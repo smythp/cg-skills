@@ -14,7 +14,8 @@
 ## Per-layer verification
 
 After translating each filesystem instruction (RUN, COPY, ADD) or contiguous
-group of them:
+group of them (every build here runs through `scripts/run-bounded.sh` with
+the build bounds — see Timeouts and cleanup):
 
 1. Build the migrated file up to and including the new lines.
 2. Build the original up to the corresponding instruction (cheap — the full
@@ -54,7 +55,8 @@ the gate.
 When every layer is done and `scripts/check-from-lines.sh` passes:
 
 1. Build the original and the migrated file in full, each with the captured
-   invocation (including `--target` if the user builds with one).
+   invocation (including `--target` if the user builds with one), through
+   `scripts/run-bounded.sh` with the build bounds.
 2. Run `scripts/compare-images.sh` on the two final images: packages, files,
    libraries.
 3. Compare the image configs (next section).
@@ -92,8 +94,9 @@ per-layer record already covers:
 
 - **Binary checks**: key binaries with `--version` or equivalent. On images
   whose entrypoint is the runtime binary, use
-  `docker run --rm --entrypoint <binary> <image> --version` so the check does
-  not go through the image entrypoint.
+  `scripts/run-bounded.sh --absolute 60 -- docker run --rm --entrypoint <binary> <image> --version`
+  so the check does not go through the image entrypoint and cannot hang past
+  the 60-second run bound.
 - **File-exists checks**: COPY targets and generated artifacts, via
   `docker create` + `docker cp` (or `compare-images.sh` file output), which
   never executes the image — necessary for distroless images with no shell.
@@ -102,26 +105,39 @@ per-layer record already covers:
   port, probe one endpoint. Bind to 127.0.0.1 on an ephemeral port
   (`docker run -d -p 127.0.0.1:0:<port>`, then read the mapped port with
   `docker port`); publishing on all interfaces exposes the container to the
-  local network during the test. Where behavior can be compared, run the same
-  command against both images and diff the output.
+  local network during the test. The detached `docker run -d` returns
+  immediately; the 60-second run bound applies to the probe itself
+  (`scripts/run-bounded.sh --absolute 60 -- curl -fsS http://127.0.0.1:<mapped-port>/`),
+  and the container is stopped right after it. Where behavior can be
+  compared, run the same command against both images and diff the output.
 
 Binary and file checks always run; they are the mandatory floor.
 
 ## Timeouts and cleanup
 
-Bound everything that executes, and remove what you start:
+Bound everything that executes, and remove what you start. Every docker
+command the workflow itself issues goes through `scripts/run-bounded.sh`,
+which kills the command's process group when the absolute limit passes or
+when the idle limit passes with no new output; the bundled lookup and
+comparison scripts bound their internal docker calls with the `timeout`
+utility on their own.
 
-- Build: 20 minutes absolute, 5 minutes with no output.
-- Pull: 10 minutes.
-- `docker save` and SBOM scan: 10 minutes.
-- `docker run` checks and probes: 60 seconds by default.
+- Build: 20 minutes absolute, 5 minutes with no output —
+  `scripts/run-bounded.sh --absolute 1200 --idle 300 --log <workdir>/build.log -- docker build ...`
+  (keep the log in the working directory; the build-fix playbook reads it).
+- Pull: 10 minutes — `scripts/run-bounded.sh --absolute 600 -- docker pull <image>`.
+- `docker save` and SBOM scan: 10 minutes, enforced inside
+  `scripts/compare-images.sh`.
+- `docker run` checks and probes: 60 seconds by default —
+  `scripts/run-bounded.sh --absolute 60 -- docker run --rm ...`.
 - Detached servers: stop immediately after their probe.
 - Every container removed afterwards (`--rm` on one-shot runs;
   `docker rm -f` for detached ones), every temporary image tag noted so the
   user can clean up.
 
-A container that ignores `--help` and serves forever will otherwise hang the
-run; the timeout converts a hang into a reported test failure.
+A build stuck on one step, or a container that ignores `--help` and serves
+forever, would otherwise hang the run; the bounds convert a hang into a
+reported failure that names which limit fired.
 
 ## Outcomes: verified and unverified
 

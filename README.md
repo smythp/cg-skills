@@ -38,8 +38,9 @@ directory instead.
   entrypoint discipline, complex bases, build-fix playbook, validation and
   report format, lookup avenues
 - `scripts/` — `preflight.sh`, `apk-lookup.sh`, `check-from-lines.sh`
-  (FROM allowlist gate), `compare-images.sh`, and their tests under
-  `scripts/tests/`
+  (FROM allowlist gate), `compare-images.sh`, `run-bounded.sh` (absolute and
+  idle time bounds for the workflow's docker commands), and their tests
+  under `scripts/tests/`
 
 ## Version
 

@@ -36,9 +36,10 @@ Exception: when the agent has the cg-apk MCP server
 (`cg-apk:search_packages`), use it for name lookups. It has no
 provides-search, so `cmd:` and `so:` questions still go through the script.
 
-If Docker cannot run a lookup container at all (it can, if preflight passed),
-the raw index is at `https://apk.cgr.dev/chainguard/<arch>/APKINDEX.tar.gz` —
-download, extract, and grep the APKINDEX text for `P:<name>` entries.
+If Docker cannot run a lookup container at all, the lookup has failed —
+report the environment problem (Docker worked at preflight and broke since)
+instead of answering from another source. A package list from anywhere but
+the build's own index can disagree with what the build will actually see.
 
 ## Does image X exist in a Chainguard registry, and which tags?
 
@@ -61,9 +62,12 @@ either avenue — enumerate a specific repo's tags, not the whole org.
 Default, and only avenue: docker.
 
 ```sh
-docker pull my-corp.example.io/chainguard-remote/python:latest-dev
+scripts/run-bounded.sh --absolute 600 -- docker pull my-corp.example.io/chainguard-remote/python:latest-dev
 docker inspect --format '{{index .RepoDigests 0}}' my-corp.example.io/chainguard-remote/python:latest-dev
 ```
+
+The pull goes through `scripts/run-bounded.sh` with the workflow's 10-minute
+pull bound; `docker inspect` reads local metadata and needs no bound.
 
 If RepoDigests is empty, the mirror reports no digest — drop the digest from
 the migrated FROM and record a warning. There is no exception: chainctl and
@@ -75,7 +79,7 @@ about a mirror path returns nothing useful.
 Default: pull and inspect.
 
 ```sh
-docker pull cgr.dev/chainguard/python:latest
+scripts/run-bounded.sh --absolute 600 -- docker pull cgr.dev/chainguard/python:latest
 docker inspect --format '{{json .Config}}' cgr.dev/chainguard/python:latest
 ```
 

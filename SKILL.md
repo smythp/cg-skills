@@ -81,9 +81,11 @@ is suspected.
 Record the exact invocation that builds the original today: context path,
 `-f`, every `--build-arg`, `--platform`, `--target`, named contexts, and any
 `--secret` or `--ssh` mounts the user already passes. Build the original once
-with it. If the original does not build locally, stop and say so — with no
-baseline there is nothing to compare a migration against, and migrating blind
-produces exactly the unverifiable file this skill refuses to emit.
+with it, through `scripts/run-bounded.sh` like every build in this workflow
+(bounds in the Time and cleanup section). If the original does not build
+locally, stop and say so — with no baseline there is nothing to compare a
+migration against, and migrating blind produces exactly the unverifiable
+file this skill refuses to emit.
 
 Credential rule: never add, discover, or forward credentials on your own —
 no SSH agent, no Docker socket mounts, no secrets lifted from the
@@ -155,9 +157,10 @@ For each instruction, using `references/from-and-registry-rules.md`,
   the versioned apk package (no drift); running unattended, take `wolfi-base`
   plus the versioned apk package — a migration must not change the runtime
   version without consent. Confirm the image exists and get its digest via
-  the avenues in `references/lookup-avenues.md`; pull it and record its
-  config (`docker inspect`: user, entrypoint, cmd, env, workdir) — the USER
-  discipline and the config comparison both need it.
+  the avenues in `references/lookup-avenues.md`; pull it
+  (`scripts/run-bounded.sh --absolute 600 -- docker pull <image>`) and record
+  its config (`docker inspect`: user, entrypoint, cmd, env, workdir) — the
+  USER discipline and the config comparison both need it.
 - **RUN**: translate the package manager; validate every package name with
   `scripts/apk-lookup.sh` before building; drop `ca-certificates`; wrap
   root-needing RUNs in `USER root` … `USER <image user>` in the same block.
@@ -169,7 +172,8 @@ For each instruction, using `references/from-and-registry-rules.md`,
 
 After each filesystem instruction or contiguous group: build the migrated
 prefix, build the original prefix to the same point (cheap — step 3 warmed
-the cache), run `scripts/compare-images.sh` on the pair, and run one focused
+the cache; both builds through `scripts/run-bounded.sh`), run
+`scripts/compare-images.sh` on the pair, and run one focused
 functional check before touching a layer that depends on this one. A build
 that succeeds while a library went missing is what the compare catches and
 the build does not. Record every check; step 11 reuses the record.
@@ -201,7 +205,8 @@ before proceeding.
 
 ### 11. Validate — a hard gate
 
-Build both files in full with the captured invocation (including `--target`).
+Build both files in full with the captured invocation (including `--target`),
+through `scripts/run-bounded.sh` with the build bounds.
 Run `scripts/compare-images.sh` on the final images, compare the image
 configs field by field, and run the remaining functional tests, all per
 `references/validation-and-report.md`. The gate passes only when both images
@@ -258,6 +263,20 @@ Builds: 20 minutes absolute, 5 minutes idle. Pulls: 10 minutes.
 servers stopped right after their probe, every container removed afterwards.
 Package-index lookups (`scripts/apk-lookup.sh`) download the apk index over
 the network, so their container run gets the 10-minute bound, not the
-60-second probe bound. The scripts enforce these bounds with the `timeout`
-utility and refuse to run docker without it; preflight checks for it.
+60-second probe bound.
+
+Enforcement is split by who runs the docker command. The bundled scripts
+(`scripts/apk-lookup.sh`, `scripts/compare-images.sh`) bound their internal
+docker calls with the `timeout` utility and refuse to run docker without it;
+preflight checks for it. Every docker command the workflow itself issues —
+build, pull, run, save, probe — goes through `scripts/run-bounded.sh`, which
+kills the command's process group when the absolute limit passes or when the
+idle limit passes with no new output, and names the limit that fired:
+
+```sh
+scripts/run-bounded.sh --absolute 1200 --idle 300 --log "$workdir/build.log" -- docker build ...
+scripts/run-bounded.sh --absolute 600 -- docker pull cgr.dev/chainguard/python:latest
+scripts/run-bounded.sh --absolute 60 -- docker run --rm cgr.dev/chainguard/python:latest --version
+```
+
 Tell the user up front that a full run is five to thirty minutes of builds.

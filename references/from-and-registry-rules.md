@@ -231,7 +231,8 @@ How to resolve the digest, per registry kind:
 
 - **Chainguard registry (public or org)**: `chainctl images tags list`
   returns the digest per tag. Pin that.
-- **External mirror**: `docker pull` the chosen reference, then read
+- **External mirror**: pull the chosen reference
+  (`scripts/run-bounded.sh --absolute 600 -- docker pull <ref>`), then read
   `docker inspect --format='{{index .RepoDigests 0}}' <ref>`. If the mirror
   reports no RepoDigest, drop the digest from the migrated FROM and record a
   warning in the report — chainctl and the Chainguard APIs do not index

@@ -48,11 +48,18 @@ SYFT_IMAGE="${SYFT_IMAGE:-docker.io/anchore/syft:v1.51.1@sha256:95fe0835e5bebc6f
 LIST_CAP=200
 # 10-minute bound on save and scan, matching the workflow's stated limits.
 TIME_LIMIT=600
+# TERM-to-KILL grace: 10 seconds lets the docker CLI detach and report before
+# a process that ignores TERM is killed hard.
+KILL_GRACE=10
 
 tmp="$(mktemp -d)" || { echo "compare-images: cannot create temp dir"; exit 1; }
 chmod 700 "$tmp"
+scanner_name=""
 cleanup() {
   [ -n "${cid:-}" ] && docker rm -f "$cid" >/dev/null 2>&1
+  # A scanner container that outlived a timeout keeps running daemon-side
+  # after its docker CLI dies; remove it by name.
+  [ -n "$scanner_name" ] && docker rm -f "$scanner_name" >/dev/null 2>&1
   rm -rf "$tmp"
 }
 trap cleanup EXIT INT TERM
@@ -66,7 +73,7 @@ not_performed() {
 # Every save, pull, and scan runs under this bound; without the timeout
 # utility the script fails closed rather than running docker unbounded.
 command -v timeout >/dev/null 2>&1 || not_performed "the timeout utility (GNU coreutils or BusyBox) is missing; refusing to run unbounded docker save/pull/scan"
-bounded() { timeout "$TIME_LIMIT" "$@"; }
+bounded() { timeout -k "$KILL_GRACE" "$TIME_LIMIT" "$@"; }
 
 command -v docker >/dev/null 2>&1 || not_performed "docker not found"
 docker image inspect "$ORIG" >/dev/null 2>&1 || not_performed "image not present locally: $ORIG (docker pull or build it first)"
@@ -94,16 +101,38 @@ fi
 [ -n "$SYFT_MODE" ] || not_performed "no SBOM scanner: no syft binary on PATH or /usr/local/bin, and the fallback image $SYFT_IMAGE could not be pulled"
 
 # scan IMAGE OUTFILE — write sorted name@version list
+scan_n=0
 scan_packages() {
   img="$1"; out="$2"; base="$(basename "$out").tar"
   bounded docker save -o "$tmp/$base" "$img" || return 1
   if [ "$SYFT_MODE" = "binary" ]; then
     bounded "$SYFT_BIN" -q -o syft-table "docker-archive:$tmp/$base" > "$out.raw" || return 1
   else
+    # One named scanner container per scan, so the cleanup trap can remove a
+    # container that outlives a timeout. The name is built only from a fixed
+    # prefix, this script's pid, and a counter, all within docker's allowed
+    # name characters; the guard makes that explicit rather than assumed.
+    scan_n=$((scan_n + 1))
+    scanner_name="compare-images-syft-$$-$scan_n"
+    case "$scanner_name" in
+      *[!A-Za-z0-9_.-]*) not_performed "internal error: scanner container name contains invalid characters: $scanner_name" ;;
+    esac
+    # --network none: the archive is local, so the scan needs no network, and
+    # a scanner with the full image mounted must not be able to phone home;
+    # SYFT_CHECK_FOR_APP_UPDATE=false stops syft's own update ping, which
+    # would otherwise fail slowly under --network none.
     # Archive dir mounted read-only; nothing from the scanned image executes.
     # --user 0:0 so the scanner can read the 0700 temp dir regardless of the
     # image's default user; the mount stays read-only either way.
-    bounded docker run --rm --user 0:0 -v "$tmp:/scan:ro" "$SYFT_IMAGE" -q -o syft-table "docker-archive:/scan/$base" > "$out.raw" || return 1
+    if ! bounded docker run --rm --name "$scanner_name" --network none \
+        -e SYFT_CHECK_FOR_APP_UPDATE=false --user 0:0 -v "$tmp:/scan:ro" \
+        "$SYFT_IMAGE" -q -o syft-table "docker-archive:/scan/$base" > "$out.raw"; then
+      docker rm -f "$scanner_name" >/dev/null 2>&1
+      scanner_name=""
+      return 1
+    fi
+    docker rm -f "$scanner_name" >/dev/null 2>&1
+    scanner_name=""
   fi
   # syft-table: NAME VERSION TYPE (header on line 1)
   awk 'NR > 1 && NF >= 2 { print $1 "@" $2 }' "$out.raw" | sort -u > "$out"

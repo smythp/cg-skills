@@ -81,7 +81,7 @@ echo "== preflight: optional =="
 if command -v syft >/dev/null 2>&1; then
   echo "syft: OK ($(syft version 2>/dev/null | awk '/^Version:/ {print $2}'))"
 else
-  echo "syft: not installed; compare-images.sh will fall back to a syft container (needs to pull cgr.dev/chainguard/syft)"
+  echo "syft: not installed; compare-images.sh will fall back to its pinned scanner container (docker.io/anchore/syft, pinned by digest in the script)"
 fi
 
 if command -v dfc >/dev/null 2>&1; then
