@@ -81,8 +81,9 @@ is suspected.
 Record the exact invocation that builds the original today: context path,
 `-f`, every `--build-arg`, `--platform`, `--target`, named contexts, and any
 `--secret` or `--ssh` mounts the user already passes. Build the original once
-with it, through `scripts/run-bounded.sh` like every build in this workflow
-(bounds in the Time and cleanup section). If the original does not build
+with it, under the build bound like every build in this workflow
+(`timeout -k 30 1200 docker build ...`; bounds in the Time and cleanup
+section). If the original does not build
 locally, stop and say so — with no baseline there is nothing to compare a
 migration against, and migrating blind produces exactly the unverifiable
 file this skill refuses to emit.
@@ -158,7 +159,7 @@ For each instruction, using `references/from-and-registry-rules.md`,
   plus the versioned apk package — a migration must not change the runtime
   version without consent. Confirm the image exists and get its digest via
   the avenues in `references/lookup-avenues.md`; pull it
-  (`scripts/run-bounded.sh --absolute 600 -- docker pull <image>`) and record
+  (`timeout -k 30 600 docker pull <image>`) and record
   its config (`docker inspect`: user, entrypoint, cmd, env, workdir) — the
   USER discipline and the config comparison both need it.
 - **RUN**: translate the package manager; validate every package name with
@@ -172,7 +173,7 @@ For each instruction, using `references/from-and-registry-rules.md`,
 
 After each filesystem instruction or contiguous group: build the migrated
 prefix, build the original prefix to the same point (cheap — step 3 warmed
-the cache; both builds through `scripts/run-bounded.sh`), run
+the cache; both builds under the build bound), run
 `scripts/compare-images.sh` on the pair, and run one focused
 functional check before touching a layer that depends on this one. A build
 that succeeds while a library went missing is what the compare catches and
@@ -206,7 +207,7 @@ before proceeding.
 ### 11. Validate — a hard gate
 
 Build both files in full with the captured invocation (including `--target`),
-through `scripts/run-bounded.sh` with the build bounds.
+each under the build bound (`timeout -k 30 1200`).
 Run `scripts/compare-images.sh` on the final images, compare the image
 configs field by field, and run the remaining functional tests, all per
 `references/validation-and-report.md`. The gate passes only when both images
@@ -257,26 +258,45 @@ report instead of swapping files.
 
 ## Time and cleanup bounds
 
-Builds: 20 minutes absolute, 5 minutes idle. Pulls: 10 minutes.
-`docker save` and SBOM scans: 10 minutes. Container runs and probes:
-60 seconds default, probes bound to 127.0.0.1 on an ephemeral port, detached
-servers stopped right after their probe, every container removed afterwards.
+Absolute bounds, one per command class: builds 20 minutes (1200 s), pulls
+10 minutes (600 s), `docker save` and SBOM scans 10 minutes (600 s),
+container runs and probes 60 seconds. Probes bind to 127.0.0.1 on an
+ephemeral port; detached servers are stopped right after their probe.
 Package-index lookups (`scripts/apk-lookup.sh`) download the apk index over
 the network, so their container run gets the 10-minute bound, not the
-60-second probe bound.
+60-second probe bound. A stalled build or a container that serves forever
+would otherwise hang the run; the bound converts the hang into a reported
+failure (`timeout` exits 124).
 
 Enforcement is split by who runs the docker command. The bundled scripts
 (`scripts/apk-lookup.sh`, `scripts/compare-images.sh`) bound their internal
 docker calls with the `timeout` utility and refuse to run docker without it;
 preflight checks for it. Every docker command the workflow itself issues —
-build, pull, run, save, probe — goes through `scripts/run-bounded.sh`, which
-kills the command's process group when the absolute limit passes or when the
-idle limit passes with no new output, and names the limit that fired:
+build, pull, run, save, probe — is written with `timeout -k 30 <seconds>`
+inline:
 
 ```sh
-scripts/run-bounded.sh --absolute 1200 --idle 300 --log "$workdir/build.log" -- docker build ...
-scripts/run-bounded.sh --absolute 600 -- docker pull cgr.dev/chainguard/python:latest
-scripts/run-bounded.sh --absolute 60 -- docker run --rm cgr.dev/chainguard/python:latest --version
+timeout -k 30 1200 docker build -t app-migrated -f "$workdir/Dockerfile.chainguard" . > "$workdir/build.log" 2>&1
+timeout -k 30 600 docker pull cgr.dev/chainguard/python:latest
+```
+
+`timeout` kills only the docker client; a container the run started keeps
+running daemon-side. So every container the workflow starts — a probe, a
+functional check, a detached server — gets a `--name` unique to that run,
+and the name is removed right after the check or after a timeout:
+
+Correct:
+
+```sh
+timeout -k 30 60 docker run --rm --name migr-probe-1 --entrypoint python cgr.dev/chainguard/python:latest --version
+docker rm -f migr-probe-1 >/dev/null 2>&1 || true
+```
+
+Wrong (no `--name`: when the run times out, the client dies but the
+container keeps running on the daemon with nothing to remove it by):
+
+```sh
+timeout -k 30 60 docker run --rm cgr.dev/chainguard/python:latest --version
 ```
 
 Tell the user up front that a full run is five to thirty minutes of builds.

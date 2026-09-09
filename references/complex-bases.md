@@ -10,14 +10,13 @@ equivalent, so the migration has to take the base apart.
 Pull it and read what it is made of — no Guardener server tools needed:
 
 ```sh
-scripts/run-bounded.sh --absolute 600 -- docker pull ros:foxy
+timeout -k 30 600 docker pull ros:foxy
 docker history --no-trunc --format '{{.CreatedBy}}' ros:foxy
 docker inspect --format '{{json .Config}}' ros:foxy
 ```
 
-The pull runs under the workflow's 10-minute pull bound via
-`scripts/run-bounded.sh`; `docker history` and `docker inspect` read local
-metadata and need no bound.
+The pull runs under the workflow's 10-minute pull bound; `docker history`
+and `docker inspect` read local metadata and need no bound.
 
 `docker history` lists the build steps newest-first (reverse it to read in
 build order); `docker inspect` gives the user, env, entrypoint, cmd, workdir,

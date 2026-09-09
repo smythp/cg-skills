@@ -7,9 +7,9 @@
 #                      (default: current directory)
 #
 # Exit codes: 0 = required tools present (docker daemon, chainctl login and
-# a working organization listing, timeout); 1 = a required tool is missing or
-# not working. Optional findings (syft, dfc, .dockerignore) are reported but
-# never fail the check.
+# a working organization listing, timeout, and the parsing tools awk, grep,
+# sed, sort); 1 = a required tool is missing or not working. Optional
+# findings (syft, dfc, .dockerignore) are reported but never fail the check.
 
 set -u
 
@@ -24,6 +24,21 @@ case ":$PATH:" in
 esac
 
 echo "== preflight: required =="
+
+# This script parses the organization listing with these tools; if one is
+# missing, the parsing would silently produce nothing and a real organization
+# would read as "no organizations", steering an entitled customer to the
+# public catalog. Check them before anything parses.
+missing_parsers=""
+for t in awk grep sed sort; do
+  command -v "$t" >/dev/null 2>&1 || missing_parsers="$missing_parsers $t"
+done
+if [ -z "$missing_parsers" ]; then
+  echo "awk/grep/sed/sort: OK"
+else
+  echo "awk/grep/sed/sort: MISSING:$missing_parsers — preflight parses the organization listing with these; without them the listing cannot be read and an entitled organization would wrongly read as 'no organizations'."
+  fail=1
+fi
 
 if command -v docker >/dev/null 2>&1; then
   if docker info >/dev/null 2>&1; then

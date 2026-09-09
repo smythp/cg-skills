@@ -62,12 +62,12 @@ either avenue — enumerate a specific repo's tags, not the whole org.
 Default, and only avenue: docker.
 
 ```sh
-scripts/run-bounded.sh --absolute 600 -- docker pull my-corp.example.io/chainguard-remote/python:latest-dev
+timeout -k 30 600 docker pull my-corp.example.io/chainguard-remote/python:latest-dev
 docker inspect --format '{{index .RepoDigests 0}}' my-corp.example.io/chainguard-remote/python:latest-dev
 ```
 
-The pull goes through `scripts/run-bounded.sh` with the workflow's 10-minute
-pull bound; `docker inspect` reads local metadata and needs no bound.
+The pull runs under the workflow's 10-minute pull bound; `docker inspect`
+reads local metadata and needs no bound.
 
 If RepoDigests is empty, the mirror reports no digest — drop the digest from
 the migrated FROM and record a warning. There is no exception: chainctl and
@@ -79,7 +79,7 @@ about a mirror path returns nothing useful.
 Default: pull and inspect.
 
 ```sh
-scripts/run-bounded.sh --absolute 600 -- docker pull cgr.dev/chainguard/python:latest
+timeout -k 30 600 docker pull cgr.dev/chainguard/python:latest
 docker inspect --format '{{json .Config}}' cgr.dev/chainguard/python:latest
 ```
 

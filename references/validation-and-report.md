@@ -14,8 +14,8 @@
 ## Per-layer verification
 
 After translating each filesystem instruction (RUN, COPY, ADD) or contiguous
-group of them (every build here runs through `scripts/run-bounded.sh` with
-the build bounds — see Timeouts and cleanup):
+group of them (every build here runs under the build bound — see Timeouts
+and cleanup):
 
 1. Build the migrated file up to and including the new lines.
 2. Build the original up to the corresponding instruction (cheap — the full
@@ -55,8 +55,8 @@ the gate.
 When every layer is done and `scripts/check-from-lines.sh` passes:
 
 1. Build the original and the migrated file in full, each with the captured
-   invocation (including `--target` if the user builds with one), through
-   `scripts/run-bounded.sh` with the build bounds.
+   invocation (including `--target` if the user builds with one), each under
+   the build bound (`timeout -k 30 1200`).
 2. Run `scripts/compare-images.sh` on the two final images: packages, files,
    libraries.
 3. Compare the image configs (next section).
@@ -94,50 +94,54 @@ per-layer record already covers:
 
 - **Binary checks**: key binaries with `--version` or equivalent. On images
   whose entrypoint is the runtime binary, use
-  `scripts/run-bounded.sh --absolute 60 -- docker run --rm --entrypoint <binary> <image> --version`
-  so the check does not go through the image entrypoint and cannot hang past
-  the 60-second run bound.
+  `timeout -k 30 60 docker run --rm --name migr-check-1 --entrypoint <binary> <image> --version`
+  (a unique `--name` per check, removed afterwards with
+  `docker rm -f migr-check-1 >/dev/null 2>&1 || true`) so the check does not
+  go through the image entrypoint and cannot hang past the 60-second run
+  bound, and a timed-out check leaves nothing running daemon-side.
 - **File-exists checks**: COPY targets and generated artifacts, via
   `docker create` + `docker cp` (or `compare-images.sh` file output), which
   never executes the image — necessary for distroless images with no shell.
 - **Startup and HTTP probe** (skipped only if the user opted out in the
-  clarify step): start the migrated container, and if the original exposes a
-  port, probe one endpoint. Bind to 127.0.0.1 on an ephemeral port
-  (`docker run -d -p 127.0.0.1:0:<port>`, then read the mapped port with
-  `docker port`); publishing on all interfaces exposes the container to the
-  local network during the test. The detached `docker run -d` returns
-  immediately; the 60-second run bound applies to the probe itself
-  (`scripts/run-bounded.sh --absolute 60 -- curl -fsS http://127.0.0.1:<mapped-port>/`),
-  and the container is stopped right after it. Where behavior can be
-  compared, run the same command against both images and diff the output.
+  clarify step): start the migrated container named and detached, and if the
+  original exposes a port, probe one endpoint. Bind to 127.0.0.1 on an
+  ephemeral port (`docker run -d --name migr-probe-app -p 127.0.0.1:0:<port>
+  <image>`, then read the mapped port with `docker port migr-probe-app`);
+  publishing on all interfaces exposes the container to the local network
+  during the test. The detached `docker run -d` returns immediately; the
+  60-second run bound applies to the probe itself
+  (`timeout -k 30 60 curl -fsS http://127.0.0.1:<mapped-port>/`), and the
+  container is removed right after it, pass, fail, or timeout
+  (`docker rm -f migr-probe-app >/dev/null 2>&1 || true`). Where behavior can
+  be compared, run the same command against both images and diff the output.
 
 Binary and file checks always run; they are the mandatory floor.
 
 ## Timeouts and cleanup
 
-Bound everything that executes, and remove what you start. Every docker
-command the workflow itself issues goes through `scripts/run-bounded.sh`,
-which kills the command's process group when the absolute limit passes or
-when the idle limit passes with no new output; the bundled lookup and
-comparison scripts bound their internal docker calls with the `timeout`
-utility on their own.
+Bound everything that executes, and remove what you start. The bundled lookup
+and comparison scripts bound their internal docker calls with the `timeout`
+utility on their own; every docker command the workflow itself issues is
+written with `timeout -k 30 <seconds>` inline.
 
-- Build: 20 minutes absolute, 5 minutes with no output —
-  `scripts/run-bounded.sh --absolute 1200 --idle 300 --log <workdir>/build.log -- docker build ...`
+- Build: 20 minutes —
+  `timeout -k 30 1200 docker build ... > <workdir>/build.log 2>&1`
   (keep the log in the working directory; the build-fix playbook reads it).
-- Pull: 10 minutes — `scripts/run-bounded.sh --absolute 600 -- docker pull <image>`.
+- Pull: 10 minutes — `timeout -k 30 600 docker pull <image>`.
 - `docker save` and SBOM scan: 10 minutes, enforced inside
   `scripts/compare-images.sh`.
-- `docker run` checks and probes: 60 seconds by default —
-  `scripts/run-bounded.sh --absolute 60 -- docker run --rm ...`.
-- Detached servers: stop immediately after their probe.
-- Every container removed afterwards (`--rm` on one-shot runs;
-  `docker rm -f` for detached ones), every temporary image tag noted so the
-  user can clean up.
+- `docker run` checks and probes: 60 seconds —
+  `timeout -k 30 60 docker run --rm --name migr-check-1 ...`.
+- Detached servers: remove immediately after their probe.
+- `timeout` kills only the docker client; a container the run started keeps
+  running daemon-side. Every container the workflow starts therefore gets a
+  unique `--name`, removed after the check or after a timeout
+  (`docker rm -f migr-check-1 >/dev/null 2>&1 || true`); every temporary
+  image tag is noted so the user can clean up.
 
 A build stuck on one step, or a container that ignores `--help` and serves
 forever, would otherwise hang the run; the bounds convert a hang into a
-reported failure that names which limit fired.
+reported failure (`timeout` exits 124).
 
 ## Outcomes: verified and unverified
 

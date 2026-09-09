@@ -113,7 +113,32 @@ Common name mappings:
 | `postgres:*` | `postgres` |
 | `redis:*` | `redis` |
 | `ubuntu:*`, `debian:*`, `alpine:*`, `fedora:*`, `centos:*`, `ubi*` | `chainguard-base` (org) / `wolfi-base` (public) |
-| `scratch`, distroless bases | `static` |
+| `scratch`, `gcr.io/distroless/static*` | `static` |
+| `gcr.io/distroless/python3*`, `.../java*`, `.../nodejs*` | `python` / `jre` / `node` |
+| `gcr.io/distroless/cc*` | `glibc-dynamic` |
+
+Distroless originals split three ways. Only `scratch` and
+`gcr.io/distroless/static` hold fully static binaries and map to `static`. A
+language distroless image (`python3`, `java`, `nodejs`) maps to the matching
+purpose-built runtime image, which carries the interpreter or VM the
+application needs. A dynamically linked binary with no purpose-built runtime
+— the `distroless/cc` case — maps to `glibc-dynamic`, which carries glibc and
+nothing else. Mapping a dynamically linked binary to `static` produces an
+image whose binary cannot start: the loader and libc it needs are not there.
+
+Correct (original `FROM gcr.io/distroless/cc-debian12`, a dynamically linked
+Rust binary):
+
+```dockerfile
+FROM cgr.dev/chainguard/glibc-dynamic:latest
+```
+
+Wrong (`static` has no glibc, so the container dies at startup with
+"no such file or directory" for the loader):
+
+```dockerfile
+FROM cgr.dev/chainguard/static:latest
+```
 
 Confirm the image actually exists in the chosen registry before using it
 (`chainctl images repos list --public --repo <name>`, or `--parent <org>`
@@ -172,9 +197,21 @@ include apk and a shell. Use `latest`.
 
 The public catalog serves purpose-built images only at `latest`/`latest-dev`,
 so a version-pinned original (`python:3.11-slim`) cannot keep its pin on a
-public purpose-built image. Check the pinned major.minor against what the
-purpose-built image's `latest` actually carries (pull it and read the
-version, or check its tag listing) and apply:
+public purpose-built image. Find out what runtime version the purpose-built
+image's `latest` actually carries: pull it and run a bounded, named probe,
+
+```sh
+timeout -k 30 600 docker pull cgr.dev/chainguard/python:latest
+timeout -k 30 60 docker run --rm --name migr-version-probe --entrypoint python cgr.dev/chainguard/python:latest --version
+docker rm -f migr-version-probe >/dev/null 2>&1 || true
+```
+
+or read the version from the image config or SBOM. A tag listing cannot
+answer this: `chainctl images tags list` only selects and resolves tags, and
+on the public catalog the tag is `latest`, which says nothing about the
+runtime version inside — a check "passed" from the tag list alone skips the
+consent question below on no evidence. Compare that version's major.minor
+against the pin and apply:
 
 **Default**: when the versions match in major.minor, or the original was
 unpinned, use the purpose-built image — nothing drifts.
@@ -232,7 +269,7 @@ How to resolve the digest, per registry kind:
 - **Chainguard registry (public or org)**: `chainctl images tags list`
   returns the digest per tag. Pin that.
 - **External mirror**: pull the chosen reference
-  (`scripts/run-bounded.sh --absolute 600 -- docker pull <ref>`), then read
+  (`timeout -k 30 600 docker pull <ref>`), then read
   `docker inspect --format='{{index .RepoDigests 0}}' <ref>`. If the mirror
   reports no RepoDigest, drop the digest from the migrated FROM and record a
   warning in the report — chainctl and the Chainguard APIs do not index
