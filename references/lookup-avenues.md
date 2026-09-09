@@ -88,9 +88,9 @@ without pulling the image.
 
 ## Debian or Fedora package name to Wolfi name?
 
-Default: the tables and rename patterns in
-`references/package-translation.md`, confirmed with `scripts/apk-lookup.sh` —
-the table proposes, the index disposes.
+Default: the Debian/Fedora/Alpine name tables and the Wolfi rename patterns
+(`python3-X` → `py3-X`, `X-devel` → `X-dev`, and the rest), confirmed with
+`scripts/apk-lookup.sh` — the table proposes, the index disposes.
 
 Exception: when the open-source dfc CLI is installed, its built-in mappings
 answer the same question (`dfc ./Dockerfile` applies them wholesale; see the

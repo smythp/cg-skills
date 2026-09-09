@@ -8,6 +8,8 @@
 #   2. an rpm-based UBI image — the scanner must read rpm databases too
 #   3. no scanner available at all — the script must fail loudly with
 #      "NOT performed", never print an empty diff
+#   4. shared-library detection accepts any .so. suffix, not just numeric
+#      ones (libfixture.so.debug), matching Guardener's isSharedLibrary
 
 set -u
 
@@ -62,6 +64,34 @@ else
   case "$out" in
     *"NOT performed"*) ok ;;
     *) bad "no-scanner case: message must say the comparison was NOT performed, got: $out" ;;
+  esac
+fi
+
+echo "--- case 4: non-numeric .so suffix counts as a shared library ---"
+# Build a minimal image by docker import (no build, no network) holding one
+# versioned-with-words library and one plain .so; both must show up in the
+# shared-libraries diff against static (which ships no .so files).
+LIBIMG=compare-images-test-libs:fixture
+fixdir="$(mktemp -d)" || exit 1
+chmod 700 "$fixdir"
+mkdir -p "$fixdir/usr/lib"
+printf 'x' > "$fixdir/usr/lib/libfixture.so.debug"
+printf 'x' > "$fixdir/usr/lib/libplain.so"
+tar -C "$fixdir" -cf "$fixdir/root.tar" usr
+docker import "$fixdir/root.tar" "$LIBIMG" >/dev/null 2>&1 || { echo "cannot docker import the library fixture; aborting"; rm -rf "$fixdir"; exit 1; }
+out=$(sh "$SCRIPT" "$LIBIMG" "$STATIC" 2>&1); rc=$?
+docker rmi -f "$LIBIMG" >/dev/null 2>&1
+rm -rf "$fixdir"
+if [ "$rc" -ne 0 ]; then
+  bad "library fixture vs static exited $rc: $(echo "$out" | tail -3)"
+else
+  case "$out" in
+    *libfixture.so.debug*) ok ;;
+    *) bad "libfixture.so.debug missing from the shared-libraries diff (non-numeric .so suffix not detected)" ;;
+  esac
+  case "$out" in
+    *libplain.so*) ok ;;
+    *) bad "libplain.so missing from the shared-libraries diff" ;;
   esac
 fi
 

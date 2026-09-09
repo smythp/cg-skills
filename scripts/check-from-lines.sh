@@ -3,8 +3,13 @@
 # allowlist: cgr.dev/* (exact host boundary), the configured external mirror
 # prefix (on a / boundary), scratch, and previously declared stage aliases.
 #
-# Usage: check-from-lines.sh [--mirror PREFIX] DOCKERFILE
-#   --mirror PREFIX   external pull-through mirror, e.g. my-corp.example.io/cg
+# Usage: check-from-lines.sh [--mirror PREFIX] [--build-arg NAME=value ...] DOCKERFILE
+#   --mirror PREFIX       external pull-through mirror, e.g. my-corp.example.io/cg
+#   --build-arg NAME=value  a build arg from the captured build invocation;
+#                         repeatable. docker build honors these over the
+#                         Dockerfile's ARG defaults, so the gate must apply
+#                         the same overrides or it checks a different file
+#                         than the one being built.
 #
 # Exit codes: 0 = all FROMs allowed; 1 = a FROM (or stage alias, or ARG
 # expansion) is not allowed, with a message naming the line; 2 = usage error.
@@ -13,6 +18,10 @@
 #   - ARG defaults declared before the first FROM are expanded inside FROM
 #     refs (quotes stripped, earlier ARGs usable in later defaults). ARGs
 #     declared after a FROM are ignored for FROM resolution.
+#   - A --build-arg override replaces the default of a matching ARG declared
+#     before the first FROM, and gives a value to a global ARG declared with
+#     no default. An override whose name no ARG declares is ignored, as in
+#     docker build.
 #   - FROM flags such as --platform=... are skipped to reach the image ref.
 #   - Unresolved variables in a FROM ref are rejected: FROM $UNSET could
 #     resolve to anything at build time, so it cannot pass a static gate.
@@ -31,22 +40,47 @@
 
 set -u
 
+NL='
+'
+
 MIRROR=""
-case "${1-}" in
-  --mirror)
-    MIRROR="${2-}"
-    [ -n "$MIRROR" ] || { echo "check-from-lines.sh: --mirror needs a value" >&2; exit 2; }
-    shift 2
-    ;;
-esac
+BUILD_ARGS=""
+while :; do
+  case "${1-}" in
+    --mirror)
+      MIRROR="${2-}"
+      [ -n "$MIRROR" ] || { echo "check-from-lines.sh: --mirror needs a value" >&2; exit 2; }
+      shift 2
+      ;;
+    --build-arg)
+      ba="${2-}"
+      case "$ba" in
+        ''|=*) echo "check-from-lines.sh: --build-arg needs NAME=value" >&2; exit 2 ;;
+        *=*) : ;;
+        *) echo "check-from-lines.sh: --build-arg needs NAME=value, got '$ba'" >&2; exit 2 ;;
+      esac
+      case "$ba" in
+        *"$NL"*) echo "check-from-lines.sh: a --build-arg value must not contain a newline" >&2; exit 2 ;;
+      esac
+      BUILD_ARGS="${BUILD_ARGS}${ba}${NL}"
+      shift 2
+      ;;
+    *) break ;;
+  esac
+done
 
 DOCKERFILE="${1-}"
 if [ -z "$DOCKERFILE" ] || [ ! -f "$DOCKERFILE" ]; then
-  echo "usage: check-from-lines.sh [--mirror PREFIX] DOCKERFILE" >&2
+  echo "usage: check-from-lines.sh [--mirror PREFIX] [--build-arg NAME=value ...] DOCKERFILE" >&2
   exit 2
 fi
 
-awk -v mirror="$MIRROR" '
+# Build args travel through the environment, not -v: awk -v runs backslash
+# escape processing on the value, which would corrupt a value containing one.
+# The Dockerfile is fed on stdin, not as an operand: a bare operand shaped
+# like name=value is treated by POSIX awk as a variable assignment, so a file
+# literally named "from=allowed" would never be read and the gate would pass.
+CHECK_FROM_BUILD_ARGS="$BUILD_ARGS" awk -v mirror="$MIRROR" '
 function rtrim(s) { sub(/[ \t\r]+$/, "", s); return s }
 function ltrim(s) { sub(/^[ \t]+/, "", s); return s }
 
@@ -124,6 +158,12 @@ BEGIN {
   mirror = tolower(mirror)
   sub(/\/+$/, "", mirror)
   sub(/^[ \t]+/, "", mirror); sub(/[ \t]+$/, "", mirror)
+  n_ba = split(ENVIRON["CHECK_FROM_BUILD_ARGS"], ba_lines, "\n")
+  for (b = 1; b <= n_ba; b++) {
+    if (ba_lines[b] == "") continue
+    p = index(ba_lines[b], "=")
+    if (p > 1) OVERRIDE[substr(ba_lines[b], 1, p - 1)] = substr(ba_lines[b], p + 1)
+  }
 }
 
 {
@@ -152,13 +192,22 @@ function process(logical, lineno,   n, f, instr, p, ref, resolved, alias, lc, i,
   instr = toupper(f[1])
 
   if (instr == "ARG" && !seen_from) {
-    # Only the first name=value token counts, and only when it has a default.
+    # Only the first token counts. A --build-arg override beats the declared
+    # default, and gives a value to an ARG declared with none — both matching
+    # docker build. An override with no matching ARG declaration never
+    # applies, also matching docker build.
     if (n >= 2) {
       p = index(f[2], "=")
       if (p > 1) {
         name = substr(f[2], 1, p - 1)
-        val = strip_quotes(substr(f[2], p + 1))
-        ARGS[name] = expand_default(val)
+        if (name in OVERRIDE) {
+          ARGS[name] = OVERRIDE[name]
+        } else {
+          val = strip_quotes(substr(f[2], p + 1))
+          ARGS[name] = expand_default(val)
+        }
+      } else if (p == 0 && f[2] ~ /^[A-Za-z_][A-Za-z0-9_]*$/ && (f[2] in OVERRIDE)) {
+        ARGS[f[2]] = OVERRIDE[f[2]]
       }
     }
     return
@@ -199,7 +248,7 @@ function process(logical, lineno,   n, f, instr, p, ref, resolved, alias, lc, i,
 
   if (alias != "") ALIASES[alias] = 1
 }
-' "$DOCKERFILE"
+' < "$DOCKERFILE"
 rc=$?
 if [ "$rc" -eq 0 ]; then
   echo "check-from-lines: OK — every FROM in $DOCKERFILE is on the allowlist"

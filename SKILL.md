@@ -93,7 +93,10 @@ the report.
 
 ### 4. Clarify, once
 
-Ask these together, in one message:
+Read `~/.config/chainguard/dockerfile-migration-preferences.md` first; if it
+exists, use its answers and ask only what it does not cover. The path is
+deliberately agent-neutral — any agent running this skill finds the same
+answers there. Then ask the rest together, in one message:
 
 - **Organization**: resolve from `chainctl iam organizations list`. Exactly
   one → use it and say so. Several → list them and ask. None → use
@@ -104,8 +107,8 @@ Ask these together, in one message:
 - **Probes**: run app startup and HTTP probes during validation? Binary and
   file checks always run regardless.
 
-Offer to save the answers to `~/.claude/chainguard-preferences.md` and reuse
-them on later migrations instead of re-asking.
+Offer to save new answers to that preferences file for later migrations;
+write it only after the user confirms.
 
 ### 5. Work outside the build context
 
@@ -145,10 +148,15 @@ For each instruction, using `references/from-and-registry-rules.md`,
 `references/package-translation.md`, and
 `references/users-entrypoints-paths.md`:
 
-- **FROM**: pick the target image and tag per the registry rules; confirm it
-  exists and get its digest via the avenues in
-  `references/lookup-avenues.md`; pull it and record its config
-  (`docker inspect`: user, entrypoint, cmd, env, workdir) — the USER
+- **FROM**: pick the target image and tag per the registry rules. On the
+  public catalog, when the original pins a version whose major.minor does not
+  match the purpose-built image's `latest`, ask the user to choose between
+  purpose-built `latest` (accepting the version drift) and `wolfi-base` plus
+  the versioned apk package (no drift); running unattended, take `wolfi-base`
+  plus the versioned apk package — a migration must not change the runtime
+  version without consent. Confirm the image exists and get its digest via
+  the avenues in `references/lookup-avenues.md`; pull it and record its
+  config (`docker inspect`: user, entrypoint, cmd, env, workdir) — the USER
   discipline and the config comparison both need it.
 - **RUN**: translate the package manager; validate every package name with
   `scripts/apk-lookup.sh` before building; drop `ca-certificates`; wrap
@@ -181,8 +189,11 @@ the user — it is never solved by switching to another registry.
 
 ### 10. Gate the FROMs
 
-Run `scripts/check-from-lines.sh` (with `--mirror <prefix>` if one is
-configured) on the complete migrated file. Any FROM outside the allowlist
+Run `scripts/check-from-lines.sh` on the complete migrated file, with
+`--mirror <prefix>` if one is configured and a repeated `--build-arg
+NAME=value` for every build arg in the captured invocation — the build honors
+those overrides over the Dockerfile's ARG defaults, so a gate run without
+them checks a different file than the one being built. Any FROM outside the allowlist
 fails the run — fix it, do not argue with the gate. Then confirm every stage
 that used `USER root` ends with the image's user. This is the
 machine-checkable intermediate output: paste its OK line into your reply
@@ -245,4 +256,8 @@ Builds: 20 minutes absolute, 5 minutes idle. Pulls: 10 minutes.
 `docker save` and SBOM scans: 10 minutes. Container runs and probes:
 60 seconds default, probes bound to 127.0.0.1 on an ephemeral port, detached
 servers stopped right after their probe, every container removed afterwards.
+Package-index lookups (`scripts/apk-lookup.sh`) download the apk index over
+the network, so their container run gets the 10-minute bound, not the
+60-second probe bound. The scripts enforce these bounds with the `timeout`
+utility and refuse to run docker without it; preflight checks for it.
 Tell the user up front that a full run is five to thirty minutes of builds.

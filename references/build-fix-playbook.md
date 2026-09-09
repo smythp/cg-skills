@@ -16,13 +16,13 @@ re-running the build to see the error again.
 
 | Error contains | Cause | Fix |
 |---|---|---|
-| `apt-get: not found`, `apt: not found`, `dnf: not found`, `yum: not found` | Debian/Fedora package command left in a Chainguard stage | Translate the line to `apk add --no-cache` per `references/package-translation.md`, or move it to the stage it belongs to |
+| `apt-get: not found`, `apt: not found`, `dnf: not found`, `yum: not found` | Debian/Fedora package command left in a Chainguard stage | Translate the line to `apk add --no-cache` with Wolfi package names, or move it to the stage it belongs to |
 | `apk: not found` | apk emitted into a non-Chainguard stage, or a distroless (non-dev) image | Move the install to a `-dev` build stage, or switch this stage's tag to `-dev` if it legitimately needs a shell |
 | `ERROR: unable to select packages:` / `no such package` | Package name wrong for Wolfi | Look the name up (`scripts/apk-lookup.sh`), try the rename patterns, check the original file for the intended spelling |
 | `/bin/sh: not found`, `runc run failed: ... exec: "/bin/sh"` | RUN line in a distroless stage | Same as `apk: not found`: RUN lines belong in `-dev` stages |
-| `adduser: unrecognized option`, `useradd: not found` | Alpine BusyBox user-management flags on Wolfi | Install `shadow` and translate to `useradd`/`groupadd` per `references/package-translation.md` |
-| `Permission denied` during `apk add` or file writes | RUN executing as the image's non-root user | Wrap in `USER root` ... `USER <image user>` per `references/users-entrypoints-paths.md` |
-| Container starts then exits with the CMD's first word treated as a file path | CMD passed as arguments to a purpose-built image's ENTRYPOINT | Fix the ENTRYPOINT/CMD pair per `references/users-entrypoints-paths.md` |
+| `adduser: unrecognized option`, `useradd: not found` | Alpine BusyBox user-management flags on Wolfi | Install `shadow` and translate the flags to `useradd`/`groupadd` |
+| `Permission denied` during `apk add` or file writes | RUN executing as the image's non-root user | Wrap in `USER root` ... `USER <image user>` in the same emitted block |
+| Container starts then exits with the CMD's first word treated as a file path | CMD passed as arguments to a purpose-built image's ENTRYPOINT | Rewrite the CMD as arguments to the image's ENTRYPOINT, or reset `ENTRYPOINT []` when the CMD runs a different program |
 | `pip install` fails compiling a wheel (`gcc: not found`, missing `.h`) | Build toolchain absent in the migrated stage | Add `build-base` and the relevant `-dev` packages to that stage, or move the install to a `-dev` build stage |
 | `manifest unknown`, `not found` on the FROM pull | The chosen tag does not exist in this registry | Pick a different tag on the same registry from the real tag list; never change the registry to fix a tag |
 | `no matching manifest for platform` | Image has no manifest for the build platform | Pass the original build's `--platform`, or pick a tag that has the platform |

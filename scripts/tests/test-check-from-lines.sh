@@ -16,16 +16,21 @@ trap 'rm -rf "$tmp"' EXIT INT TERM
 pass=0
 failcount=0
 
-# run_case NAME MIRROR EXPECT CONTAINS  (dockerfile on stdin)
+# run_case NAME MIRROR EXPECT CONTAINS [BUILDARG...]  (dockerfile on stdin)
 #   EXPECT: ok  -> script must exit 0
 #           err -> script must exit non-zero and output must contain CONTAINS
+#   Each extra argument is passed as --build-arg NAME=value.
 run_case() {
-  name="$1"; mirror="$2"; expect="$3"; contains="$4"
+  name="$1"; mirror="$2"; expect="$3"; contains="$4"; shift 4
   cat > "$tmp/Dockerfile"
+  # Fixture build-arg values contain no whitespace, so a string build with
+  # unquoted expansion below is safe.
+  extra=""
+  for a in "$@"; do extra="$extra --build-arg $a"; done
   if [ -n "$mirror" ]; then
-    out=$(sh "$SCRIPT" --mirror "$mirror" "$tmp/Dockerfile" 2>&1); rc=$?
+    out=$(sh "$SCRIPT" --mirror "$mirror" $extra "$tmp/Dockerfile" 2>&1); rc=$?
   else
-    out=$(sh "$SCRIPT" "$tmp/Dockerfile" 2>&1); rc=$?
+    out=$(sh "$SCRIPT" $extra "$tmp/Dockerfile" 2>&1); rc=$?
   fi
   if [ "$expect" = "ok" ]; then
     if [ "$rc" -eq 0 ]; then
@@ -358,6 +363,55 @@ FROM cgr.dev/chainguard/go:latest \
   AS builder
 FROM builder
 EOF
+
+run_case "build-arg override to a forbidden registry is rejected" "" err "docker.io/library/python:3.12" BASE=docker.io/library/python:3.12 <<'EOF'
+ARG BASE=cgr.dev/chainguard/python:latest-dev
+FROM ${BASE}
+RUN echo hi
+EOF
+
+run_case "build-arg override to an allowed registry is accepted" "" ok "" BASE=cgr.dev/chainguard/python:latest-dev <<'EOF'
+ARG BASE=docker.io/library/python:3.12
+FROM ${BASE}
+RUN echo hi
+EOF
+
+run_case "build-arg gives a value to a global ARG with no default" "" ok "" BASE=cgr.dev/chainguard/python:latest-dev <<'EOF'
+ARG BASE
+FROM ${BASE}
+RUN echo hi
+EOF
+
+run_case "build-arg forbidden value via defaultless ARG is rejected" "" err "ubuntu:22.04" BASE=ubuntu:22.04 <<'EOF'
+ARG BASE
+FROM ${BASE}
+RUN echo hi
+EOF
+
+run_case "build-arg with no matching ARG declaration is ignored" "" err '${BASE}' OTHER=cgr.dev/chainguard/python:latest-dev <<'EOF'
+ARG BASE
+FROM ${BASE}
+RUN echo hi
+EOF
+
+# A Dockerfile whose bare name contains '=' must still be read: a POSIX awk
+# operand shaped like name=value is a variable assignment, not a filename, so
+# the gate feeds the file on stdin. If that regresses, this forbidden FROM
+# is never read and the gate prints OK.
+printf 'FROM docker.io/library/python:3.12\n' > "$tmp/from=allowed"
+out=$( (cd "$tmp" && sh "$SCRIPT" "from=allowed") 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  case "$out" in
+    *"docker.io/library/python:3.12"*) pass=$((pass + 1)) ;;
+    *)
+      failcount=$((failcount + 1))
+      echo "FAIL: filename containing '=' — error should name the forbidden FROM, got: $out"
+      ;;
+  esac
+else
+  failcount=$((failcount + 1))
+  echo "FAIL: filename containing '=' — forbidden FROM passed; the file was not read"
+fi
 
 echo ""
 echo "test-check-from-lines: $pass passed, $failcount failed"

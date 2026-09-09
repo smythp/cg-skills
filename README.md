@@ -24,13 +24,12 @@ finished.
 
 ## Install
 
-Once published to the Chainguard Skills Registry:
-
 ```sh
-chainctl skills install chainguard/guardener-dockerfile-migration
+chainctl skills install skills.cgr.dev/chainguard/chainguard-dev/guardener-dockerfile-migration:latest
 ```
 
-Until then, copy this directory into your agent's skills directory.
+For local development, copy this directory into your agent's skills
+directory instead.
 
 ## Layout
 
@@ -49,13 +48,12 @@ standalone skill.
 
 ## Credits and sources
 
-Distilled from Guardener dfc v2 in chainguard-dev/mono at commit
-`6cb4966f8d` — `containers/dfc/internal/agent/` (layer, fixer, and
-validation prompts; FROM validation), `containers/dfc/internal/shared/`
-(registry preference), `chainctl/pkg/images/dfc/tools/` (client tools), and
-`containers/dfc/SPEC.md` (report format and test types). Authors: Billy
-Lynch, Alex Buchanan, Rahul Duvedi, Carlos Tadeu Panato Junior, Jonathan
-Lange, Maxime Gréau, Evan Gibler, Kenny Leung, Ajay Kemparaj.
+Distilled from Guardener dfc v2 (chainguard-dev/mono, containers/dfc): its
+layer, fixer, and validation prompts, FROM validation, registry preference
+rules, client-side image comparison tools, and report format and test types.
+Authors: Billy Lynch, Alex Buchanan, Rahul Duvedi, Carlos Tadeu Panato
+Junior, Jonathan Lange, Maxime Gréau, Evan Gibler, Kenny Leung, Ajay
+Kemparaj.
 
 Prior art folded in: `dockerfile-migrator` (Patrick Smyth) and
 `migrating-dockerfiles-to-chainguard` (Lisa Tagliaferri) from

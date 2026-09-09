@@ -64,8 +64,10 @@ RUN apk add --no-cache curl
 
 ## File ownership for the non-root user
 
-Files created as root in a build stage are unreadable to the runtime user in
-the final stage. Set ownership at copy time:
+Files created as root in a build stage stay root-owned in the final stage:
+the non-root runtime user cannot write them, and cannot read them when the
+mode bits exclude others (0600, 0700 — a 0644 file stays readable). Set
+ownership at copy time rather than reasoning about mode bits:
 
 ```dockerfile
 COPY --from=builder --chown=65532:65532 /app /app
@@ -93,10 +95,12 @@ absolute path and then fails in the user's entrypoint.
 
 ## ENTRYPOINT and CMD on purpose-built images
 
-Purpose-built Chainguard images set ENTRYPOINT to the runtime binary
-(`/usr/bin/node`, `/usr/bin/python`, `java`...), not to a shell wrapper. CMD
-values are passed as arguments to that ENTRYPOINT. A Dockerfile written for
-an upstream image whose entrypoint delegates to CMD breaks silently:
+Purpose-built Chainguard images often set ENTRYPOINT to the runtime binary
+(`/usr/bin/node`, `/usr/bin/python`, `java`...), not to a shell wrapper —
+read the actual value from the image config rather than assuming it. When
+the entrypoint is the binary, CMD values are passed as arguments to it, and
+a Dockerfile written for an upstream image whose entrypoint delegates to CMD
+breaks silently:
 
 - Original: `FROM node:20-alpine` (entrypoint script delegates to CMD),
   `CMD ["npm", "start"]`
@@ -129,8 +133,10 @@ original sets its own CMD later, do not add a CMD "to match the base" — the
 later instruction overrides it and the added line is pure noise. The same for
 ENTRYPOINT, USER, WORKDIR, and SHELL. ENV is the exception: base-image
 environment variables (PATH additions, `LANG`, interpreter version markers)
-can be needed even when the original sets other ENV values, because ENV is
-additive rather than overriding.
+can be needed even when the original sets other ENV values, because ENV
+replaces per key — setting one variable leaves the others standing, but
+re-setting the same key replaces its whole value (a later `PATH=` wipes the
+base's PATH unless it re-includes it).
 
 ## Postgres init scripts
 

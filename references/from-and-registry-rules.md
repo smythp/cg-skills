@@ -6,6 +6,7 @@
 - [Registry kinds and the preference chain](#registry-kinds-and-the-preference-chain)
 - [Purpose-built image over base image](#purpose-built-image-over-base-image)
 - [Tag selection](#tag-selection)
+- [Version pins on the public catalog](#version-pins-on-the-public-catalog)
 - [Digest rule](#digest-rule)
 - [chainguard-base vs wolfi-base](#chainguard-base-vs-wolfi-base)
 - [Stage aliases](#stage-aliases)
@@ -66,7 +67,9 @@ the matching chain for every FROM:
 
 **Public catalog only** (user has no organization): purpose-built image from
 `cgr.dev/chainguard` first; `cgr.dev/chainguard/wolfi-base` as the fallback
-for generic OS bases and for images with no purpose-built equivalent.
+for generic OS bases and for images with no purpose-built equivalent. A
+version-pinned original may also land on `wolfi-base`, but only through the
+decision in [Version pins on the public catalog](#version-pins-on-the-public-catalog).
 
 **Customer organization** (`cgr.dev/<org>`): purpose-built image from the
 organization first, then the organization's `chainguard-base`, then
@@ -113,7 +116,8 @@ Common name mappings:
 | `scratch`, distroless bases | `static` |
 
 Confirm the image actually exists in the chosen registry before using it
-(see `references/lookup-avenues.md`); the table is a starting point, not a
+(`chainctl images repos list --public --repo <name>`, or `--parent <org>`
+for an organization registry); the table is a starting point, not a
 guarantee.
 
 Correct:
@@ -133,12 +137,17 @@ ENV GOPATH=/go PATH=/go/bin:$PATH
 
 The one place base-plus-apk is right: generic OS bases (`ubuntu`, `debian`,
 `alpine`, `fedora`, UBI) that exist only to host arbitrary packages. Those map
-to `chainguard-base`/`wolfi-base` plus the translated package installs.
+to `chainguard-base`/`wolfi-base` plus the translated package installs. (A
+version-pinned original on the public catalog can also land on base-plus-apk,
+but only through the decision described in
+[Version pins on the public catalog](#version-pins-on-the-public-catalog).)
 
 ## Tag selection
 
 For a Chainguard registry, list the available tags
-(`chainctl images tags list`, see `references/lookup-avenues.md`) and pick:
+(`chainctl images tags list --public --repo <name>`, or
+`--parent <org> --repo <name>`; the listing includes each tag's digest) and
+pick:
 
 1. The exact version of the original (`golang:1.21` → `go:1.21`), truncating
    patch versions to major.minor (`3.12.1` → `3.12`).
@@ -159,6 +168,44 @@ organizations. Check the tag list rather than assuming a version tag exists.
 `chainguard-base` and `wolfi-base` have no `-dev` variant — they already
 include apk and a shell. Use `latest`.
 
+## Version pins on the public catalog
+
+The public catalog serves purpose-built images only at `latest`/`latest-dev`,
+so a version-pinned original (`python:3.11-slim`) cannot keep its pin on a
+public purpose-built image. Check the pinned major.minor against what the
+purpose-built image's `latest` actually carries (pull it and read the
+version, or check its tag listing) and apply:
+
+**Default**: when the versions match in major.minor, or the original was
+unpinned, use the purpose-built image — nothing drifts.
+
+**Named exception — the versions differ in major.minor**: moving the runtime
+version is the user's decision, not the migration's. Ask, offering the two
+real options: the purpose-built image at `latest` (accepting the version
+drift) or `wolfi-base` plus the versioned apk package (`python-3.11` with
+`py3.11-pip`), which keeps the pinned version with no drift. Running
+unattended with no user to ask, take `wolfi-base` plus the versioned apk
+package — a migration must never change the runtime version without consent,
+and disclosing the drift in the final report is too late to count as consent.
+
+Organization registries are unaffected: they carry version tags, so the pin
+is matched there by the tag-selection rules above.
+
+Correct (original `FROM python:3.11-slim`, public catalog, purpose-built
+`latest` is a different major.minor, no user to ask):
+
+```dockerfile
+FROM cgr.dev/chainguard/wolfi-base:latest
+RUN apk add --no-cache python-3.11 py3.11-pip
+```
+
+Wrong (the pinned 3.11 silently becomes whatever `latest` is; the user finds
+out when the runtime behaves differently):
+
+```dockerfile
+FROM cgr.dev/chainguard/python:latest-dev
+```
+
 ## Digest rule
 
 A digest-pinned original gets a digest-pinned migration; an unpinned original
@@ -170,7 +217,7 @@ Correct:
 
 ```dockerfile
 # Original: FROM golang:1.25@sha256:1e6e1a6a...
-FROM cgr.dev/chainguard/go:latest-dev@sha256:8a1b7fa2f1e0c9... 
+FROM cgr.dev/chainguard/go:latest-dev@sha256:8a1b7fa2f1e0c9...
 ```
 
 Wrong (upstream digest carried onto the Chainguard image — this reference can

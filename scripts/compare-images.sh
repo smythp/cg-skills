@@ -13,8 +13,8 @@
 #
 # Environment:
 #   SYFT_BIN    path to a syft binary (overrides lookup on PATH)
-#   SYFT_IMAGE  syft container image for the fallback path
-#               (default cgr.dev/chainguard/syft:latest)
+#   SYFT_IMAGE  syft container image for the fallback path (overrides the
+#               pinned default below)
 #
 # Exit codes:
 #   0 — all three comparisons were performed (differences are reported as
@@ -23,7 +23,9 @@
 #       Treat this as a failed validation gate, never as "no differences".
 #   2 — usage error
 #
-# Dependencies: sh, awk, tar, sort, comm, docker (daemon running).
+# Dependencies: sh, awk, tar, sort, comm, docker (daemon running), timeout
+# (GNU coreutils or BusyBox). The script refuses to run docker without
+# timeout: an unbounded save or scan can hang the validation gate.
 
 set -u
 
@@ -34,7 +36,13 @@ if [ -z "$ORIG" ] || [ -z "$MIGR" ]; then
   exit 2
 fi
 
-SYFT_IMAGE="${SYFT_IMAGE:-cgr.dev/chainguard/syft:latest}"
+# The fallback scanner is pinned by digest so it cannot change under the
+# skill. It is the upstream syft image because the fallback must be pullable
+# with no Chainguard entitlement (cgr.dev/chainguard/syft is not in the free
+# public catalog). To bump: pick a new tag, run
+#   docker buildx imagetools inspect docker.io/anchore/syft:<tag>
+# and replace both the tag and the sha256 below with what it prints.
+SYFT_IMAGE="${SYFT_IMAGE:-docker.io/anchore/syft:v1.51.1@sha256:95fe0835e5bebc6f8b1f8acef68d47d63d594ef4c0f25c097ff853b23cbac74c}"
 # 200 lines per diff list keeps output readable in an agent transcript while
 # still naming every difference in the common case; counts are always exact.
 LIST_CAP=200
@@ -49,18 +57,16 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Wrap long-running steps in a timeout when the timeout utility exists.
-if command -v timeout >/dev/null 2>&1; then
-  bounded() { timeout "$TIME_LIMIT" "$@"; }
-else
-  bounded() { "$@"; }
-fi
-
 not_performed() {
   echo "compare-images: comparison was NOT performed: $1"
   echo "compare-images: do not treat this as an empty diff; the validation gate fails."
   exit 1
 }
+
+# Every save, pull, and scan runs under this bound; without the timeout
+# utility the script fails closed rather than running docker unbounded.
+command -v timeout >/dev/null 2>&1 || not_performed "the timeout utility (GNU coreutils or BusyBox) is missing; refusing to run unbounded docker save/pull/scan"
+bounded() { timeout "$TIME_LIMIT" "$@"; }
 
 command -v docker >/dev/null 2>&1 || not_performed "docker not found"
 docker image inspect "$ORIG" >/dev/null 2>&1 || not_performed "image not present locally: $ORIG (docker pull or build it first)"
@@ -95,8 +101,8 @@ scan_packages() {
     bounded "$SYFT_BIN" -q -o syft-table "docker-archive:$tmp/$base" > "$out.raw" || return 1
   else
     # Archive dir mounted read-only; nothing from the scanned image executes.
-    # --user 0:0 because the syft image runs as a non-root user that cannot
-    # read the 0700 temp dir; the mount stays read-only either way.
+    # --user 0:0 so the scanner can read the 0700 temp dir regardless of the
+    # image's default user; the mount stays read-only either way.
     bounded docker run --rm --user 0:0 -v "$tmp:/scan:ro" "$SYFT_IMAGE" -q -o syft-table "docker-archive:/scan/$base" > "$out.raw" || return 1
   fi
   # syft-table: NAME VERSION TYPE (header on line 1)
@@ -152,9 +158,11 @@ scan_packages "$MIGR" "$tmp/pkg-migr" || not_performed "SBOM scan failed for $MI
 list_files "$ORIG" "$tmp/files-orig" || not_performed "file listing failed for $ORIG"
 list_files "$MIGR" "$tmp/files-migr" || not_performed "file listing failed for $MIGR"
 
-# Shared libraries: file paths whose basename looks like NAME.so or NAME.so.N
-grep -E '(^|/)[^/]+\.so(\.[0-9][0-9.]*)?$' "$tmp/files-orig" > "$tmp/libs-orig" || true
-grep -E '(^|/)[^/]+\.so(\.[0-9][0-9.]*)?$' "$tmp/files-migr" > "$tmp/libs-migr" || true
+# Shared libraries: paths ending in .so or containing .so. anywhere —
+# Guardener's isSharedLibrary rule. The suffix after .so. is not required to
+# be numeric (libfoo.so.debug counts as much as libfoo.so.1.2).
+grep -E '\.so($|\.)' "$tmp/files-orig" > "$tmp/libs-orig" || true
+grep -E '\.so($|\.)' "$tmp/files-migr" > "$tmp/libs-migr" || true
 
 print_diff "packages (name@version)" "$tmp/pkg-orig" "$tmp/pkg-migr"
 print_diff "files" "$tmp/files-orig" "$tmp/files-migr"

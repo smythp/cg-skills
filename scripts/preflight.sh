@@ -6,9 +6,10 @@
 #   BUILD_CONTEXT_DIR  the directory that will be sent to docker build
 #                      (default: current directory)
 #
-# Exit codes: 0 = required tools present (docker daemon + chainctl login);
-# 1 = a required tool is missing or not working. Optional findings (syft,
-# dfc, .dockerignore) are reported but never fail the check.
+# Exit codes: 0 = required tools present (docker daemon, chainctl login and
+# a working organization listing, timeout); 1 = a required tool is missing or
+# not working. Optional findings (syft, dfc, .dockerignore) are reported but
+# never fail the check.
 
 set -u
 
@@ -40,12 +41,23 @@ if command -v chainctl >/dev/null 2>&1; then
   if chainctl auth status >/dev/null 2>&1; then
     ident=$(chainctl auth status 2>/dev/null | awk -F'|' '/Email/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}')
     echo "chainctl: OK (logged in${ident:+ as $ident})"
-    orgs=$(chainctl iam organizations list -o json 2>/dev/null | grep -o '"name"[^,}]*' | sed 's/.*: *"//; s/"$//' | sort -u)
-    if [ -n "$orgs" ]; then
-      echo "organizations visible to this identity:"
-      echo "$orgs" | sed 's/^/  /'
+    # The listing runs alone so its exit status is visible: in a pipeline it
+    # would be swallowed (no pipefail in POSIX sh), and an API or network
+    # failure would read as "no organizations" — silently steering an
+    # entitled customer to the public catalog.
+    orgs_json=$(chainctl iam organizations list -o json 2>/dev/null)
+    orgs_rc=$?
+    if [ "$orgs_rc" -ne 0 ]; then
+      echo "organizations: LISTING FAILED (chainctl iam organizations list exited $orgs_rc). This is an API or network error, not 'no organizations'; without the real list, an entitled organization would be migrated onto the public catalog. Fix connectivity or auth and rerun."
+      fail=1
     else
-      echo "organizations: none visible (public catalog cgr.dev/chainguard will be the default)"
+      orgs=$(printf '%s\n' "$orgs_json" | grep -o '"name"[^,}]*' | sed 's/.*: *"//; s/"$//' | sort -u)
+      if [ -n "$orgs" ]; then
+        echo "organizations visible to this identity:"
+        echo "$orgs" | sed 's/^/  /'
+      else
+        echo "organizations: none visible (public catalog cgr.dev/chainguard will be the default)"
+      fi
     fi
   else
     echo "chainctl: present but not logged in. Run: chainctl auth login"
@@ -53,6 +65,13 @@ if command -v chainctl >/dev/null 2>&1; then
   fi
 else
   echo "chainctl: NOT FOUND. Install it (https://edu.chainguard.dev/chainguard/chainctl/) — tag, digest, and org lookups need it."
+  fail=1
+fi
+
+if command -v timeout >/dev/null 2>&1; then
+  echo "timeout: OK"
+else
+  echo "timeout: NOT FOUND (GNU coreutils or BusyBox provide it). The lookup and comparison scripts refuse to run docker without it — an unbounded pull or scan can hang the migration indefinitely."
   fail=1
 fi
 

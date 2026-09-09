@@ -159,7 +159,8 @@ real example:
 - Migrated: FROM cgr.dev/chainguard/python:latest-dev AS builder
 - Purpose-built python image over wolfi-base; -dev variant because the stage
   runs pip. Public catalog serves latest/latest-dev, so the 3.11 pin became
-  latest (python 3.13) with the user's agreement.
+  latest with the user's agreement; the no-drift alternative (wolfi-base plus
+  the python-3.11 apk package) was offered and declined.
 
 ### RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 - Migrated: USER root / RUN apk add --no-cache curl / USER 65532
@@ -183,7 +184,8 @@ real example:
 
 ## Functional Tests
 
-- [PASS] python --version (both images; 3.11.9 vs 3.13.2, accepted by user)
+- [PASS] python --version (both images; the original's pinned 3.11 vs the
+  migrated image's latest — the version drift the user accepted)
 - [PASS] python -c "import flask"
 - [PASS] file exists: /app/app.py
 - [PASS] app startup; HTTP GET / on 127.0.0.1 returned 200

@@ -172,8 +172,9 @@ translated package name with `scripts/apk-lookup.sh` before the build:
 
 When a package has no Wolfi equivalent at all, decide with the user whether
 to drop it, build it from source in a builder stage, or stop. If it is
-dropped, apply the internal-consistency rule in
-`references/users-entrypoints-paths.md`.
+dropped, apply the internal-consistency rule: remove the earlier `ENV`,
+`ARG`, and symlink lines that existed for it, and fix or remove later lines
+that invoke it.
 
 ## Version pinning
 
