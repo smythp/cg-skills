@@ -63,8 +63,7 @@ directory instead.
 - `evals/` — end-to-end harness: six before/after fixtures whose
   original builds and whose skill-regenerated `Dockerfile.chainguard` are
   built, gated, and smoke-tested with real Docker (`evals/run.sh`; see
-  `evals/README.md`). The harness is bash — a maintainer tool that
-  needs Docker anyway; the POSIX-sh rule applies to `scripts/` only.
+  `evals/README.md`).
 
 ## Version
 

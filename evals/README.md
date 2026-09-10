@@ -1,21 +1,11 @@
 # End-to-end harness
 
-Proves, with real Docker builds, that the migrations this skill produces
+Checks, with real Docker builds, that the migrations this skill produces
 hold up: for every fixture, the original Dockerfile still builds and passes
 its smoke test (so the fixture itself is valid), and the expected
 `Dockerfile.chainguard` passes the skill's FROM allowlist gate and stage-end
 USER rule, builds, and passes the same smoke test. The harness exercises the
 skill's *outputs*; it does not run the skill.
-
-This harness is written in bash — it is a maintainer tool that needs Docker
-anyway; the POSIX-sh portability rule applies to `scripts/`, not to
-`evals/`.
-
-The directory is named `evals/` because that is the name the Agent Skills
-documentation and Claude Code's plugin eval tooling use for a skill's own
-evaluations, so those tools find it where they expect. `chainctl skills
-validate` prints exactly which files a push would publish; run it to see
-whether this directory ships in the artifact.
 
 ## Running it
 
@@ -50,8 +40,7 @@ The run exits 0 only when every fixture is PASS or SKIP.
   the same fixtures against an org catalog. Default: unset, the public
   catalog.
 - `SKILL_DIR` — where the skill's `scripts/` live. Defaults to one level
-  above `run.sh`; this is the harness's only path assumption, so moving
-  `evals/` elsewhere means updating one default.
+  above `run.sh`.
 - `SKIP_BEFORE=1` — skip the "before" sanity build for faster iteration.
 - `KEEP_IMAGES=1` — keep the built images for inspection afterwards.
 
@@ -78,5 +67,4 @@ Create `evals/fixtures/<name>/` with:
   its validation gate. If the gate fails, place
   `Dockerfile.chainguard.unverified` and the report instead — do not edit
   the file into a passing state. Scrub absolute paths, run identifiers, and
-  timestamps from the report so it neither rots nor leaks the machine it
-  was generated on.
+  timestamps from the report.
