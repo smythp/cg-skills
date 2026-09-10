@@ -1,0 +1,37 @@
+# pull official base image
+FROM cgr.dev/chainguard/wolfi-base:latest
+
+# set work directory
+WORKDIR /usr/src/app
+
+# set environment varibles
+ENV PYTHONDONTWRITEBYTECODE 1
+ENV PYTHONUNBUFFERED 1
+
+# install os packages
+RUN apk add --no-cache python-3.12 py3.12-pip gettext git libpq-17 make rsync
+
+ARG REQ_FILE=requirements/prod.txt
+
+# install python dependencies
+COPY ./requirements ./requirements
+RUN apk add --no-cache \
+        gcc \
+        glibc-dev \
+        postgresql-17-dev \
+        python-3.12-dev \
+        zlib-dev \
+    && python3 -m pip install --no-cache-dir -r ${REQ_FILE} \
+    && apk del \
+        gcc \
+        glibc-dev \
+        postgresql-17-dev \
+        python-3.12-dev \
+        zlib-dev
+
+# copy project
+COPY . .
+
+# ENTRYPOINT is specified only in the local docker-compose.yml to avoid
+# accidentally running it in deployed environments.
+CMD ["python3"]

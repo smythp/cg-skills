@@ -42,9 +42,14 @@ directory instead.
   `scripts/tests/`: run each suite with `sh scripts/tests/<name>.sh`.
   `test-check-from-lines.sh` needs no Docker; `test-compare-images.sh` needs
   Docker with registry egress; the two doc guards, `test-docs-bounded.sh`
-  (every docker build/pull/run/save/exec line in the docs carries
+  (every docker build/pull/run/save/exec/manifest line in the docs carries
   `timeout -k 30`) and `test-docs-container-names.sh` (every `--name` uses
   the `migr-$RUN_ID-` run identifier), need only sh and awk.
+- `tests/e2e/` — end-to-end harness: six before/after fixtures whose
+  original builds and whose skill-regenerated `Dockerfile.chainguard` are
+  built, gated, and smoke-tested with real Docker (`tests/e2e/run.sh`; see
+  `tests/e2e/README.md`). The harness is bash — a maintainer tool that
+  needs Docker anyway; the POSIX-sh rule applies to `scripts/` only.
 
 ## Version
 
@@ -65,3 +70,9 @@ Prior art folded in: `dockerfile-migrator` (Patrick Smyth) and
 chainguard-demo/claude-plugins; `chainguard-migrate-dockerfile` (iamfuzz);
 Chainguard Power for Kiro (iamfuzz, Brian Thomason, Jonathan Lange, Jason
 Meridth); the open-source dfc CLI (chainguard-dev/dfc).
+
+The end-to-end harness under `tests/e2e/` is adapted from `dfc-skillz` by
+Adrian Mouat (github.com/amouat/dfc-skillz): the runner shape and all six
+fixtures' inputs are his, as are the manifest-inspect existence-and-digest
+check for external mirrors and the rule that every public-catalog fallback
+is called out explicitly in the report.

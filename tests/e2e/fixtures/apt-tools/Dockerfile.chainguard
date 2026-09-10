@@ -1,0 +1,5 @@
+FROM cgr.dev/chainguard/wolfi-base:latest
+
+RUN apk add --no-cache curl jq
+
+CMD ["sh", "-c", "curl --version && jq --version"]

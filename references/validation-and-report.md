@@ -168,8 +168,11 @@ a draft that looks finished gets deployed.
 
 Write `migration-report.md` with these sections: Summary, Layer-by-Layer
 Changes (with the reason for each change), Package Changes, Config
-Differences, Functional Tests, Warnings, and What Was Not Tested. A condensed
-real example:
+Differences, Functional Tests, Warnings, and What Was Not Tested. When an
+organization registry or mirror is in play, Warnings carries one sentence
+per image that fell back to the public `cgr.dev/chainguard` catalog, naming
+the image and the reason (for example: ruby is not in your org, so the
+public `cgr.dev/chainguard/ruby` was used). A condensed real example:
 
 ```markdown
 # Migration Report: flask-app

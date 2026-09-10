@@ -20,7 +20,11 @@ metadata:
     (Patrick Smyth) and migrating-dockerfiles-to-chainguard (Lisa Tagliaferri),
     chainguard-demo/claude-plugins; chainguard-migrate-dockerfile (iamfuzz,
     chainguard-dev/mono cursor plugin); Chainguard Power for Kiro (iamfuzz,
-    Brian Thomason, Jonathan Lange, Jason Meridth); dfc CLI (chainguard-dev/dfc).
+    Brian Thomason, Jonathan Lange, Jason Meridth); dfc CLI (chainguard-dev/dfc);
+    dfc-skillz (Adrian Mouat, github.com/amouat/dfc-skillz): the end-to-end
+    harness shape and the six fixtures' inputs under tests/e2e/, the
+    manifest-inspect mirror check, and the public-catalog fallback-callout
+    rule.
 allowed-tools: Read, Write, Edit, Grep, Glob, Bash
 ---
 
@@ -252,7 +256,8 @@ reference file carries the detail; the one-line forms:
    through; nothing else does.
 8. **Digest rule**: pinned original → migration pinned to the Chainguard
    image's own digest; unpinned stays unpinned; mirror digests come from
-   RepoDigests or are dropped with a warning
+   the mirror's manifest digest (RepoDigests after a pull as the fallback)
+   or are dropped with a warning
    (`references/from-and-registry-rules.md` documents the one deliberate
    deviation from Guardener here).
 

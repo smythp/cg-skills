@@ -87,6 +87,13 @@ fall back to it rather than to any other host.
 In every chain, `wolfi-base` is the floor. There is no lower fallback; going
 below the Chainguard catalog defeats the migration.
 
+Every fallback from an organization registry (or its mirror) to the public
+`cgr.dev/chainguard` catalog is called out explicitly in the report — one
+sentence per image, naming the image and the reason. For example: ruby is
+not in your org, so the public `cgr.dev/chainguard/ruby` was used. A silent
+fallback leaves the customer believing they run their entitled, possibly
+customized image when they do not.
+
 ## Purpose-built image over base image
 
 When the original FROM is a language or application image (`golang:1.21`,
@@ -269,10 +276,13 @@ How to resolve the digest, per registry kind:
 
 - **Chainguard registry (public or org)**: `chainctl images tags list`
   returns the digest per tag. Pin that.
-- **External mirror**: pull the chosen reference
-  (`timeout -k 30 600 docker pull <ref>`), then read
-  `docker inspect --format='{{index .RepoDigests 0}}' <ref>`. If the mirror
-  reports no RepoDigest, drop the digest from the migrated FROM and record a
+- **External mirror**: the manifest digest, read without pulling —
+  `timeout -k 30 60 docker manifest inspect -v <ref>` and take
+  `.Descriptor.digest` (requires a prior `docker login` to the mirror).
+  When the mirror rejects manifest inspection, fall back to pulling the
+  chosen reference (`timeout -k 30 600 docker pull <ref>`) and reading
+  `docker inspect --format='{{index .RepoDigests 0}}' <ref>`. If neither
+  yields a digest, drop the digest from the migrated FROM and record a
   warning in the report — chainctl and the Chainguard APIs do not index
   arbitrary mirrors, so there is nothing else to ask.
 

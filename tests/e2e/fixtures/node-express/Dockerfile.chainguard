@@ -1,0 +1,13 @@
+FROM cgr.dev/chainguard/wolfi-base:latest
+
+RUN apk add --no-cache nodejs-20 npm
+
+WORKDIR /app
+
+COPY package.json .
+RUN npm install
+
+COPY server.js .
+
+EXPOSE 8080
+CMD ["node", "server.js"]

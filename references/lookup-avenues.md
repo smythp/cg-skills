@@ -59,7 +59,21 @@ either avenue — enumerate a specific repo's tags, not the whole org.
 
 ## Does image X exist on the external mirror, and what is its digest?
 
-Default, and only avenue: docker.
+Default: a manifest inspection, which answers existence and digest in one
+bounded call without pulling any layers. It requires a prior `docker login`
+to the mirror.
+
+```sh
+timeout -k 30 60 docker manifest inspect my-corp.example.io/chainguard-remote/python:latest-dev >/dev/null && echo exists
+timeout -k 30 60 docker manifest inspect -v my-corp.example.io/chainguard-remote/python:latest-dev
+```
+
+The digest to pin is the manifest digest — `.Descriptor.digest` in the
+verbose output (for a multi-platform reference, the descriptor whose
+platform matches the build).
+
+Fallback, when the mirror rejects manifest inspection (some registries
+disable the endpoints it uses): pull and read RepoDigests.
 
 ```sh
 timeout -k 30 600 docker pull my-corp.example.io/chainguard-remote/python:latest-dev
@@ -69,10 +83,12 @@ docker inspect --format '{{index .RepoDigests 0}}' my-corp.example.io/chainguard
 The pull runs under the workflow's 10-minute pull bound; `docker inspect`
 reads local metadata and needs no bound.
 
-If RepoDigests is empty, the mirror reports no digest — drop the digest from
-the migrated FROM and record a warning. There is no exception: chainctl and
-the Chainguard MCP servers do not index arbitrary mirrors, so asking them
-about a mirror path returns nothing useful.
+If neither avenue yields a digest, drop the digest from the migrated FROM
+and record a warning. There is no other exception: chainctl and the
+Chainguard MCP servers do not index arbitrary mirrors, so asking them
+about a mirror path returns nothing useful. For Chainguard registries
+(public or org), `chainctl images tags list` stays the default — the tag
+listing already carries the digest.
 
 ## What is an image's user, entrypoint, cmd, env, workdir?
 

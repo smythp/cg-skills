@@ -1,9 +1,9 @@
 #!/bin/sh
 # Doc guard: every shell line in SKILL.md and references/*.md that invokes a
-# long-running docker subcommand (build, pull, run, save, exec) must carry the
-# workflow's inline bound — `timeout -k 30 ` earlier on the same line. A doc
-# line an agent copies without a bound is how an unbounded build gets back in
-# after review.
+# long-running docker subcommand (build, pull, run, save, exec, manifest)
+# must carry the workflow's inline bound — `timeout -k 30 ` earlier on the
+# same line. A doc line an agent copies without a bound is how an unbounded
+# build gets back in after review.
 #
 # What counts as an invocation:
 #   - any line inside a ```sh fenced block containing docker <subcommand>
@@ -38,7 +38,7 @@ for f in "$DIR/SKILL.md" "$DIR"/references/*.md; do
     skip { next }
     {
       line = $0; s = line; base = 0; bad = 0
-      while (match(s, /docker (build|pull|run|save|exec)/)) {
+      while (match(s, /docker (build|pull|run|save|exec|manifest)/)) {
         pre = substr(line, 1, base + RSTART - 1)
         post = substr(line, base + RSTART + RLENGTH)
         if (pre !~ /timeout -k 30 /) {
@@ -61,5 +61,5 @@ if [ "$fail" -ne 0 ]; then
   echo "test-docs-bounded: FAIL — the lines above invoke docker without 'timeout -k 30 ' on the same line"
   exit 1
 fi
-echo "test-docs-bounded: PASS — every docker build/pull/run/save/exec line in the docs is bounded"
+echo "test-docs-bounded: PASS — every docker build/pull/run/save/exec/manifest line in the docs is bounded"
 exit 0
