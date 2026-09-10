@@ -49,10 +49,10 @@ directory instead.
   the `migr-$RUN_ID-` run identifier), need only sh and awk; so does
   `test-docs-guards-selfcheck.sh`, which seeds known violations into a temp
   doc tree and asserts both guards catch each one by file:line.
-- `tests/e2e/` — end-to-end harness: six before/after fixtures whose
+- `evals/` — end-to-end harness: six before/after fixtures whose
   original builds and whose skill-regenerated `Dockerfile.chainguard` are
-  built, gated, and smoke-tested with real Docker (`tests/e2e/run.sh`; see
-  `tests/e2e/README.md`). The harness is bash — a maintainer tool that
+  built, gated, and smoke-tested with real Docker (`evals/run.sh`; see
+  `evals/README.md`). The harness is bash — a maintainer tool that
   needs Docker anyway; the POSIX-sh rule applies to `scripts/` only.
 
 ## Version
@@ -75,7 +75,7 @@ chainguard-demo/claude-plugins; `chainguard-migrate-dockerfile` (iamfuzz);
 Chainguard Power for Kiro (iamfuzz, Brian Thomason, Jonathan Lange, Jason
 Meridth); the open-source dfc CLI (chainguard-dev/dfc).
 
-The end-to-end harness under `tests/e2e/` is adapted from `dfc-skillz` by
+The end-to-end harness under `evals/` is adapted from `dfc-skillz` by
 Adrian Mouat (github.com/amouat/dfc-skillz): the runner shape and all six
 fixtures' inputs are his, as are the manifest-inspect existence-and-digest
 check for external mirrors and the rule that every public-catalog fallback

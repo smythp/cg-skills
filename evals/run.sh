@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end harness for guardener-dockerfile-migration.
 #
-# For each fixture under tests/e2e/fixtures/, this:
+# For each fixture under evals/fixtures/, this:
 #   1. Builds the original Dockerfile ("before") and runs its smoke test
 #      (sanity — a failure here is ERROR, a fixture bug, not a migration
 #      failure)
@@ -18,20 +18,20 @@
 # non-zero. A fixture with no expected file at all is SKIP.
 #
 # This harness is bash — it is a maintainer tool that needs Docker anyway;
-# the POSIX-sh rule applies to scripts/, not to tests/e2e/.
+# the POSIX-sh rule applies to scripts/, not to evals/.
 #
 # Usage:
-#   tests/e2e/run.sh                 # run all fixtures
-#   tests/e2e/run.sh python-flask    # run named fixture(s)
+#   evals/run.sh                 # run all fixtures
+#   evals/run.sh python-flask    # run named fixture(s)
 #
 # Env:
 #   TEST_ORG     cgr.dev org substituted for the public "chainguard" org in
 #                Dockerfile.chainguard (default: unset — the expected files
 #                stay on the public catalog, so anyone can run the harness
 #                with no Chainguard entitlement)
-#   SKILL_DIR    the skill directory holding scripts/ (default: two levels
+#   SKILL_DIR    the skill directory holding scripts/ (default: one level
 #                above this script — the harness's one path assumption, so a
-#                git mv of tests/e2e/ means changing this default alone)
+#                git mv of evals/ means changing this default alone)
 #   SKIP_BEFORE=1   skip the "before" sanity build (faster iteration)
 #   KEEP_IMAGES=1   don't remove built images afterwards
 #
@@ -45,7 +45,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FIXTURES="$ROOT/fixtures"
-SKILL_DIR="${SKILL_DIR:-$(cd "$ROOT/../.." && pwd)}"
+SKILL_DIR="${SKILL_DIR:-$(cd "$ROOT/.." && pwd)}"
 RUN_ID="$(date +%s)-$$"
 # shellcheck source=lib.sh
 source "$ROOT/lib.sh"

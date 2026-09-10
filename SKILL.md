@@ -22,7 +22,7 @@ metadata:
     chainguard-dev/mono cursor plugin); Chainguard Power for Kiro (iamfuzz,
     Brian Thomason, Jonathan Lange, Jason Meridth); dfc CLI (chainguard-dev/dfc);
     dfc-skillz (Adrian Mouat, github.com/amouat/dfc-skillz): the end-to-end
-    harness shape and the six fixtures' inputs under tests/e2e/, the
+    harness shape and the six fixtures' inputs under evals/, the
     manifest-inspect mirror check, and the public-catalog fallback-callout
     rule.
 allowed-tools: Read, Write, Edit, Grep, Glob, Bash

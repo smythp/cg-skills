@@ -9,13 +9,19 @@ skill's *outputs*; it does not run the skill.
 
 This harness is written in bash — it is a maintainer tool that needs Docker
 anyway; the POSIX-sh portability rule applies to `scripts/`, not to
-`tests/e2e/`.
+`evals/`.
+
+The directory is named `evals/` because that is the name the Agent Skills
+documentation and Claude Code's plugin eval tooling use for a skill's own
+evaluations, so those tools find it where they expect. `chainctl skills
+validate` prints exactly which files a push would publish; run it to see
+whether this directory ships in the artifact.
 
 ## Running it
 
 ```sh
-tests/e2e/run.sh                 # all fixtures
-tests/e2e/run.sh python-flask    # one or more named fixtures
+evals/run.sh                 # all fixtures
+evals/run.sh python-flask    # one or more named fixtures
 ```
 
 Requirements: Docker with a running daemon, bash, curl, `timeout`. The
@@ -43,9 +49,9 @@ The run exits 0 only when every fixture is PASS or SKIP.
   the expected files (`sed cgr.dev/chainguard/ → cgr.dev/$TEST_ORG/`) to run
   the same fixtures against an org catalog. Default: unset, the public
   catalog.
-- `SKILL_DIR` — where the skill's `scripts/` live. Defaults to two levels
+- `SKILL_DIR` — where the skill's `scripts/` live. Defaults to one level
   above `run.sh`; this is the harness's only path assumption, so moving
-  `tests/e2e/` elsewhere means updating one default.
+  `evals/` elsewhere means updating one default.
 - `SKIP_BEFORE=1` — skip the "before" sanity build for faster iteration.
 - `KEEP_IMAGES=1` — keep the built images for inspection afterwards.
 
@@ -56,7 +62,7 @@ EXIT, INT, and TERM.
 
 ## Adding a fixture
 
-Create `tests/e2e/fixtures/<name>/` with:
+Create `evals/fixtures/<name>/` with:
 
 - `Dockerfile` — the original, unmigrated file.
 - The build context it needs (source files, requirements, and so on).
