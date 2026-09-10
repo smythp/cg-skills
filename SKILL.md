@@ -53,10 +53,12 @@ Copy this checklist into your reply and tick items as you complete them:
 ### 1. Preflight
 
 Run `scripts/preflight.sh <context-dir>`. If Docker is not running or
-chainctl is missing or logged out, stop and tell the user what to fix.
-Without Docker there is no verification, so do not continue with an
-unverified rewrite; point the user at the dfc CLI for a deterministic rewrite
-without builds.
+chainctl is missing or logged out, stop and relay preflight's messages to the
+user: each names what is missing and links its install instructions, so the
+user can install it or ask you to. Do not install anything on the skill's
+initiative. Without Docker there is no verification, so do not continue with
+an unverified rewrite; point the user at the dfc CLI for a deterministic
+rewrite without builds.
 
 ### 2. Trust gate — always
 
@@ -139,7 +141,8 @@ If the `dfc` CLI is installed, run
 `dfc --registry=<mirror-prefix> ...` when a mirror is configured) and treat
 every line of the draft as untested input: it saves time on the easy lines,
 and nothing from it is emitted until step 8 verifies it. If dfc is not
-installed, skip this — do not install anything for it.
+installed, skip this; preflight gave the user its install link, and
+installing it is their call.
 
 ### 8. Migrate layer by layer, in order, per stage
 

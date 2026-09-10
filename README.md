@@ -19,13 +19,19 @@ run writes the report with the reasons and leaves the draft as
 ## Requirements
 
 - Docker with a running daemon
-- `chainctl`, logged in (`chainctl auth login`)
-- Optional: `syft` (otherwise a syft container is used for image
-  comparison), `dfc` (optional deterministic first draft)
+  (install: https://docs.docker.com/get-docker/)
+- `chainctl`, logged in with `chainctl auth login`, which is interactive
+  (install: https://edu.chainguard.dev/platform/chainctl-usage/how-to-install-chainctl/)
+- Optional: `syft` (install: https://github.com/anchore/syft#installation;
+  otherwise a syft container is used for image comparison) and `dfc`
+  (install: https://github.com/chainguard-dev/dfc; optional deterministic
+  first draft)
 
-The skill installs nothing. Preflight stops when Docker or `chainctl` is
-missing and says which; without `syft` the pinned scanner container is used,
-and without `dfc` the draft step is skipped.
+The skill does not install these. `scripts/preflight.sh` checks each one
+and, for anything missing, tells the user what is missing and where the
+install instructions are; the user decides whether to install it or to ask
+their agent to. Without `syft` the pinned scanner container is used; without
+`dfc` the draft step is skipped.
 
 ## Install
 
