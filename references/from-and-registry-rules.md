@@ -198,12 +198,13 @@ include apk and a shell. Use `latest`.
 The public catalog serves purpose-built images only at `latest`/`latest-dev`,
 so a version-pinned original (`python:3.11-slim`) cannot keep its pin on a
 public purpose-built image. Find out what runtime version the purpose-built
-image's `latest` actually carries: pull it and run a bounded, named probe,
+image's `latest` actually carries: pull it and run a bounded probe, named
+with the run identifier from SKILL.md step 5,
 
 ```sh
 timeout -k 30 600 docker pull cgr.dev/chainguard/python:latest
-timeout -k 30 60 docker run --rm --name migr-version-probe --entrypoint python cgr.dev/chainguard/python:latest --version
-docker rm -f migr-version-probe >/dev/null 2>&1 || true
+timeout -k 30 60 docker run --rm --name migr-$RUN_ID-version-probe --entrypoint python cgr.dev/chainguard/python:latest --version
+docker rm -f migr-$RUN_ID-version-probe >/dev/null 2>&1 || true
 ```
 
 or read the version from the image config or SBOM. A tag listing cannot

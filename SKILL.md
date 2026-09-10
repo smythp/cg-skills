@@ -47,7 +47,7 @@ Copy this checklist into your reply and tick items as you complete them:
 - [ ] 2. User confirmed the build after a summary of what it does
 - [ ] 3. Build invocation captured; original built as the baseline
 - [ ] 4. Org / mirror / FIPS / probe preferences clarified
-- [ ] 5. Working directory created outside the build context
+- [ ] 5. Working directory created outside the build context; RUN_ID minted
 - [ ] 6. File mapped: stages, package managers, referenced context files
 - [ ] 7. Optional dfc draft taken or skipped
 - [ ] 8. Every layer translated, built, compared, and tested
@@ -121,6 +121,11 @@ and build with `-f` pointing there. A working file inside the context gets
 swept up by `COPY . .` — it contaminates the migrated image, invalidates the
 comparison, and busts Docker's layer cache on every edit. Nothing is written
 beside the original until step 12, and the original file is never edited.
+
+Mint one run identifier alongside the directory — `RUN_ID=$(date +%s)-$$` —
+and name every container this run starts `migr-$RUN_ID-<purpose>` (see Time
+and cleanup bounds): two concurrent migrations sharing a fixed name would
+collide, and one run's cleanup would remove the other run's container.
 
 ### 6. Map the file
 
@@ -282,18 +287,21 @@ timeout -k 30 600 docker pull cgr.dev/chainguard/python:latest
 
 `timeout` kills only the docker client; a container the run started keeps
 running daemon-side. So every container the workflow starts — a probe, a
-functional check, a detached server — gets a `--name` unique to that run,
-and the name is removed right after the check or after a timeout:
+functional check, a detached server — gets a `--name` built from the step-5
+run identifier (`migr-$RUN_ID-<purpose>`), and exactly that name is removed
+right after the check or after a timeout:
 
 Correct:
 
 ```sh
-timeout -k 30 60 docker run --rm --name migr-probe-1 --entrypoint python cgr.dev/chainguard/python:latest --version
-docker rm -f migr-probe-1 >/dev/null 2>&1 || true
+timeout -k 30 60 docker run --rm --name migr-$RUN_ID-probe --entrypoint python cgr.dev/chainguard/python:latest --version
+docker rm -f migr-$RUN_ID-probe >/dev/null 2>&1 || true
 ```
 
 Wrong (no `--name`: when the run times out, the client dies but the
-container keeps running on the daemon with nothing to remove it by):
+container keeps running on the daemon with nothing to remove it by. A fixed
+literal name is also wrong — concurrent runs collide on it, and one run's
+cleanup removes the other's container):
 
 ```sh
 timeout -k 30 60 docker run --rm cgr.dev/chainguard/python:latest --version

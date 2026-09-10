@@ -94,9 +94,10 @@ per-layer record already covers:
 
 - **Binary checks**: key binaries with `--version` or equivalent. On images
   whose entrypoint is the runtime binary, use
-  `timeout -k 30 60 docker run --rm --name migr-check-1 --entrypoint <binary> <image> --version`
-  (a unique `--name` per check, removed afterwards with
-  `docker rm -f migr-check-1 >/dev/null 2>&1 || true`) so the check does not
+  `timeout -k 30 60 docker run --rm --name migr-$RUN_ID-check-1 --entrypoint <binary> <image> --version`
+  (`$RUN_ID` is the run identifier from SKILL.md step 5; a unique `--name`
+  per check, removed afterwards with
+  `docker rm -f migr-$RUN_ID-check-1 >/dev/null 2>&1 || true`) so the check does not
   go through the image entrypoint and cannot hang past the 60-second run
   bound, and a timed-out check leaves nothing running daemon-side.
 - **File-exists checks**: COPY targets and generated artifacts, via
@@ -105,14 +106,17 @@ per-layer record already covers:
 - **Startup and HTTP probe** (skipped only if the user opted out in the
   clarify step): start the migrated container named and detached, and if the
   original exposes a port, probe one endpoint. Bind to 127.0.0.1 on an
-  ephemeral port (`docker run -d --name migr-probe-app -p 127.0.0.1:0:<port>
-  <image>`, then read the mapped port with `docker port migr-probe-app`);
+  ephemeral port
+  (`timeout -k 30 60 docker run -d --name migr-$RUN_ID-app -p 127.0.0.1:0:<port> <image>`,
+  then read the mapped port with `docker port migr-$RUN_ID-app`);
   publishing on all interfaces exposes the container to the local network
-  during the test. The detached `docker run -d` returns immediately; the
-  60-second run bound applies to the probe itself
+  during the test. The detached `docker run -d` returns as soon as the
+  container starts, but the client carries the 60-second bound like every
+  `docker run` in the workflow — a stuck daemon or implicit pull would
+  otherwise hang it. The same bound applies to the probe itself
   (`timeout -k 30 60 curl -fsS http://127.0.0.1:<mapped-port>/`), and the
   container is removed right after it, pass, fail, or timeout
-  (`docker rm -f migr-probe-app >/dev/null 2>&1 || true`). Where behavior can
+  (`docker rm -f migr-$RUN_ID-app >/dev/null 2>&1 || true`). Where behavior can
   be compared, run the same command against both images and diff the output.
 
 Binary and file checks always run; they are the mandatory floor.
@@ -131,12 +135,16 @@ written with `timeout -k 30 <seconds>` inline.
 - `docker save` and SBOM scan: 10 minutes, enforced inside
   `scripts/compare-images.sh`.
 - `docker run` checks and probes: 60 seconds —
-  `timeout -k 30 60 docker run --rm --name migr-check-1 ...`.
+  `timeout -k 30 60 docker run --rm --name migr-$RUN_ID-check-1 ...` — and the
+  bound goes on detached (`-d`) starts too; it covers the client, not the
+  server the container runs.
 - Detached servers: remove immediately after their probe.
 - `timeout` kills only the docker client; a container the run started keeps
   running daemon-side. Every container the workflow starts therefore gets a
-  unique `--name`, removed after the check or after a timeout
-  (`docker rm -f migr-check-1 >/dev/null 2>&1 || true`); every temporary
+  `--name` built from the step-5 run identifier (`migr-$RUN_ID-<purpose>` —
+  a fixed name would collide across concurrent runs), removed after the
+  check or after a timeout
+  (`docker rm -f migr-$RUN_ID-check-1 >/dev/null 2>&1 || true`); every temporary
   image tag is noted so the user can clean up.
 
 A build stuck on one step, or a container that ignores `--help` and serves

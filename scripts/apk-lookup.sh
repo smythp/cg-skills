@@ -22,15 +22,16 @@
 # line) and is never printed.
 #
 # Exit codes: 0 = every query matched; 1 = at least one query had no match or
-# the lookup failed; 2 = usage error; 4 = the lookup run hit its time bound
-# (the container is removed before exiting).
+# the lookup failed; 2 = usage error; 4 = the lookup run or the image pull hit
+# its time bound (a live lookup container is removed before exiting).
 #
 # Dependencies: sh, docker (daemon running), timeout (GNU coreutils or
 # BusyBox); chainctl only when --org is used. The script refuses to run
 # docker without timeout: an unbounded pull or lookup can hang a migration.
 # LOOKUP_IMAGE overrides the container (default cgr.dev/chainguard/wolfi-base:latest).
-# LOOKUP_TIMEOUT / LOOKUP_PULL_TIMEOUT override the run/pull bounds (whole
-# seconds; defaults below).
+# LOOKUP_TIMEOUT / LOOKUP_PULL_TIMEOUT override the run/pull bounds (positive
+# whole seconds; defaults below — 0 is rejected because GNU timeout treats it
+# as no limit at all).
 
 set -u
 
@@ -41,14 +42,25 @@ ORG=""
 # the same 10 minutes for the lookup run because it downloads the apk index
 # over the network — the workflow's 60-second run bound is for local probes
 # of already-built images, which this is not.
-PULL_LIMIT="${LOOKUP_PULL_TIMEOUT:-600}"
-RUN_LIMIT="${LOOKUP_TIMEOUT:-600}"
-case "$PULL_LIMIT$RUN_LIMIT" in
-  *[!0-9]*)
-    echo "apk-lookup: LOOKUP_TIMEOUT and LOOKUP_PULL_TIMEOUT must be whole seconds" >&2
+PULL_LIMIT="${LOOKUP_PULL_TIMEOUT-600}"
+RUN_LIMIT="${LOOKUP_TIMEOUT-600}"
+# Positive integers only: GNU timeout treats 0 as "no limit", which is exactly
+# the unbounded docker run this script refuses, and an empty value would do
+# the same by collapsing the bound off the command line.
+check_limit() {
+  case "$2" in
+    ''|*[!0-9]*)
+      echo "apk-lookup: $1 must be a positive whole number of seconds (got '$2')" >&2
+      exit 2
+      ;;
+  esac
+  if [ "$2" -eq 0 ]; then
+    echo "apk-lookup: $1 must be a positive whole number of seconds (got '$2'; 0 disables the bound)" >&2
     exit 2
-    ;;
-esac
+  fi
+}
+check_limit LOOKUP_PULL_TIMEOUT "$PULL_LIMIT"
+check_limit LOOKUP_TIMEOUT "$RUN_LIMIT"
 # TERM-to-KILL grace: 10 seconds lets the docker CLI detach and report before
 # a process that ignores TERM is killed hard.
 KILL_GRACE=10
@@ -134,9 +146,20 @@ inner="${inner}exit \$missing"
 
 # Pull explicitly so the pull gets its own bound — an implicit pull inside
 # docker run would run inside the (shorter-purposed) run bound instead.
-docker image inspect "$LOOKUP_IMAGE" >/dev/null 2>&1 \
-  || timeout -k "$KILL_GRACE" "$PULL_LIMIT" docker pull -q "$LOOKUP_IMAGE" >/dev/null \
-  || { echo "apk-lookup: could not pull $LOOKUP_IMAGE (failed or exceeded ${PULL_LIMIT}s)" >&2; exit 1; }
+if ! docker image inspect "$LOOKUP_IMAGE" >/dev/null 2>&1; then
+  timeout -k "$KILL_GRACE" "$PULL_LIMIT" docker pull -q "$LOOKUP_IMAGE" >/dev/null
+  prc=$?
+  # A timed-out pull is the documented exit 4, normalized the same way as the
+  # lookup run below (coreutils 124, docker killed by TERM 143 or KILL 137),
+  # before any other pull failure maps to 1.
+  case "$prc" in
+    124|137|143)
+      echo "apk-lookup: pull of $LOOKUP_IMAGE exceeded ${PULL_LIMIT}s and was killed" >&2
+      exit 4
+      ;;
+  esac
+  [ "$prc" -eq 0 ] || { echo "apk-lookup: could not pull $LOOKUP_IMAGE" >&2; exit 1; }
+fi
 
 # Named container so a timed-out or interrupted run can be removed: timeout
 # (and Ctrl-C) kill the docker client, and the daemon-side container would

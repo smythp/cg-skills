@@ -23,9 +23,11 @@
 #       Treat this as a failed validation gate, never as "no differences".
 #   2 — usage error
 #
-# Dependencies: sh, awk, tar, sort, comm, docker (daemon running), timeout
-# (GNU coreutils or BusyBox). The script refuses to run docker without
-# timeout: an unbounded save or scan can hang the validation gate.
+# Dependencies: sh, awk, basename, chmod, comm, grep, head, mktemp, rm, sed,
+# sort, tar, tr, wc, docker (daemon running), timeout (GNU coreutils or
+# BusyBox) — all checked up front before anything runs. The script refuses to
+# run docker without timeout: an unbounded save or scan can hang the
+# validation gate.
 
 set -u
 
@@ -52,7 +54,22 @@ TIME_LIMIT=600
 # a process that ignores TERM is killed hard.
 KILL_GRACE=10
 
-tmp="$(mktemp -d)" || { echo "compare-images: cannot create temp dir"; exit 1; }
+not_performed() {
+  echo "compare-images: comparison was NOT performed: $1"
+  echo "compare-images: do not treat this as an empty diff; the validation gate fails."
+  exit 1
+}
+
+# Every external command this script calls, checked before any of them runs.
+# POSIX sh reports only the last status of a pipeline, so a helper that goes
+# missing mid-run could read as an empty result — and an empty diff that was
+# never computed is the exact lie exit 1 exists to prevent. timeout is on the
+# list because without it a docker save/pull/scan would run unbounded.
+for dep in awk basename chmod comm docker grep head mktemp rm sed sort tar timeout tr wc; do
+  command -v "$dep" >/dev/null 2>&1 || not_performed "required command not found: $dep"
+done
+
+tmp="$(mktemp -d)" || not_performed "cannot create temp dir"
 chmod 700 "$tmp"
 scanner_name=""
 cleanup() {
@@ -64,18 +81,8 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-not_performed() {
-  echo "compare-images: comparison was NOT performed: $1"
-  echo "compare-images: do not treat this as an empty diff; the validation gate fails."
-  exit 1
-}
-
-# Every save, pull, and scan runs under this bound; without the timeout
-# utility the script fails closed rather than running docker unbounded.
-command -v timeout >/dev/null 2>&1 || not_performed "the timeout utility (GNU coreutils or BusyBox) is missing; refusing to run unbounded docker save/pull/scan"
+# Every save, pull, and scan runs under this bound.
 bounded() { timeout -k "$KILL_GRACE" "$TIME_LIMIT" "$@"; }
-
-command -v docker >/dev/null 2>&1 || not_performed "docker not found"
 docker image inspect "$ORIG" >/dev/null 2>&1 || not_performed "image not present locally: $ORIG (docker pull or build it first)"
 docker image inspect "$MIGR" >/dev/null 2>&1 || not_performed "image not present locally: $MIGR"
 
@@ -163,15 +170,22 @@ list_files() {
 
 print_diff() {
   label="$1"; a="$2"; b="$3"
-  na=$(comm -23 "$a" "$b" | wc -l | tr -d ' ')
-  nb=$(comm -13 "$a" "$b" | wc -l | tr -d ' ')
+  # Each comm result lands in a file whose exit status is checked directly: a
+  # pipeline reports only its last command's status, so a failed comm feeding
+  # wc would read as a zero-difference diff instead of failing the gate.
+  comm -23 "$a" "$b" > "$tmp/only-orig" || not_performed "comm failed on the $label comparison"
+  comm -13 "$a" "$b" > "$tmp/only-migr" || not_performed "comm failed on the $label comparison"
+  na=$(wc -l < "$tmp/only-orig" | tr -d ' ')
+  nb=$(wc -l < "$tmp/only-migr" | tr -d ' ')
+  case "$na" in ''|*[!0-9]*) not_performed "counting the $label diff failed" ;; esac
+  case "$nb" in ''|*[!0-9]*) not_performed "counting the $label diff failed" ;; esac
   echo ""
   echo "== $label =="
   echo "only in original ($na):"
-  comm -23 "$a" "$b" | head -n "$LIST_CAP" | sed 's/^/  /'
+  head -n "$LIST_CAP" "$tmp/only-orig" | sed 's/^/  /'
   [ "$na" -gt "$LIST_CAP" ] && echo "  ... list capped at $LIST_CAP of $na"
   echo "only in migrated ($nb):"
-  comm -13 "$a" "$b" | head -n "$LIST_CAP" | sed 's/^/  /'
+  head -n "$LIST_CAP" "$tmp/only-migr" | sed 's/^/  /'
   [ "$nb" -gt "$LIST_CAP" ] && echo "  ... list capped at $LIST_CAP of $nb"
 }
 
@@ -189,9 +203,15 @@ list_files "$MIGR" "$tmp/files-migr" || not_performed "file listing failed for $
 
 # Shared libraries: paths ending in .so or containing .so. anywhere —
 # Guardener's isSharedLibrary rule. The suffix after .so. is not required to
-# be numeric (libfoo.so.debug counts as much as libfoo.so.1.2).
-grep -E '\.so($|\.)' "$tmp/files-orig" > "$tmp/libs-orig" || true
-grep -E '\.so($|\.)' "$tmp/files-migr" > "$tmp/libs-migr" || true
+# be numeric (libfoo.so.debug counts as much as libfoo.so.1.2). grep exit 1 is
+# a clean no-match (distroless images ship no .so files); anything above 1 is
+# a real failure and fails the gate.
+grep -E '\.so($|\.)' "$tmp/files-orig" > "$tmp/libs-orig"
+rc=$?
+[ "$rc" -le 1 ] || not_performed "shared-library extraction failed for $ORIG (grep exited $rc)"
+grep -E '\.so($|\.)' "$tmp/files-migr" > "$tmp/libs-migr"
+rc=$?
+[ "$rc" -le 1 ] || not_performed "shared-library extraction failed for $MIGR (grep exited $rc)"
 
 print_diff "packages (name@version)" "$tmp/pkg-orig" "$tmp/pkg-migr"
 print_diff "files" "$tmp/files-orig" "$tmp/files-migr"

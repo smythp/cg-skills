@@ -39,7 +39,12 @@ directory instead.
   report format, lookup avenues
 - `scripts/` — `preflight.sh`, `apk-lookup.sh`, `check-from-lines.sh`
   (FROM allowlist gate), `compare-images.sh`, and their tests under
-  `scripts/tests/`
+  `scripts/tests/`: run each suite with `sh scripts/tests/<name>.sh`.
+  `test-check-from-lines.sh` needs no Docker; `test-compare-images.sh` needs
+  Docker with registry egress; the two doc guards, `test-docs-bounded.sh`
+  (every docker build/pull/run/save/exec line in the docs carries
+  `timeout -k 30`) and `test-docs-container-names.sh` (every `--name` uses
+  the `migr-$RUN_ID-` run identifier), need only sh and awk.
 
 ## Version
 

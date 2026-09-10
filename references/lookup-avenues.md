@@ -123,6 +123,6 @@ HTTP_AUTH="basic:apk.cgr.dev:user:$(chainctl auth token --audience apk.cgr.dev)"
 `apk-lookup.sh --org <org>` does exactly this and exports HTTP_AUTH into the
 lookup container's environment. Never echo the token, never write it to a
 file, never put it on a command line where other processes can read it —
-passing it as an inherited environment variable to `docker run -e HTTP_AUTH`
-(value taken from the environment, not the command line) keeps it out of
-process listings.
+passing it as an inherited environment variable to `docker run` via
+`-e HTTP_AUTH` (value taken from the environment, not the command line)
+keeps it out of process listings.
