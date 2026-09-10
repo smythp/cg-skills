@@ -66,13 +66,26 @@ if command -v chainctl >/dev/null 2>&1; then
       echo "organizations: LISTING FAILED (chainctl iam organizations list exited $orgs_rc). This is an API or network error, not 'no organizations'; without the real list, an entitled organization would be migrated onto the public catalog. Fix connectivity or auth and rerun."
       fail=1
     else
-      orgs=$(printf '%s\n' "$orgs_json" | grep -o '"name"[^,}]*' | sed 's/.*: *"//; s/"$//' | sort -u)
-      if [ -n "$orgs" ]; then
-        echo "organizations visible to this identity:"
-        echo "$orgs" | sed 's/^/  /'
-      else
-        echo "organizations: none visible (public catalog cgr.dev/chainguard will be the default)"
-      fi
+      # An exit 0 with empty or non-JSON output is the same failure in
+      # different clothes: parsed, it yields nothing, and nothing reads as
+      # "no organizations". Accept only output whose first non-whitespace
+      # character starts a JSON document.
+      first_char=$(printf '%s\n' "$orgs_json" | awk 'NF { print substr($1, 1, 1); exit }')
+      case "$first_char" in
+        '['|'{')
+          orgs=$(printf '%s\n' "$orgs_json" | grep -o '"name"[^,}]*' | sed 's/.*: *"//; s/"$//' | sort -u)
+          if [ -n "$orgs" ]; then
+            echo "organizations visible to this identity:"
+            echo "$orgs" | sed 's/^/  /'
+          else
+            echo "organizations: none visible (public catalog cgr.dev/chainguard will be the default)"
+          fi
+          ;;
+        *)
+          echo "organizations: LISTING FAILED (chainctl iam organizations list exited 0 but its output was empty or not JSON). This is an API or client error, not 'no organizations'; without the real list, an entitled organization would be migrated onto the public catalog. Fix chainctl or connectivity and rerun."
+          fail=1
+          ;;
+      esac
     fi
   else
     echo "chainctl: present but not logged in. Run: chainctl auth login"

@@ -1,28 +1,32 @@
 #!/bin/sh
 # Doc guard: every container name assigned in SKILL.md and references/*.md —
-# `--name ` followed by a value — must use the run identifier: the value
-# starts with `migr-$RUN_ID-`. A fixed literal name collides across
-# concurrent runs, and one run's cleanup then removes the other run's
-# container.
+# `--name value` (one or more spaces or tabs before the value) or
+# `--name=value` — must use the run identifier: the value starts with
+# `migr-$RUN_ID-`. A fixed literal name collides across concurrent runs, and
+# one run's cleanup then removes the other run's container.
 #
-# Prose references to the flag itself, like "gets a `--name`", have no value
-# after them (no trailing space before the closing backtick) and are ignored.
+# Prose references to the flag itself, like "gets a `--name`", have neither
+# `=` nor whitespace-then-value after them and are ignored.
+#
+# An optional first argument points the guard at another directory laid out
+# like the skill (SKILL.md plus references/) — the self-check uses this;
+# default is this skill's own docs.
 #
 # Dependencies: sh, awk. No network, no Docker.
 
 set -u
 
-DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+DIR="${1:-$(cd "$(dirname "$0")/../.." && pwd)}"
 fail=0
 
 for f in "$DIR/SKILL.md" "$DIR"/references/*.md; do
   out=$(awk '
     {
       s = $0; bad = 0
-      while ((i = index(s, "--name ")) > 0) {
-        after = substr(s, i + 7)
-        if (substr(after, 1, 13) != "migr-$RUN_ID-") bad = 1
-        s = after
+      while (match(s, /--name(=|[ \t]+)/)) {
+        val = substr(s, RSTART + RLENGTH)
+        if (substr(val, 1, 13) != "migr-$RUN_ID-") bad = 1
+        s = val
       }
       if (bad) printf "%s:%d: %s\n", FILENAME, FNR, $0
     }

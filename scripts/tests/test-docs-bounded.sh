@@ -16,11 +16,15 @@
 # history, port, rm, create, cp, export) are exempt: the docs state they need
 # no bound, and cleanup lines must run unbounded.
 #
+# An optional first argument points the guard at another directory laid out
+# like the skill (SKILL.md plus references/) — the self-check uses this;
+# default is this skill's own docs.
+#
 # Dependencies: sh, awk. No network, no Docker.
 
 set -u
 
-DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+DIR="${1:-$(cd "$(dirname "$0")/../.." && pwd)}"
 fail=0
 
 for f in "$DIR/SKILL.md" "$DIR"/references/*.md; do
@@ -38,7 +42,7 @@ for f in "$DIR/SKILL.md" "$DIR"/references/*.md; do
     skip { next }
     {
       line = $0; s = line; base = 0; bad = 0
-      while (match(s, /docker (build|pull|run|save|exec|manifest)/)) {
+      while (match(s, /docker[ 	]+(build|pull|run|save|exec|manifest)/)) {
         pre = substr(line, 1, base + RSTART - 1)
         post = substr(line, base + RSTART + RLENGTH)
         if (pre !~ /timeout -k 30 /) {

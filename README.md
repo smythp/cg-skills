@@ -41,10 +41,14 @@ directory instead.
   (FROM allowlist gate), `compare-images.sh`, and their tests under
   `scripts/tests/`: run each suite with `sh scripts/tests/<name>.sh`.
   `test-check-from-lines.sh` needs no Docker; `test-compare-images.sh` needs
-  Docker with registry egress; the two doc guards, `test-docs-bounded.sh`
+  Docker with registry egress; `test-preflight.sh` (the organization listing
+  must fail loudly on empty or non-JSON output) shims docker and chainctl,
+  so it needs neither; the two doc guards, `test-docs-bounded.sh`
   (every docker build/pull/run/save/exec/manifest line in the docs carries
   `timeout -k 30`) and `test-docs-container-names.sh` (every `--name` uses
-  the `migr-$RUN_ID-` run identifier), need only sh and awk.
+  the `migr-$RUN_ID-` run identifier), need only sh and awk; so does
+  `test-docs-guards-selfcheck.sh`, which seeds known violations into a temp
+  doc tree and asserts both guards catch each one by file:line.
 - `tests/e2e/` — end-to-end harness: six before/after fixtures whose
   original builds and whose skill-regenerated `Dockerfile.chainguard` are
   built, gated, and smoke-tested with real Docker (`tests/e2e/run.sh`; see

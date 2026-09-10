@@ -1,6 +1,7 @@
 #!/bin/sh
 # Fixture tests for compare-images.sh. Needs Docker with egress to cgr.dev
-# and registry.access.redhat.com.
+# and registry.access.redhat.com, and timeout (GNU coreutils or BusyBox) —
+# the setup pulls run under the same 10-minute bound the scripts use.
 #
 # Covers:
 #   1. distroless vs glibc base (cgr.dev/chainguard/static vs wolfi-base) —
@@ -10,6 +11,10 @@
 #      "NOT performed", never print an empty diff
 #   4. shared-library detection accepts any .so. suffix, not just numeric
 #      ones (libfixture.so.debug), matching Guardener's isSharedLibrary
+#   5. a sort that fails mid-inventory — the script must take the
+#      NOT-performed path, never report an empty diff as complete
+#   6. an option-shaped image argument (--help) — rejected before any
+#      docker command runs
 
 set -u
 
@@ -25,7 +30,7 @@ ok()   { pass=$((pass + 1)); }
 bad()  { failcount=$((failcount + 1)); echo "FAIL: $1"; }
 
 for img in "$STATIC" "$GLIBC" "$UBI"; do
-  docker image inspect "$img" >/dev/null 2>&1 || docker pull -q "$img" >/dev/null || {
+  docker image inspect "$img" >/dev/null 2>&1 || timeout -k 30 600 docker pull -q "$img" >/dev/null || {
     echo "cannot pull $img; aborting"; exit 1; }
 done
 
@@ -92,6 +97,51 @@ else
   case "$out" in
     *libplain.so*) ok ;;
     *) bad "libplain.so missing from the shared-libraries diff" ;;
+  esac
+fi
+
+echo "--- case 5: a failing sort mid-inventory takes the NOT-performed path ---"
+# The shim passes the up-front presence check (command -v finds it) but fails
+# when the inventory pipeline runs it; the gate must fail, not report an
+# empty diff as three performed comparisons.
+shimdir="$(mktemp -d)" || exit 1
+chmod 700 "$shimdir"
+printf '#!/bin/sh\nexit 1\n' > "$shimdir/sort"
+chmod 755 "$shimdir/sort"
+out=$(PATH="$shimdir:$PATH" sh "$SCRIPT" "$STATIC" "$GLIBC" 2>&1); rc=$?
+rm -rf "$shimdir"
+if [ "$rc" -eq 0 ]; then
+  bad "failing-sort case exited 0; must fail"
+else
+  case "$out" in
+    *"NOT performed"*) ok ;;
+    *) bad "failing-sort case: message must say the comparison was NOT performed, got: $out" ;;
+  esac
+  case "$out" in
+    *"all three comparisons performed"*) bad "failing-sort case printed the completion line" ;;
+    *) ok ;;
+  esac
+fi
+
+echo "--- case 6: an option-shaped image argument is rejected before docker runs ---"
+# The docker shim fails loudly if invoked; the rejection must happen on
+# argument validation alone.
+shimdir="$(mktemp -d)" || exit 1
+chmod 700 "$shimdir"
+printf '#!/bin/sh\necho "docker invoked: $*" >&2\nexit 97\n' > "$shimdir/docker"
+chmod 755 "$shimdir/docker"
+out=$(PATH="$shimdir:$PATH" sh "$SCRIPT" --help "$GLIBC" 2>&1); rc=$?
+rm -rf "$shimdir"
+if [ "$rc" -eq 0 ]; then
+  bad "--help as ORIGINAL_IMAGE exited 0; must be rejected"
+else
+  case "$out" in
+    *"'--help' is not an image reference"*) ok ;;
+    *) bad "--help rejection must name the bad argument, got: $out" ;;
+  esac
+  case "$out" in
+    *"docker invoked:"*) bad "--help case ran docker before validating: $out" ;;
+    *) ok ;;
   esac
 fi
 

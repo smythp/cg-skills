@@ -38,6 +38,21 @@ if [ -z "$ORIG" ] || [ -z "$MIGR" ]; then
   exit 2
 fi
 
+# Both image references land on docker command lines, so each must look like
+# one — the same pattern apk-lookup.sh applies to LOOKUP_IMAGE. An argument
+# starting with '-' would be parsed by docker as an option: --help as ORIG
+# would run `docker image inspect --help`, which exits 0 and would pass the
+# presence check below.
+for img in "$ORIG" "$MIGR"; do
+  case "$img" in
+    ''|[!A-Za-z0-9]*|*[!A-Za-z0-9._:/@-]*)
+      echo "compare-images: '$img' is not an image reference (must start with a letter or digit and contain only [A-Za-z0-9._:/@-])" >&2
+      echo "usage: compare-images.sh ORIGINAL_IMAGE MIGRATED_IMAGE" >&2
+      exit 2
+      ;;
+  esac
+done
+
 # The fallback scanner is pinned by digest so it cannot change under the
 # skill. It is the upstream syft image because the fallback must be pullable
 # with no Chainguard entitlement (cgr.dev/chainguard/syft is not in the free
@@ -141,9 +156,13 @@ scan_packages() {
     docker rm -f "$scanner_name" >/dev/null 2>&1
     scanner_name=""
   fi
-  # syft-table: NAME VERSION TYPE (header on line 1)
-  awk 'NR > 1 && NF >= 2 { print $1 "@" $2 }' "$out.raw" | sort -u > "$out"
-  rm -f "$tmp/$base"
+  # syft-table: NAME VERSION TYPE (header on line 1). Each normalization
+  # stage writes its own file and is checked: a pipeline reports only its
+  # last command's status, and a failed stage feeding sort would read as an
+  # empty package inventory instead of failing the gate.
+  awk 'NR > 1 && NF >= 2 { print $1 "@" $2 }' "$out.raw" > "$out.pairs" || return 1
+  sort -u "$out.pairs" > "$out" || return 1
+  rm -f "$tmp/$base" "$out.pairs"
   return 0
 }
 
@@ -163,8 +182,11 @@ list_files() {
     rm -f "$tmp/export.tar"
     return 1
   fi
-  sed 's:/$::' "$out.raw" | sort -u > "$out"
-  rm -f "$tmp/export.tar" "$out.raw"
+  # Each normalization stage writes its own file and is checked — the same
+  # pipeline-status reasoning as in scan_packages and print_diff.
+  sed 's:/$::' "$out.raw" > "$out.stripped" || return 1
+  sort -u "$out.stripped" > "$out" || return 1
+  rm -f "$tmp/export.tar" "$out.raw" "$out.stripped"
   return 0
 }
 
