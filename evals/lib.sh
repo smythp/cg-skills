@@ -2,7 +2,6 @@
 # Shared helpers for the guardener-dockerfile-migration e2e harness.
 # Sourced by run.sh and by per-fixture smoke.sh scripts.
 #
-# Adapted from Adrian Mouat's dfc-skillz (amouat/dfc-skillz) tests/lib.sh.
 # Changes from his version: containers run under a harness-supplied --name,
 # ports publish on an ephemeral 127.0.0.1 port instead of a fixed host port
 # on all interfaces (fixed ports collide between concurrent runs and expose

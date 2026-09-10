@@ -44,7 +44,7 @@ if command -v docker >/dev/null 2>&1; then
   if docker info >/dev/null 2>&1; then
     echo "docker: OK ($(docker version --format '{{.Server.Version}}' 2>/dev/null || echo 'version unknown'))"
   else
-    echo "docker: CLI present but the daemon is not reachable. Without builds there is no verification, and an unverified migration is the failure this skill exists to prevent."
+    echo "docker: CLI present but the daemon is not reachable. Builds are required for verification; start the daemon and rerun preflight."
     fail=1
   fi
 else

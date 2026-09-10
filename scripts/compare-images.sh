@@ -77,8 +77,8 @@ not_performed() {
 
 # Every external command this script calls, checked before any of them runs.
 # POSIX sh reports only the last status of a pipeline, so a helper that goes
-# missing mid-run could read as an empty result — and an empty diff that was
-# never computed is the exact lie exit 1 exists to prevent. timeout is on the
+# missing mid-run could read as an empty result; an empty diff that was never
+# computed must exit 1 as not performed, not pass as no differences. timeout is on the
 # list because without it a docker save/pull/scan would run unbounded.
 for dep in awk basename chmod comm docker grep head mktemp rm sed sort tar timeout tr wc; do
   command -v "$dep" >/dev/null 2>&1 || not_performed "required command not found: $dep"

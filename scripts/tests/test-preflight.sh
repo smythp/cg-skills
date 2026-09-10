@@ -41,7 +41,7 @@ EOF
 chmod 755 "$tmp/bin/docker"
 
 # Two chainctl shims: auth status always succeeds; the organization listing
-# either prints nothing (exit 0 — the lie case 1 exists for) or a minimal
+# either prints nothing (exit 0 — the case 1 checks) or a minimal
 # JSON list.
 cat > "$tmp/chainctl-empty" <<'EOF'
 #!/bin/sh

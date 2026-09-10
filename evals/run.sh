@@ -35,7 +35,6 @@
 #   SKIP_BEFORE=1   skip the "before" sanity build (faster iteration)
 #   KEEP_IMAGES=1   don't remove built images afterwards
 #
-# Adapted from Adrian Mouat's dfc-skillz (amouat/dfc-skillz) tests/run.sh.
 # Changes from his version: the expected file is Dockerfile.chainguard (the
 # skill's output name), the two gate checks and the UNVERIFIED outcome are
 # new, builds carry the workflow's inline time bound, containers and image

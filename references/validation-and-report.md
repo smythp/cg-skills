@@ -65,9 +65,8 @@ When every layer is done and `scripts/check-from-lines.sh` passes:
 The gate passes only when both images build, the comparisons were actually
 performed, every difference is either resolved or explained in the report,
 and the mandatory tests pass. "The compare tool failed so there were no
-differences" does not pass — a comparison that was not performed fails the
-gate, because an unverified migration that looks finished is the exact
-failure this skill exists to prevent.
+differences" does not pass: a comparison that was not performed fails the
+gate, since it cannot show whether anything changed.
 
 ## Image config comparison
 
@@ -161,8 +160,8 @@ confirmation, keeping the original as a backup file.
 **Gate failed, or could not run**: copy the report and the draft as
 `Dockerfile.chainguard.unverified` instead. Say plainly which checks failed
 or why validation could not run, and do not offer a swap. Guardener marks
-such a run failed; so does this skill. The unverified suffix is the point:
-a draft that looks finished gets deployed.
+such a run failed; so does this skill. The suffix marks the file as
+unverified for anyone who finds it later.
 
 ## Report format, with a worked example
 

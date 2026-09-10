@@ -10,33 +10,20 @@ description: >-
   full run takes five to thirty minutes of builds. Not for GitHub Actions
   workflow migrations, Helm charts or Kubernetes manifests, apko or melange
   image builds, Chainguard Libraries (language dependency) setup, or images
-  that have no Dockerfile source. For a quick rules-only rewrite without
-  Docker, use a static Dockerfile migration skill instead.
-metadata:
-  derived_from: >-
-    Guardener dfc v2 (chainguard-dev/mono containers/dfc; Billy Lynch, Alex
-    Buchanan, Rahul Duvedi, Carlos Tadeu Panato Junior, Jonathan Lange,
-    Maxime Gréau, Evan Gibler, Kenny Leung, Ajay Kemparaj); dockerfile-migrator
-    (Patrick Smyth) and migrating-dockerfiles-to-chainguard (Lisa Tagliaferri),
-    chainguard-demo/claude-plugins; chainguard-migrate-dockerfile (iamfuzz,
-    chainguard-dev/mono cursor plugin); Chainguard Power for Kiro (iamfuzz,
-    Brian Thomason, Jonathan Lange, Jason Meridth); dfc CLI (chainguard-dev/dfc);
-    dfc-skillz (Adrian Mouat, github.com/amouat/dfc-skillz): the end-to-end
-    harness shape and the six fixtures' inputs under evals/, the
-    manifest-inspect mirror check, and the public-catalog fallback-callout
-    rule.
+  that have no Dockerfile source. For a deterministic rewrite without
+  Docker, use the dfc CLI instead.
 allowed-tools: Read, Write, Edit, Grep, Glob, Bash
 ---
 
 # Guardener Dockerfile migration
 
 Migrate one Dockerfile (single or multi-stage) onto Chainguard Containers,
-and prove the result: the migrated image builds, keeps every FROM on an
+and verify the result: the migrated image builds, keeps every FROM on an
 allowed Chainguard source, runs as the image's non-root user, matches the
 original's packages and configuration except where the report explains the
-difference, and passes functional checks. A run that cannot meet that bar
-says so and leaves a clearly-marked unverified draft — never a file that
-looks finished.
+difference, and passes functional checks. A run whose validation gate does not pass
+writes the report with the reasons and leaves the draft as
+`Dockerfile.chainguard.unverified`.
 
 The loop is translate → build → compare → test, per layer, then a final
 validation gate. Builds are real execution: a `docker build` ships the whole
@@ -67,9 +54,9 @@ Copy this checklist into your reply and tick items as you complete them:
 
 Run `scripts/preflight.sh <context-dir>`. If Docker is not running or
 chainctl is missing or logged out, stop and tell the user what to fix.
-Without Docker there is no verification, and an unverified migration is
-exactly the failure this skill exists to prevent — do not fall back to
-guessing; point the user at a static rules-only migration skill instead.
+Without Docker there is no verification, so do not continue with an
+unverified rewrite; point the user at the dfc CLI for a deterministic rewrite
+without builds.
 
 ### 2. Trust gate — always
 
