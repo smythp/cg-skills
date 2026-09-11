@@ -11,7 +11,8 @@ run writes the report with the reasons and leaves the draft as
 ## Requirements
 
 - Docker with a running daemon
-  (install: https://docs.docker.com/get-docker/)
+  (install: https://docs.docker.com/get-docker/). Docker is required;
+  Podman is not supported in this version.
 - `chainctl`, logged in with `chainctl auth login`, which is interactive
   (install: https://edu.chainguard.dev/platform/chainctl-usage/how-to-install-chainctl/)
 - `timeout` — GNU coreutils or BusyBox; on macOS `brew install coreutils`
