@@ -44,7 +44,7 @@ if command -v docker >/dev/null 2>&1; then
   if docker info >/dev/null 2>&1; then
     echo "docker: OK ($(docker version --format '{{.Server.Version}}' 2>/dev/null || echo 'version unknown'))"
   else
-    echo "docker: CLI present but the daemon is not reachable. Builds are required for verification; start the daemon and rerun preflight."
+    echo "docker: CLI present but the Docker daemon is not reachable. Builds are required for verification; start the Docker daemon and rerun preflight."
     fail=1
   fi
 else
@@ -121,7 +121,7 @@ fi
 if [ -f "$CONTEXT/.dockerignore" ]; then
   echo ".dockerignore: present in $CONTEXT"
 else
-  echo ".dockerignore: MISSING in $CONTEXT — docker build ships this entire directory to the daemon; check for secrets and large files before the first build"
+  echo ".dockerignore: MISSING in $CONTEXT — Docker will include this entire directory in the build; check for secrets and large files before the first build"
 fi
 
 echo ""

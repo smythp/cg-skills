@@ -26,8 +26,8 @@ writes the report with the reasons and leaves the draft as
 `Dockerfile.chainguard.unverified`.
 
 The loop is translate → build → compare → test, per layer, then a final
-validation gate. Builds are real execution: a `docker build` ships the whole
-context to the daemon and RUN lines run with network access, which is why the
+validation gate. Builds are real execution: `docker build` runs the
+Dockerfile's RUN lines locally with network access, which is why the
 workflow gates the first build on the user's confirmation and never adds
 credentials of its own.
 
@@ -63,8 +63,9 @@ rewrite without builds.
 ### 2. Trust gate — always
 
 Read the Dockerfile and the `.dockerignore`, then summarize in a few lines
-what the build does: what it fetches, what it executes, what the context
-directory exposes to the daemon. Get the user's confirmation before the
+what the build does: what it fetches and what it executes. Don't restate
+that `docker build` sends the context to Docker — the user already builds
+this image and knows that; focus on what runs. Get the user's confirmation before the
 first build. This is not skipped for files the user says are their own —
 the point is that the user sees what is about to execute, not that the file
 is suspected.
