@@ -100,6 +100,9 @@ answers there. Then ask the rest together, in one message:
   suffix, e.g. `python-fips`.)
 - **Probes**: run app startup and HTTP probes during validation? Binary and
   file checks always run regardless.
+- **Digest pinning**: pin FROM lines to image digests? Recommended for
+  reproducible builds. The original is [pinned / not pinned]. Running
+  unattended, match the original.
 
 Offer to save new answers to that preferences file for later migrations;
 write it only after the user confirms.
@@ -150,7 +153,9 @@ For each instruction, using `references/from-and-registry-rules.md`,
   the versioned apk package (no drift); running unattended, take `wolfi-base`
   plus the versioned apk package — a migration must not change the runtime
   version without consent. Confirm the image exists and get its digest via
-  the avenues in `references/lookup-avenues.md`; pull it
+  the avenues in `references/lookup-avenues.md` — a pinned original, or a
+  digest opt-in from the clarify step, means the FROM is pinned to that
+  digest (hard rule 8), and the report records it either way; pull it
   (`timeout -k 30 600 docker pull <image>`) and record
   its config (`docker inspect`: user, entrypoint, cmd, env, workdir) — the
   USER discipline and the config comparison both need it.
@@ -237,8 +242,9 @@ reference file carries the detail; the one-line forms:
    Chainguard image.
 7. **No credentials of your own** (step 3): user-supplied mounts pass
    through; nothing else does.
-8. **Digest rule**: pinned original → migration pinned to the Chainguard
-   image's own digest; unpinned stays unpinned; mirror digests come from
+8. **Digest rule**: a pinned original, or a user who opted in at the
+   clarify step, → migration pinned to the Chainguard image's own digest;
+   otherwise unpinned stays unpinned; mirror digests come from
    the mirror's manifest digest (RepoDigests after a pull as the fallback)
    or are dropped with a warning
    (`references/from-and-registry-rules.md` documents the one deliberate

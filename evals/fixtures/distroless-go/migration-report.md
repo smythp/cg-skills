@@ -60,6 +60,11 @@
 - The original was not digest-pinned, so the migration is not digest-pinned.
 - Wolfi is a rolling distribution: go-1.22 tracks the latest 1.22.x patch
   release rather than a frozen build.
+- Resolved digests:
+  cgr.dev/chainguard/wolfi-base:latest@sha256:65e1acb87a2bf356b92c5f70f3980f03b4bb51dfd483c834e01557525f15c1d9
+  (not pinned: original unpinned, unattended run);
+  cgr.dev/chainguard/static:latest@sha256:207a5673ab31ed83332e54ae33d0f1de4adb5984bd93b8309789889e7bf30ba6
+  (not pinned: original unpinned, unattended run).
 
 ## What Was Not Tested
 

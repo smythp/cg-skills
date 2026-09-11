@@ -171,7 +171,14 @@ Differences, Functional Tests, Warnings, and What Was Not Tested. When an
 organization registry or mirror is in play, Warnings carries one sentence
 per image that fell back to the public `cgr.dev/chainguard` catalog, naming
 the image and the reason (for example: ruby is not in your org, so the
-public `cgr.dev/chainguard/ruby` was used). A condensed real example:
+public `cgr.dev/chainguard/ruby` was used).
+
+Warnings also carries a Resolved digests line: for every FROM in the
+migrated file, the digest it resolved to — through
+`chainctl images tags list` for a Chainguard registry, or for a mirror the
+manifest digest (`timeout -k 30 60 docker manifest inspect -v <ref>`) — and
+whether it was pinned (pinned: original was pinned, or the user opted in;
+not pinned: original unpinned and no opt-in). A condensed real example:
 
 ```markdown
 # Migration Report: flask-app
@@ -223,6 +230,11 @@ public `cgr.dev/chainguard/ruby` was used). A condensed real example:
 ## Warnings
 
 - Original was not digest-pinned, so the migration is not digest-pinned.
+- Resolved digests:
+  cgr.dev/chainguard/python:latest-dev@sha256:df9eb3812f118b33f8fd0bafb7efa0112d6a0810b40b2707337a4c432845f7b4
+  (not pinned: original unpinned and no opt-in);
+  cgr.dev/chainguard/python:latest@sha256:780029a86e72bf3a58b1795cb77ab73b8f48dfea8c94ab154345396dc3d3237a
+  (not pinned: original unpinned and no opt-in).
 
 ## What Was Not Tested
 

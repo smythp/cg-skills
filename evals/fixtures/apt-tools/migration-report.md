@@ -55,6 +55,9 @@
 - curl and jq are newer in the migrated image (see Package Changes); any
   consumer pinned to Ubuntu 22.04's curl 7.x/jq 1.6 behavior should review.
 - The original was not digest-pinned, so the migration is not digest-pinned.
+- Resolved digests:
+  cgr.dev/chainguard/wolfi-base:latest@sha256:65e1acb87a2bf356b92c5f70f3980f03b4bb51dfd483c834e01557525f15c1d9
+  (not pinned: original unpinned, unattended run).
 
 ## What Was Not Tested
 

@@ -279,6 +279,17 @@ stays unpinned. The migrated digest is always the Chainguard image's own
 digest — never the upstream digest, which is the hash of a different image
 and can never match.
 
+The clarify step offers digest pinning as an opt-in: a user who wants
+reproducible builds gets every FROM pinned even though the original was
+unpinned. Running unattended, match the original. Pinned or not, the
+report's Resolved digests line records the digest every FROM resolved to at
+migration time.
+
+**Packages are not pinned.** Wolfi is a rolling distribution and superseded
+package versions leave the index, so `apk add name=version` stops building
+within days. The image digest fixes the package set, and the report records
+the resolved package versions.
+
 Correct:
 
 ```dockerfile
