@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end harness for guardener-dockerfile-migration.
+# Adapted from Adrian Mouat's dfc-skillz tests/run.sh.
 #
 # For each fixture under evals/fixtures/, this:
 #   1. Builds the original Dockerfile ("before") and runs its smoke test

@@ -62,3 +62,10 @@ directory instead.
 
 0.1.0 — first packaged release of the Guardener migration method as a
 standalone skill.
+
+## Credits
+
+The end-to-end harness under `evals/` — the runner shape and the six
+fixtures' inputs — is adapted from Adrian Mouat's dfc-skillz. Adrian also
+contributed the rule that `static` and `glibc-dynamic` fall back to the
+public catalog rather than `wolfi-base`, and reviewed and tested the skill.

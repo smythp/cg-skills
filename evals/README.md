@@ -70,3 +70,9 @@ Create `evals/fixtures/<name>/` with:
   `Dockerfile.chainguard.unverified` and the report instead — do not edit
   the file into a passing state. Scrub absolute paths, run identifiers, and
   timestamps from the report.
+
+## Credits
+
+Adapted from the test harness in Adrian Mouat's dfc-skillz: the runner
+shape with its ERROR/FAIL split, the per-fixture smoke scripts, and the six
+fixtures' inputs.
