@@ -1,7 +1,8 @@
 #!/bin/sh
 # Fixture tests for compare-images.sh. Needs Docker with egress to cgr.dev
-# and registry.access.redhat.com, and timeout (GNU coreutils or BusyBox) —
-# the setup pulls run under the same 10-minute bound the scripts use.
+# and registry.access.redhat.com. The setup pulls run under the same
+# 10-minute bound the scripts use when a timeout binary (timeout or
+# gtimeout) is installed, and unbounded when none is.
 #
 # Covers:
 #   1. distroless vs glibc base (cgr.dev/chainguard/static vs wolfi-base) —
@@ -15,10 +16,30 @@
 #      NOT-performed path, never report an empty diff as complete
 #   6. an option-shaped image argument (--help) — rejected before any
 #      docker command runs
+#   7. no timeout binary on PATH — the compare still exits 0 and prints
+#      the no-timeout warning
 
 set -u
 
 SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/compare-images.sh"
+
+# TIMEOUT_BIN is timeout if present, else gtimeout (Homebrew coreutils on
+# macOS installs it under that name), else empty.
+if command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN=timeout
+elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN=gtimeout
+else TIMEOUT_BIN=""
+fi
+
+# bounded SECONDS cmd args... — run under the timeout binary when one
+# exists, and as given when none does.
+bounded() {
+  _secs="$1"; shift
+  if [ -n "$TIMEOUT_BIN" ]; then
+    "$TIMEOUT_BIN" -k 30 "$_secs" "$@"
+  else
+    "$@"
+  fi
+}
 STATIC=cgr.dev/chainguard/static:latest
 GLIBC=cgr.dev/chainguard/wolfi-base:latest
 UBI=registry.access.redhat.com/ubi8/ubi-minimal:latest
@@ -30,7 +51,7 @@ ok()   { pass=$((pass + 1)); }
 bad()  { failcount=$((failcount + 1)); echo "FAIL: $1"; }
 
 for img in "$STATIC" "$GLIBC" "$UBI"; do
-  docker image inspect "$img" >/dev/null 2>&1 || timeout -k 30 600 docker pull -q "$img" >/dev/null || {
+  docker image inspect "$img" >/dev/null 2>&1 || bounded 600 docker pull -q "$img" >/dev/null || {
     echo "cannot pull $img; aborting"; exit 1; }
 done
 
@@ -142,6 +163,32 @@ else
   case "$out" in
     *"docker invoked:"*) bad "--help case ran docker before validating: $out" ;;
     *) ok ;;
+  esac
+fi
+
+echo "--- case 7: no timeout binary still compares, with a warning ---"
+# A shim PATH holding every dependency except timeout and gtimeout: the
+# compare must print the no-timeout line, run unbounded, and still perform
+# all three comparisons. The syft binary fallback at /usr/local/bin/syft or
+# the scanner container keeps a scanner reachable without PATH.
+shimdir="$(mktemp -d)" || exit 1
+chmod 700 "$shimdir"
+for dep in awk basename chmod comm docker grep head mktemp rm sed sort tar tr wc sh; do
+  p="$(command -v "$dep")" || { echo "cannot resolve $dep for the shim PATH; aborting"; rm -rf "$shimdir"; exit 1; }
+  ln -s "$p" "$shimdir/$dep"
+done
+out=$(PATH="$shimdir" "$shimdir/sh" "$SCRIPT" "$STATIC" "$GLIBC" 2>&1); rc=$?
+rm -rf "$shimdir"
+if [ "$rc" -ne 0 ]; then
+  bad "no-timeout case exited $rc: $(echo "$out" | tail -3)"
+else
+  case "$out" in
+    *"no timeout binary found"*) ok ;;
+    *) bad "no-timeout case must print the no-timeout warning, got: $(echo "$out" | head -3)" ;;
+  esac
+  case "$out" in
+    *"all three comparisons performed"*) ok ;;
+    *) bad "no-timeout case: missing completion line" ;;
   esac
 fi
 

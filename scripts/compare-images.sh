@@ -24,10 +24,10 @@
 #   2 — usage error
 #
 # Dependencies: sh, awk, basename, chmod, comm, grep, head, mktemp, rm, sed,
-# sort, tar, tr, wc, docker (daemon running), timeout (GNU coreutils or
-# BusyBox) — all checked up front before anything runs. The script refuses to
-# run docker without timeout: an unbounded save or scan can hang the
-# validation gate.
+# sort, tar, tr, wc, docker (daemon running) — all checked up front before
+# anything runs. Save, pull, and scan calls are bounded with timeout (or
+# gtimeout, the Homebrew coreutils name on macOS); with neither installed
+# they run unbounded, after one stderr warning.
 
 set -u
 
@@ -68,6 +68,13 @@ TIME_LIMIT=600
 # TERM-to-KILL grace: 10 seconds lets the docker CLI detach and report before
 # a process that ignores TERM is killed hard.
 KILL_GRACE=10
+# TIMEOUT_BIN is timeout if present, else gtimeout (Homebrew coreutils on
+# macOS installs it under that name), else empty — with neither, docker runs
+# unbounded after the warning below.
+if command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN=timeout
+elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN=gtimeout
+else TIMEOUT_BIN=""
+fi
 
 not_performed() {
   echo "compare-images: comparison was NOT performed: $1"
@@ -78,9 +85,8 @@ not_performed() {
 # Every external command this script calls, checked before any of them runs.
 # POSIX sh reports only the last status of a pipeline, so a helper that goes
 # missing mid-run could read as an empty result; an empty diff that was never
-# computed must exit 1 as not performed, not pass as no differences. timeout is on the
-# list because without it a docker save/pull/scan would run unbounded.
-for dep in awk basename chmod comm docker grep head mktemp rm sed sort tar timeout tr wc; do
+# computed must exit 1 as not performed, not pass as no differences.
+for dep in awk basename chmod comm docker grep head mktemp rm sed sort tar tr wc; do
   command -v "$dep" >/dev/null 2>&1 || not_performed "required command not found: $dep"
 done
 
@@ -96,8 +102,16 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Every save, pull, and scan runs under this bound.
-bounded() { timeout -k "$KILL_GRACE" "$TIME_LIMIT" "$@"; }
+# Every save, pull, and scan runs under this bound when a timeout binary
+# exists; without one the command runs as given.
+bounded() {
+  if [ -n "$TIMEOUT_BIN" ]; then
+    "$TIMEOUT_BIN" -k "$KILL_GRACE" "$TIME_LIMIT" "$@"
+  else
+    "$@"
+  fi
+}
+[ -n "$TIMEOUT_BIN" ] || echo "compare-images: no timeout binary found; docker commands run without a time bound" >&2
 docker image inspect "$ORIG" >/dev/null 2>&1 || not_performed "image not present locally: $ORIG (docker pull or build it first)"
 docker image inspect "$MIGR" >/dev/null 2>&1 || not_performed "image not present locally: $MIGR"
 

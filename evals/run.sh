@@ -101,7 +101,7 @@ stage_end_user_check() {
 build_and_smoke() {
   local label="$1" dockerfile="$2" ctx="$3" fixdir="$4" tag="$5" cname="$6"
   local logf; logf="$(mktemp)"
-  if ! timeout -k 30 1200 docker build -q -t "$tag" -f "$dockerfile" "$ctx" >"$logf" 2>&1; then
+  if ! bounded 1200 docker build -q -t "$tag" -f "$dockerfile" "$ctx" >"$logf" 2>&1; then
     echo "  [$label] build FAILED:" >&2
     sed 's/^/    /' "$logf" >&2
     rm -f "$logf"

@@ -14,6 +14,9 @@ run writes the report with the reasons and leaves the draft as
   (install: https://docs.docker.com/get-docker/)
 - `chainctl`, logged in with `chainctl auth login`, which is interactive
   (install: https://edu.chainguard.dev/platform/chainctl-usage/how-to-install-chainctl/)
+- `timeout` — GNU coreutils or BusyBox; on macOS `brew install coreutils`
+  provides it as `gtimeout`. Without it the scripts run docker without a
+  time bound and preflight says so.
 - Optional: `syft` (install: https://github.com/anchore/syft#installation;
   otherwise a syft container is used for image comparison)
 

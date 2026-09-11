@@ -7,9 +7,10 @@
 #                      (default: current directory)
 #
 # Exit codes: 0 = required tools present (docker daemon, chainctl login and
-# a working organization listing, timeout, and the parsing tools awk, grep,
-# sed, sort); 1 = a required tool is missing or not working. Optional
-# findings (syft, .dockerignore) are reported but never fail the check.
+# a working organization listing, and the parsing tools awk, grep, sed,
+# sort); 1 = a required tool is missing or not working. Optional findings
+# (timeout/gtimeout, syft, .dockerignore) are reported but never fail the
+# check.
 
 set -u
 
@@ -96,15 +97,16 @@ else
   fail=1
 fi
 
-if command -v timeout >/dev/null 2>&1; then
-  echo "timeout: OK"
-else
-  echo "timeout: NOT FOUND (GNU coreutils or BusyBox provide it). The lookup and comparison scripts refuse to run docker without it — an unbounded pull or scan can hang the migration indefinitely."
-  fail=1
-fi
-
 echo ""
 echo "== preflight: optional =="
+
+if command -v timeout >/dev/null 2>&1; then
+  echo "timeout: OK (timeout)"
+elif command -v gtimeout >/dev/null 2>&1; then
+  echo "timeout: OK (gtimeout)"
+else
+  echo "timeout: not found; the lookup and comparison scripts will run docker without a time bound, so a hung pull or build hangs the run. macOS: brew install coreutils (provides gtimeout). Elsewhere: GNU coreutils or BusyBox."
+fi
 
 if command -v syft >/dev/null 2>&1; then
   echo "syft: OK ($(syft version 2>/dev/null | awk '/^Version:/ {print $2}'))"

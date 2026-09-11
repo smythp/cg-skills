@@ -5,6 +5,6 @@ IMAGE="$1"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$ROOT/lib.sh"
 trap 'cleanup_container' EXIT
-out="$(timeout -k 30 60 docker run --rm --name "$E2E_CONTAINER" "$IMAGE" 2>&1)" \
+out="$(bounded 60 docker run --rm --name "$E2E_CONTAINER" "$IMAGE" 2>&1)" \
   || { echo "    container exited non-zero: $out" >&2; exit 1; }
 [ "$out" = "Hello, world!" ] || { echo "    unexpected output: '$out'" >&2; exit 1; }

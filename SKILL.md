@@ -118,6 +118,11 @@ and name every container this run starts `migr-$RUN_ID-<purpose>` (see Time
 and cleanup bounds): two concurrent migrations sharing a fixed name would
 collide, and one run's cleanup would remove the other run's container.
 
+The docker commands in this skill carry `timeout -k 30 <seconds>`. If
+preflight reported `gtimeout`, use that name in place of `timeout`; if it
+reported neither, run the command without the prefix and record in the
+report that builds ran without a time bound.
+
 ### 6. Map the file
 
 List the stages, the base image and package manager per stage, and classify
@@ -258,8 +263,10 @@ failure (`timeout` exits 124).
 
 Enforcement is split by who runs the docker command. The bundled scripts
 (`scripts/apk-lookup.sh`, `scripts/compare-images.sh`) bound their internal
-docker calls with the `timeout` utility and refuse to run docker without it;
-preflight checks for it. Every docker command the workflow itself issues —
+docker calls with the `timeout` utility (`gtimeout` where that is its
+installed name) and, with neither installed, run docker unbounded after one
+stderr warning; preflight reports which name it found. Every docker command
+the workflow itself issues —
 build, pull, run, save, probe — is written with `timeout -k 30 <seconds>`
 inline:
 

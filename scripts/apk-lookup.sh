@@ -25,9 +25,10 @@
 # the lookup failed; 2 = usage error; 4 = the lookup run or the image pull hit
 # its time bound (a live lookup container is removed before exiting).
 #
-# Dependencies: sh, docker (daemon running), timeout (GNU coreutils or
-# BusyBox); chainctl only when --org is used. The script refuses to run
-# docker without timeout: an unbounded pull or lookup can hang a migration.
+# Dependencies: sh, docker (daemon running); chainctl only when --org is
+# used. Pulls and lookup runs are bounded with timeout (or gtimeout, the
+# Homebrew coreutils name on macOS); with neither installed they run
+# unbounded, after one stderr warning.
 # LOOKUP_IMAGE overrides the container (default cgr.dev/chainguard/wolfi-base:latest).
 # LOOKUP_TIMEOUT / LOOKUP_PULL_TIMEOUT override the run/pull bounds (positive
 # whole seconds; defaults below — 0 is rejected because GNU timeout treats it
@@ -44,9 +45,9 @@ ORG=""
 # of already-built images, which this is not.
 PULL_LIMIT="${LOOKUP_PULL_TIMEOUT-600}"
 RUN_LIMIT="${LOOKUP_TIMEOUT-600}"
-# Positive integers only: GNU timeout treats 0 as "no limit", which is exactly
-# the unbounded docker run this script refuses, and an empty value would do
-# the same by collapsing the bound off the command line.
+# Positive integers only: GNU timeout treats 0 as "no limit", which silently
+# drops the bound even when a timeout binary is installed, and an empty value
+# would do the same by collapsing the bound off the command line.
 check_limit() {
   case "$2" in
     ''|*[!0-9]*)
@@ -64,6 +65,24 @@ check_limit LOOKUP_TIMEOUT "$RUN_LIMIT"
 # TERM-to-KILL grace: 10 seconds lets the docker CLI detach and report before
 # a process that ignores TERM is killed hard.
 KILL_GRACE=10
+# TIMEOUT_BIN is timeout if present, else gtimeout (Homebrew coreutils on
+# macOS installs it under that name), else empty — with neither, docker runs
+# unbounded after the warning below.
+if command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN=timeout
+elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN=gtimeout
+else TIMEOUT_BIN=""
+fi
+
+# bounded SECONDS cmd args... — run under the timeout binary when one
+# exists, and as given when none does.
+bounded() {
+  _secs="$1"; shift
+  if [ -n "$TIMEOUT_BIN" ]; then
+    "$TIMEOUT_BIN" -k "$KILL_GRACE" "$_secs" "$@"
+  else
+    "$@"
+  fi
+}
 
 if [ "${1-}" = "--org" ]; then
   ORG="${2-}"
@@ -78,7 +97,7 @@ esac
 [ "$#" -ge 1 ] || { echo "usage: apk-lookup.sh [--org ORG] [exact|search|cmd|so] QUERY [QUERY...]" >&2; exit 2; }
 
 command -v docker >/dev/null 2>&1 || { echo "apk-lookup: docker not found" >&2; exit 1; }
-command -v timeout >/dev/null 2>&1 || { echo "apk-lookup: the timeout utility (GNU coreutils or BusyBox) is required; refusing to run docker without a time bound" >&2; exit 1; }
+[ -n "$TIMEOUT_BIN" ] || echo "apk-lookup: no timeout binary found; docker commands run without a time bound" >&2
 
 # Queries are interpolated into a shell command inside the container, so
 # restrict them to package/file-name characters, and require the first
@@ -147,7 +166,7 @@ inner="${inner}exit \$missing"
 # Pull explicitly so the pull gets its own bound — an implicit pull inside
 # docker run would run inside the (shorter-purposed) run bound instead.
 if ! docker image inspect "$LOOKUP_IMAGE" >/dev/null 2>&1; then
-  timeout -k "$KILL_GRACE" "$PULL_LIMIT" docker pull -q "$LOOKUP_IMAGE" >/dev/null
+  bounded "$PULL_LIMIT" docker pull -q "$LOOKUP_IMAGE" >/dev/null
   prc=$?
   # A timed-out pull is the documented exit 4, normalized the same way as the
   # lookup run below (coreutils 124, docker killed by TERM 143 or KILL 137),
@@ -173,9 +192,9 @@ trap cleanup EXIT INT TERM
 
 cname="apk-lookup-$$"
 if [ -n "$ORG" ]; then
-  timeout -k "$KILL_GRACE" "$RUN_LIMIT" docker run --rm --name "$cname" -e HTTP_AUTH "$LOOKUP_IMAGE" sh -c "$inner"
+  bounded "$RUN_LIMIT" docker run --rm --name "$cname" -e HTTP_AUTH "$LOOKUP_IMAGE" sh -c "$inner"
 else
-  timeout -k "$KILL_GRACE" "$RUN_LIMIT" docker run --rm --name "$cname" "$LOOKUP_IMAGE" sh -c "$inner"
+  bounded "$RUN_LIMIT" docker run --rm --name "$cname" "$LOOKUP_IMAGE" sh -c "$inner"
 fi
 rc=$?
 docker rm -f "$cname" >/dev/null 2>&1

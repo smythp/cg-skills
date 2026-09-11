@@ -14,7 +14,8 @@ evals/run.sh                 # all fixtures
 evals/run.sh python-flask    # one or more named fixtures
 ```
 
-Requirements: Docker with a running daemon, bash, curl, `timeout`. The
+Requirements: Docker with a running daemon, bash, curl, and `timeout` (or
+`gtimeout`; with neither, builds and container runs are unbounded). The
 expected files reference the public `cgr.dev/chainguard` catalog, so no
 Chainguard entitlement is needed.
 
@@ -44,8 +45,9 @@ The run exits 0 only when every fixture is PASS or SKIP.
 - `SKIP_BEFORE=1` — skip the "before" sanity build for faster iteration.
 - `KEEP_IMAGES=1` — keep the built images for inspection afterwards.
 
-Every build, pull, and container run carries an inline `timeout -k 30`
-bound; containers and image tags carry a per-run identifier
+Every build, pull, and container run is bounded through `lib.sh`'s
+`bounded` helper (`timeout -k 30`, or `gtimeout` where that is its
+installed name); containers and image tags carry a per-run identifier
 (`migr-e2e-$RUN_ID-<fixture>-<purpose>`), and cleanup runs from a trap on
 EXIT, INT, and TERM.
 
@@ -59,8 +61,8 @@ Create `evals/fixtures/<name>/` with:
   image tag as `$1` and exits non-zero on failure. Source `../../lib.sh`
   and start containers through `run_detached` (which publishes on an
   ephemeral 127.0.0.1 port and echoes the resolved `host:port`) or with
-  `--name "$E2E_CONTAINER"` and an inline `timeout`, so the harness can
-  clean up after a hang.
+  `--name "$E2E_CONTAINER"` under `lib.sh`'s `bounded` helper, so the
+  harness can clean up after a hang.
 - `Dockerfile.chainguard` and `migration-report.md` — regenerated, never
   written by hand: run this skill's SKILL.md end to end as the agent against
   the fixture's Dockerfile and place exactly what the skill produced after

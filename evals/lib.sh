@@ -13,6 +13,24 @@
 # smoke.sh run gets a per-process fallback.
 E2E_CONTAINER="${E2E_CONTAINER:-migr-e2e-$(date +%s)-$$-smoke}"
 
+# TIMEOUT_BIN is timeout if present, else gtimeout (Homebrew coreutils on
+# macOS installs it under that name), else empty.
+if command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN=timeout
+elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN=gtimeout
+else TIMEOUT_BIN=""
+fi
+
+# bounded SECONDS cmd args... — run under the timeout binary when one
+# exists, and as given when none does.
+bounded() {
+  local secs="$1"; shift
+  if [ -n "$TIMEOUT_BIN" ]; then
+    "$TIMEOUT_BIN" -k 30 "$secs" "$@"
+  else
+    "$@"
+  fi
+}
+
 # wait_for_http URL [timeout_seconds]
 # Polls URL until it returns any HTTP response, or times out.
 wait_for_http() {
@@ -31,7 +49,7 @@ wait_for_http() {
 # ephemeral 127.0.0.1 port, and echoes the resolved host:port.
 run_detached() {
   local image="$1" cport="$2" addr
-  timeout -k 30 60 docker run -d --rm --name "$E2E_CONTAINER" \
+  bounded 60 docker run -d --rm --name "$E2E_CONTAINER" \
     -p "127.0.0.1::$cport" "$image" >/dev/null || return 1
   addr="$(docker port "$E2E_CONTAINER" "$cport" | head -n1)" || return 1
   [ -n "$addr" ] || return 1

@@ -8,9 +8,12 @@
 #      as "no organizations"
 #   2. a working listing (minimal JSON) — preflight must PASS and show the
 #      organization
+#   3. a PATH with neither timeout nor gtimeout — preflight exits 0 and
+#      prints the not-found line (a warning, not a failure)
+#   4. a PATH where only gtimeout exists — preflight prints OK (gtimeout)
 #
-# Dependencies: sh, awk, grep, sed, sort, timeout (all also required by
-# preflight itself). No network, no Docker, no chainctl.
+# Dependencies: sh, awk, grep, sed, sort. No network, no Docker, no
+# chainctl.
 
 set -u
 
@@ -82,6 +85,49 @@ else
   case "$out" in
     *"preflight: PASS"*) ok ;;
     *) bad "expected 'preflight: PASS', got: $out" ;;
+  esac
+fi
+
+# Cases 3 and 4 need a PATH that controls whether timeout and gtimeout
+# resolve, so the shim directory carries preflight's other dependencies
+# itself. /usr/local/bin stays on PATH after the shims so preflight's own
+# PATH-extension case matches and does not prepend it ahead of them; these
+# cases assume it carries no timeout binary of its own.
+SH_BIN="$(command -v sh)"
+make_tool_shims() {
+  mkdir -p "$1"
+  for t in awk grep sed sort; do
+    p="$(command -v "$t")" || { echo "cannot resolve $t for the shim PATH; aborting"; exit 1; }
+    ln -s "$p" "$1/$t"
+  done
+  cp "$tmp/bin/docker" "$1/docker"
+  cp "$tmp/chainctl-json" "$1/chainctl"
+  chmod 755 "$1/docker" "$1/chainctl"
+}
+
+echo "--- case 3: neither timeout nor gtimeout is a warning, not a failure ---"
+make_tool_shims "$tmp/notimeout"
+out=$(PATH="$tmp/notimeout:/usr/local/bin" "$SH_BIN" "$SCRIPT" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  bad "a missing timeout binary must not fail preflight (exited $rc): $out"
+else
+  case "$out" in
+    *"timeout: not found"*) ok ;;
+    *) bad "expected the timeout not-found line, got: $out" ;;
+  esac
+fi
+
+echo "--- case 4: gtimeout alone reports OK (gtimeout) ---"
+make_tool_shims "$tmp/gtimeoutonly"
+printf '#!/bin/sh\nexit 0\n' > "$tmp/gtimeoutonly/gtimeout"
+chmod 755 "$tmp/gtimeoutonly/gtimeout"
+out=$(PATH="$tmp/gtimeoutonly:/usr/local/bin" "$SH_BIN" "$SCRIPT" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  bad "gtimeout-only case exited $rc: $out"
+else
+  case "$out" in
+    *"timeout: OK (gtimeout)"*) ok ;;
+    *) bad "expected 'timeout: OK (gtimeout)', got: $out" ;;
   esac
 fi
 
