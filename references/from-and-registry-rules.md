@@ -275,7 +275,8 @@ FROM cgr.dev/chainguard/python:latest-dev
 ## Digest rule
 
 A digest-pinned original gets a digest-pinned migration; an unpinned original
-stays unpinned. The migrated digest is always the Chainguard image's own
+stays unpinned unless the user opted in to digest pinning at the clarify
+step. The migrated digest is always the Chainguard image's own
 digest — never the upstream digest, which is the hash of a different image
 and can never match.
 
@@ -287,8 +288,8 @@ migration time.
 
 **Packages are not pinned.** Wolfi is a rolling distribution and superseded
 package versions leave the index, so `apk add name=version` stops building
-within days. The image digest fixes the package set, and the report records
-the resolved package versions.
+within days. A digest-pinned FROM fixes the package set; the report records
+the resolved package versions either way.
 
 Correct:
 

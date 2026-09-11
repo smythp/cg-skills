@@ -101,7 +101,7 @@ answers there. Then ask the rest together, in one message:
 - **Probes**: run app startup and HTTP probes during validation? Binary and
   file checks always run regardless.
 - **Digest pinning**: pin FROM lines to image digests? Recommended for
-  reproducible builds. The original is [pinned / not pinned]. Running
+  reproducible builds; say whether the original is pinned. Running
   unattended, match the original.
 
 Offer to save new answers to that preferences file for later migrations;

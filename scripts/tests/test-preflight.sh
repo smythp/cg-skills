@@ -90,10 +90,14 @@ fi
 
 # Cases 3 and 4 need a PATH that controls whether timeout and gtimeout
 # resolve, so the shim directory carries preflight's other dependencies
-# itself. /usr/local/bin stays on PATH after the shims so preflight's own
-# PATH-extension case matches and does not prepend it ahead of them; these
-# cases assume it carries no timeout binary of its own.
+# itself. preflight prepends /usr/local/bin to PATH when it is absent, which
+# would let a host's own timeout or gtimeout there (Homebrew on Intel macOS)
+# change what these cases see; so they run a copy of preflight whose
+# /usr/local/bin is rewritten to an empty directory under $tmp.
 SH_BIN="$(command -v sh)"
+mkdir -p "$tmp/emptybin"
+PF_ISOLATED="$tmp/preflight-isolated.sh"
+sed "s|/usr/local/bin|$tmp/emptybin|g" "$SCRIPT" > "$PF_ISOLATED"
 make_tool_shims() {
   mkdir -p "$1"
   for t in awk grep sed sort; do
@@ -107,7 +111,7 @@ make_tool_shims() {
 
 echo "--- case 3: neither timeout nor gtimeout is a warning, not a failure ---"
 make_tool_shims "$tmp/notimeout"
-out=$(PATH="$tmp/notimeout:/usr/local/bin" "$SH_BIN" "$SCRIPT" "$tmp" 2>&1); rc=$?
+out=$(PATH="$tmp/notimeout" "$SH_BIN" "$PF_ISOLATED" "$tmp" 2>&1); rc=$?
 if [ "$rc" -ne 0 ]; then
   bad "a missing timeout binary must not fail preflight (exited $rc): $out"
 else
@@ -121,7 +125,7 @@ echo "--- case 4: gtimeout alone reports OK (gtimeout) ---"
 make_tool_shims "$tmp/gtimeoutonly"
 printf '#!/bin/sh\nexit 0\n' > "$tmp/gtimeoutonly/gtimeout"
 chmod 755 "$tmp/gtimeoutonly/gtimeout"
-out=$(PATH="$tmp/gtimeoutonly:/usr/local/bin" "$SH_BIN" "$SCRIPT" "$tmp" 2>&1); rc=$?
+out=$(PATH="$tmp/gtimeoutonly" "$SH_BIN" "$PF_ISOLATED" "$tmp" 2>&1); rc=$?
 if [ "$rc" -ne 0 ]; then
   bad "gtimeout-only case exited $rc: $out"
 else

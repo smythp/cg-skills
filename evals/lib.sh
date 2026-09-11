@@ -19,6 +19,10 @@ if command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN=timeout
 elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN=gtimeout
 else TIMEOUT_BIN=""
 fi
+if [ -z "$TIMEOUT_BIN" ] && [ -z "${E2E_TIMEOUT_WARNED:-}" ]; then
+  echo "evals: no timeout binary found; docker commands run without a time bound" >&2
+  export E2E_TIMEOUT_WARNED=1
+fi
 
 # bounded SECONDS cmd args... — run under the timeout binary when one
 # exists, and as given when none does.

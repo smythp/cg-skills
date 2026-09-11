@@ -173,8 +173,9 @@ per image that fell back to the public `cgr.dev/chainguard` catalog, naming
 the image and the reason (for example: ruby is not in your org, so the
 public `cgr.dev/chainguard/ruby` was used).
 
-Warnings also carries a Resolved digests line: for every FROM in the
-migrated file, the digest it resolved to — through
+Warnings also carries a Resolved digests line: for every FROM that names a
+registry image (`scratch` and stage aliases have no digest), the digest it
+resolved to — through
 `chainctl images tags list` for a Chainguard registry, or for a mirror the
 manifest digest (`timeout -k 30 60 docker manifest inspect -v <ref>`) — and
 whether it was pinned (pinned: original was pinned, or the user opted in;
