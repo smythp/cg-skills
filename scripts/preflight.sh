@@ -9,7 +9,7 @@
 # Exit codes: 0 = required tools present (docker daemon, chainctl login and
 # a working organization listing, timeout, and the parsing tools awk, grep,
 # sed, sort); 1 = a required tool is missing or not working. Optional
-# findings (syft, dfc, .dockerignore) are reported but never fail the check.
+# findings (syft, .dockerignore) are reported but never fail the check.
 
 set -u
 
@@ -48,7 +48,7 @@ if command -v docker >/dev/null 2>&1; then
     fail=1
   fi
 else
-  echo "docker: NOT FOUND. This skill needs Docker to build and verify. Install instructions for the user: https://docs.docker.com/get-docker/ . For a deterministic rewrite without builds, the dfc CLI (https://github.com/chainguard-dev/dfc) does the mapping only."
+  echo "docker: NOT FOUND. This skill needs Docker to build and verify. Install instructions for the user: https://docs.docker.com/get-docker/"
   fail=1
 fi
 
@@ -110,12 +110,6 @@ if command -v syft >/dev/null 2>&1; then
   echo "syft: OK ($(syft version 2>/dev/null | awk '/^Version:/ {print $2}'))"
 else
   echo "syft: not installed; compare-images.sh will fall back to its pinned scanner container (docker.io/anchore/syft, pinned by digest in the script). Install instructions if the user wants the binary: https://github.com/anchore/syft#installation"
-fi
-
-if command -v dfc >/dev/null 2>&1; then
-  echo "dfc: OK (optional deterministic first draft is available)"
-else
-  echo "dfc: not installed; the optional draft step is skipped. Install instructions if the user wants it: https://github.com/chainguard-dev/dfc"
 fi
 
 if [ -f "$CONTEXT/.dockerignore" ]; then

@@ -112,9 +112,8 @@ Default: the Debian/Fedora/Alpine name tables and the Wolfi rename patterns
 (`python3-X` → `py3-X`, `X-devel` → `X-dev`, and the rest), confirmed with
 `scripts/apk-lookup.sh` — the table proposes, the index disposes.
 
-Exception: when the open-source dfc CLI is installed, its built-in mappings
-answer the same question (`dfc ./Dockerfile` applies them wholesale; see the
-optional draft step in SKILL.md).
+No named exception; confirm every candidate name with
+`scripts/apk-lookup.sh`.
 
 ## Compare two images?
 

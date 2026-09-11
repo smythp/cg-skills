@@ -10,8 +10,7 @@ description: >-
   full run takes five to thirty minutes of builds. Not for GitHub Actions
   workflow migrations, Helm charts or Kubernetes manifests, apko or melange
   image builds, Chainguard Libraries (language dependency) setup, or images
-  that have no Dockerfile source. For a deterministic rewrite without
-  Docker, use the dfc CLI instead.
+  that have no Dockerfile source.
 allowed-tools: Read, Write, Edit, Grep, Glob, Bash
 ---
 
@@ -40,12 +39,11 @@ Copy this checklist into your reply and tick items as you complete them:
 - [ ] 4. Org / mirror / FIPS / probe preferences clarified
 - [ ] 5. Working directory created outside the build context; RUN_ID minted
 - [ ] 6. File mapped: stages, package managers, referenced context files
-- [ ] 7. Optional dfc draft taken or skipped
-- [ ] 8. Every layer translated, built, compared, and tested
-- [ ] 9. Build failures fixed with the playbook (or none occurred)
-- [ ] 10. FROM gate passed; stage-end USER verified
-- [ ] 11. Final validation gate passed (or run marked unverified)
-- [ ] 12. Report written; outputs delivered; swap only on confirmation
+- [ ] 7. Every layer translated, built, compared, and tested
+- [ ] 8. Build failures fixed with the playbook (or none occurred)
+- [ ] 9. FROM gate passed; stage-end USER verified
+- [ ] 10. Final validation gate passed (or run marked unverified)
+- [ ] 11. Report written; outputs delivered; swap only on confirmation
 ```
 
 ## The workflow
@@ -57,8 +55,7 @@ chainctl is missing or logged out, stop and relay preflight's messages to the
 user: each names what is missing and links its install instructions, so the
 user can install it or ask you to. Do not install anything on the skill's
 initiative. Without Docker there is no verification, so do not continue with
-an unverified rewrite; point the user at the dfc CLI for a deterministic
-rewrite without builds.
+an unverified rewrite.
 
 ### 2. Trust gate — always
 
@@ -114,7 +111,7 @@ context for the evolving Dockerfile, report draft, build logs, and archives,
 and build with `-f` pointing there. A working file inside the context gets
 swept up by `COPY . .` — it contaminates the migrated image, invalidates the
 comparison, and busts Docker's layer cache on every edit. Nothing is written
-beside the original until step 12, and the original file is never edited.
+beside the original until step 11, and the original file is never edited.
 
 Mint one run identifier alongside the directory — `RUN_ID=$(date +%s)-$$` —
 and name every container this run starts `migr-$RUN_ID-<purpose>` (see Time
@@ -135,17 +132,7 @@ If a base image is a deep stack with no one-line equivalent (ros,
 tensorflow, a vendor image), plan the stage with
 `references/complex-bases.md` before translating line by line.
 
-### 7. Optional deterministic draft
-
-If the `dfc` CLI is installed, run
-`dfc --org=<org> ./Dockerfile > <workdir>/Dockerfile.draft` (or
-`dfc --registry=<mirror-prefix> ...` when a mirror is configured) and treat
-every line of the draft as untested input: it saves time on the easy lines,
-and nothing from it is emitted until step 8 verifies it. If dfc is not
-installed, skip this; preflight gave the user its install link, and
-installing it is their call.
-
-### 8. Migrate layer by layer, in order, per stage
+### 7. Migrate layer by layer, in order, per stage
 
 For each instruction, using `references/from-and-registry-rules.md`,
 `references/package-translation.md`, and
@@ -177,7 +164,7 @@ the cache; both builds under the build bound), run
 `scripts/compare-images.sh` on the pair, and run one focused
 functional check before touching a layer that depends on this one. A build
 that succeeds while a library went missing is what the compare catches and
-the build does not. Record every check; step 11 reuses the record.
+the build does not. Record every check; step 10 reuses the record.
 
 Prefix builds carry the captured build args, platform, contexts, and
 user-supplied mounts — but not `--target` (a prefix ending before that stage
@@ -186,13 +173,13 @@ were in the last successful build.
 
 Details, including what not to build for: `references/validation-and-report.md`.
 
-### 9. Fix failed builds
+### 8. Fix failed builds
 
 Use `references/build-fix-playbook.md`: read the error and its surrounding
 log, apply the matching fix, rebuild. A pull or auth failure is reported to
 the user — it is never solved by switching to another registry.
 
-### 10. Gate the FROMs
+### 9. Gate the FROMs
 
 Run `scripts/check-from-lines.sh` on the complete migrated file, with
 `--mirror <prefix>` if one is configured and a repeated `--build-arg
@@ -204,7 +191,7 @@ that used `USER root` ends with the image's user. This is the
 machine-checkable intermediate output: paste its OK line into your reply
 before proceeding.
 
-### 11. Validate — a hard gate
+### 10. Validate — a hard gate
 
 Build both files in full with the captured invocation (including `--target`),
 each under the build bound (`timeout -k 30 1200`).
@@ -215,10 +202,10 @@ build, the comparisons were actually performed, every difference is resolved
 or explained, and the mandatory tests pass. A comparison that could not be
 performed fails the gate — it is not an empty diff.
 
-### 12. Report and hand over
+### 11. Report and hand over
 
 Write `migration-report.md` in the format shown in
-`references/validation-and-report.md`. If step 11 passed, copy the report
+`references/validation-and-report.md`. If step 10 passed, copy the report
 and `Dockerfile.chainguard` beside the original and offer — do not perform —
 a swap of the original on the user's confirmation. If it did not pass, copy
 the report and `Dockerfile.chainguard.unverified` instead, say plainly why,
@@ -254,7 +241,7 @@ reference file carries the detail; the one-line forms:
 
 When running unattended with no user to ask, prefer any real migration path
 over keeping the original image — but the trust gate (step 2) and the swap
-confirmation (step 12) still require a human; without one, stop at the
+confirmation (step 11) still require a human; without one, stop at the
 report instead of swapping files.
 
 ## Time and cleanup bounds

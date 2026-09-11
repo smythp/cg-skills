@@ -8,14 +8,6 @@ write a migration report. When the final validation gate does not pass, the
 run writes the report with the reasons and leaves the draft as
 `Dockerfile.chainguard.unverified`; no file swap is offered.
 
-## Which tool to use
-
-- **This skill** when Docker is available and you want a build-verified
-  result. A full run takes five to thirty minutes of builds.
-- **The `dfc` CLI** (github.com/chainguard-dev/dfc) for a deterministic
-  rewrite without Docker: the base-image and package mappings, no build
-  verification. This skill can use it for its optional first draft.
-
 ## Requirements
 
 - Docker with a running daemon
@@ -23,15 +15,12 @@ run writes the report with the reasons and leaves the draft as
 - `chainctl`, logged in with `chainctl auth login`, which is interactive
   (install: https://edu.chainguard.dev/platform/chainctl-usage/how-to-install-chainctl/)
 - Optional: `syft` (install: https://github.com/anchore/syft#installation;
-  otherwise a syft container is used for image comparison) and `dfc`
-  (install: https://github.com/chainguard-dev/dfc; optional deterministic
-  first draft)
+  otherwise a syft container is used for image comparison)
 
 The skill does not install these. `scripts/preflight.sh` checks each one
 and, for anything missing, tells the user what is missing and where the
 install instructions are; the user decides whether to install it or to ask
-their agent to. Without `syft` the pinned scanner container is used; without
-`dfc` the draft step is skipped.
+their agent to. Without `syft` the pinned scanner container is used.
 
 ## Install
 
