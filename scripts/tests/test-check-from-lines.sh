@@ -1,8 +1,6 @@
 #!/bin/sh
-# Fixture tests for check-from-lines.sh, ported from Guardener's
-# TestValidateMigratedFROMs (chainguard-dev/mono
-# containers/dfc/internal/agent/loop_validation_test.go), including every
-# stage-alias case. Run from anywhere: ./test-check-from-lines.sh
+# Fixture tests for check-from-lines.sh, ported from Guardener's FROM
+# validation test cases, including every stage-alias case. Run from anywhere: ./test-check-from-lines.sh
 #
 # Dependencies: sh, awk. No network, no Docker.
 
