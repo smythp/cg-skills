@@ -282,7 +282,10 @@ and can never match.
 
 The clarify step offers digest pinning as an opt-in: a user who wants
 reproducible builds gets every FROM pinned even though the original was
-unpinned. Running unattended, match the original. Pinned or not, the
+unpinned. A digest pin holds the image at that build, so it stops receiving
+Chainguard's rebuilds until the pin moves; pair it with an automated digest
+updater (digestabot, github.com/chainguard-dev/digestabot, or Renovate) so
+it keeps receiving them. Running unattended, match the original. Pinned or not, the
 report's Resolved digests line records the digest every FROM resolved to at
 migration time.
 

@@ -178,7 +178,8 @@ registry image (`scratch` and stage aliases have no digest), the digest it
 resolved to — through
 `chainctl images tags list` for a Chainguard registry, or for a mirror the
 manifest digest (`timeout -k 30 60 docker manifest inspect -v <ref>`) — and
-whether it was pinned (pinned: original was pinned, or the user opted in;
+whether it was pinned (pinned: original was pinned, or the user opted in,
+with a reminder to keep the digest current with digestabot or Renovate;
 not pinned: original unpinned and no opt-in). A condensed real example:
 
 ```markdown
