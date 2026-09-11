@@ -4,6 +4,7 @@
 
 - [The FROM allowlist](#the-from-allowlist)
 - [Registry kinds and the preference chain](#registry-kinds-and-the-preference-chain)
+- [Minimal runtime bases fall back to the public catalog](#minimal-runtime-bases-fall-back-to-the-public-catalog)
 - [Purpose-built image over base image](#purpose-built-image-over-base-image)
 - [Tag selection](#tag-selection)
 - [Version pins on the public catalog](#version-pins-on-the-public-catalog)
@@ -86,6 +87,26 @@ fall back to it rather than to any other host.
 
 In every chain, `wolfi-base` is the floor. There is no lower fallback; going
 below the Chainguard catalog defeats the migration.
+
+## Minimal runtime bases fall back to the public catalog
+
+`static` and `glibc-dynamic` are the distroless final-stage bases for
+compiled binaries (the distroless mappings below). Customer organizations
+rarely carry them — an org typically mirrors the language and application
+images its developers build on, not these minimal runtime bases. So when a
+FROM resolves to `static` (or `glibc-dynamic`) and the existence check finds
+it absent from the org registry or the configured mirror, the fallback is the
+public `cgr.dev/chainguard/static` (or `cgr.dev/chainguard/glibc-dynamic`),
+**not** `wolfi-base`.
+
+`wolfi-base` is the dead-last floor only for generic OS bases that exist to
+host arbitrary packages. Substituting it for `static` would add a shell, apk,
+and glibc to an image whose whole purpose is to carry none of them — the CVE
+and size win the user is migrating for would be gone.
+
+This is an ordinary org-to-public fallback, so call it out in the report like
+any other: one sentence naming the image and the reason (for example: static
+is not in your org, so the public `cgr.dev/chainguard/static` was used).
 
 Every fallback from an organization registry (or its mirror) to the public
 `cgr.dev/chainguard` catalog is called out explicitly in the report — one
