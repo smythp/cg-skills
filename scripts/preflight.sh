@@ -9,8 +9,8 @@
 # Exit codes: 0 = required tools present (docker daemon, chainctl login and
 # a working organization listing, and the parsing tools awk, grep, sed,
 # sort); 1 = a required tool is missing or not working. Optional findings
-# (timeout/gtimeout, syft, .dockerignore) are reported but never fail the
-# check.
+# (timeout/gtimeout, syft, .dockerignore, Dockerfile-specific
+# <name>.dockerignore files) are reported but never fail the check.
 
 set -u
 
@@ -119,6 +119,16 @@ if [ -f "$CONTEXT/.dockerignore" ]; then
 else
   echo ".dockerignore: MISSING in $CONTEXT — Docker will include this entire directory in the build; check for secrets and large files before the first build"
 fi
+
+# BuildKit applies <name>.dockerignore ahead of the context's .dockerignore,
+# selected by the name of the file passed with -f. The workflow builds from
+# a relocated temporary Dockerfile, so such a file must travel beside it or
+# its exclusions silently stop applying. The glob skips the plain
+# .dockerignore, whose leading dot no unquoted * matches.
+for di in "$CONTEXT"/*.dockerignore; do
+  [ -f "$di" ] || continue
+  echo "Dockerfile-specific ignore file: $(basename "$di") is present in $CONTEXT. It applies only to a build whose -f file has the matching name; when the workflow relocates the Dockerfile into its temporary directory, this file must travel beside the temporary file as <temp-name>.dockerignore or its rules stop applying."
+done
 
 echo ""
 if [ "$fail" -eq 0 ]; then

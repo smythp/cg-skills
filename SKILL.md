@@ -59,8 +59,10 @@ an unverified rewrite.
 
 ### 2. Trust gate — always
 
-Read the Dockerfile and the `.dockerignore`, then summarize in a few lines
-what the build does: what it fetches and what it executes. Don't restate
+Read the Dockerfile, the context's `.dockerignore`, and any
+Dockerfile-specific `<name>.dockerignore` beside the Dockerfile, then
+summarize in a few lines what the build does: what it fetches and what it
+executes. Don't restate
 that `docker build` sends the context to Docker — the user already builds
 this image and knows that; focus on what runs. Get the user's confirmation before the
 first build. This is not skipped for files the user says are their own —
@@ -116,6 +118,13 @@ and build with `-f` pointing there. A working file inside the context gets
 swept up by `COPY . .` — it contaminates the migrated image, invalidates the
 comparison, and busts Docker's layer cache on every edit. Nothing is written
 beside the original until step 11, and the original file is never edited.
+
+If the original Dockerfile has a sibling `<name>.dockerignore`, copy it
+beside each temporary Dockerfile under the matching name
+(`<temp-name>.dockerignore`) before any build. BuildKit selects the ignore
+file by the name of the file passed with `-f`, ahead of the context's
+`.dockerignore`, so a relocated Dockerfile without the copy loses those
+rules and a file the original build excluded gets swept into the image.
 
 Mint one run identifier alongside the directory — `RUN_ID=$(date +%s)-$$` —
 and name every container this run starts `migr-$RUN_ID-<purpose>` (see Time
@@ -218,9 +227,12 @@ performed fails the gate — it is not an empty diff.
 Write `migration-report.md` in the format shown in
 `references/validation-and-report.md`. If step 10 passed, copy the report
 and `Dockerfile.chainguard` beside the original and offer — do not perform —
-a swap of the original on the user's confirmation. If it did not pass, copy
-the report and `Dockerfile.chainguard.unverified` instead, say plainly why,
-and do not offer a swap.
+a swap of the original on the user's confirmation. When the original had a
+Dockerfile-specific ignore file, deliver `Dockerfile.chainguard.dockerignore`
+beside `Dockerfile.chainguard` with the same rules, so the delivered pair
+builds with the same exclusions the original did. If step 10 did not pass,
+copy the report and `Dockerfile.chainguard.unverified` instead, say plainly
+why, and do not offer a swap.
 
 ## Hard rules
 

@@ -11,6 +11,9 @@
 #   3. a PATH with neither timeout nor gtimeout — preflight exits 0 and
 #      prints the not-found line (a warning, not a failure)
 #   4. a PATH where only gtimeout exists — preflight prints OK (gtimeout)
+#   5. a context holding Dockerfile.dockerignore — preflight reports the
+#      Dockerfile-specific ignore file and that it must travel beside the
+#      relocated temporary Dockerfile; still a PASS, never a failure
 #
 # Dependencies: sh, awk, grep, sed, sort. No network, no Docker, no
 # chainctl.
@@ -132,6 +135,25 @@ else
   case "$out" in
     *"timeout: OK (gtimeout)"*) ok ;;
     *) bad "expected 'timeout: OK (gtimeout)', got: $out" ;;
+  esac
+fi
+
+echo "--- case 5: a Dockerfile-specific ignore file is reported ---"
+mkdir -p "$tmp/ctx-di"
+printf 'secret.txt\n' > "$tmp/ctx-di/Dockerfile.dockerignore"
+cp "$tmp/chainctl-json" "$tmp/bin/chainctl"
+chmod 755 "$tmp/bin/chainctl"
+out=$(PATH="$tmp/bin:/usr/local/bin:$PATH" sh "$SCRIPT" "$tmp/ctx-di" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  bad "a Dockerfile-specific ignore file must not fail preflight (exited $rc): $out"
+else
+  case "$out" in
+    *"Dockerfile-specific ignore file: Dockerfile.dockerignore"*) ok ;;
+    *) bad "expected the Dockerfile-specific ignore file report, got: $out" ;;
+  esac
+  case "$out" in
+    *"travel beside the temporary file"*) ok ;;
+    *) bad "the report must say the file travels beside the temporary Dockerfile, got: $out" ;;
   esac
 fi
 
