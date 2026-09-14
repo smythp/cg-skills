@@ -338,6 +338,28 @@ FROM My-Corp.Example.io/chainguard-remote/python:latest-dev
 RUN echo hi
 EOF
 
+# Oracle: docker.io/library/alpine:3.20 is resolved; instruction keywords
+# are case-insensitive.
+run_case "lowercase from is still a FROM" "" err "alpine:3.20" <<'EOF'
+from alpine:3.20
+run echo hi
+EOF
+
+# Oracle: docker.io/library/alpine:3.20 is resolved; BuildKit strips one
+# pair of quotes around a FROM reference. The gate does not unquote
+# references, so the quoted form never matches the allowlist and fails
+# closed either way.
+run_case "quoted FROM reference fails closed" "" err "docker.io/library/alpine:3.20" <<'EOF'
+FROM "docker.io/library/alpine:3.20"
+EOF
+
+# Oracle: cgr.dev/chainguard/wolfi-base:latest@sha256:9a8d954d... is
+# resolved as written; a tag plus digest reference passes through the
+# allowlist check on its host prefix.
+run_case "digest-pinned cgr.dev reference is allowed" "" ok "" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base:latest@sha256:9a8d954d8f03a21bcf2be73d4628f0ad26d35c3275469925de63a34eebd58f13
+EOF
+
 run_case "image-shaped alias with slash is rejected" "" err "stage alias" <<'EOF'
 FROM cgr.dev/chainguard/go:latest AS docker.io/evil/img
 RUN echo hi
@@ -648,6 +670,27 @@ RUN echo hi `
 FROM alpine
 EOF
 
+# Oracle: only cgr.dev/chainguard/wolfi-base is resolved. Leading
+# whitespace before a parser directive is allowed and the directive is
+# honored.
+run_case "parser directive with leading whitespace is honored" "" ok "" <<'EOF'
+   # escape=`
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo hi `
+FROM alpine
+EOF
+
+# Oracle: only cgr.dev/chainguard/wolfi-base is resolved. check is a known
+# directive key, so it does not end the directive block and the escape
+# directive after it is honored.
+run_case "check directive does not end the directive block" "" ok "" <<'EOF'
+# check=skip=all
+# escape=`
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo hi `
+FROM alpine
+EOF
+
 # Oracle: only cgr.dev/chainguard/wolfi-base is resolved. An empty line
 # inside a continuation draws a BuildKit warning but the instruction
 # continues, so the "FROM ubuntu" text is swallowed into the RUN.
@@ -665,6 +708,16 @@ run_case "continuation joins without a separator" "" err "builder2" <<'EOF'
 FROM cgr.dev/chainguard/go:latest AS builder
 FROM builder\
 2
+EOF
+
+# Oracle: only cgr.dev/chainguard/wolfi-base is resolved. A comment line
+# inside a continuation is dropped and the continuation goes on, so the
+# FROM alpine text is swallowed into the RUN.
+run_case "comment inside a continuation does not end it" "" ok "" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo hi \
+# a comment
+FROM alpine
 EOF
 
 # Oracle: only cgr.dev/chainguard/wolfi-base is resolved. BuildKit's lexer
@@ -776,6 +829,26 @@ FROM cgr.dev/chainguard/wolfi-base
 RUN cat <<$F1
 FROM ubuntu:22.04
 $F1
+EOF
+
+# Oracle: only cgr.dev/chainguard/wolfi-base is resolved; ONBUILD RUN, COPY,
+# and ADD lines open heredocs like their plain forms, and the body is
+# content.
+run_case "ONBUILD heredoc body is content" "" ok "" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+ONBUILD RUN <<F1
+FROM ubuntu:22.04
+F1
+EOF
+
+# Oracle: only cgr.dev/chainguard/wolfi-base is resolved. After the glued
+# whitespace of a separated << the dash belongs to the delimiter, so this is
+# a heredoc named -EOF2 with no tab chomping.
+run_case "separated delimiter starting with a dash" "" ok "" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN cat << -EOF2
+FROM ubuntu:22.04
+-EOF2
 EOF
 
 # Oracle: docker.io/library/alpine:latest is resolved for the final stage.
@@ -959,6 +1032,15 @@ ARG BASE=${OTHER%-x}
 FROM ${BASE}
 EOF
 
+# Oracle: docker.io/library/alpine:3.20 is resolved (the colon-less -
+# modifier substitutes its default only when the variable is undeclared or
+# undefined, not when it is empty). The gate rejects the colon-less forms
+# instead of emulating them; a conservative rejection, stated in the header.
+run_case "colon-less minus modifier is rejected, not emulated" "" err "unsupported variable modifier" <<'EOF'
+ARG BASE
+FROM ${BASE-docker.io/library/alpine:3.20}
+EOF
+
 # BuildKit reads the quoted value as one assignment spanning whitespace.
 # The gate does not reassemble quoted whitespace; it refuses the line. A
 # conservative rejection, stated in the header.
@@ -974,6 +1056,20 @@ run_case "escape character in an ARG value fails closed" "" err "escape characte
 ARG OTHER=a\ BASE=alpine
 FROM cgr.dev/chainguard/wolfi-base
 EOF
+
+# Oracle: only cgr.dev/chainguard/wolfi-base is resolved. A UTF-8 byte order
+# mark before the parser directives is discarded and the escape directive
+# after it is honored, so the backtick continuation swallows the FROM alpine
+# text. The fixture is built with printf because a literal byte order mark in
+# this file would be invisible.
+printf '\357\273\277# escape=`\nFROM cgr.dev/chainguard/wolfi-base\nRUN echo hi `\nFROM alpine\n' > "$tmp/Dockerfile"
+out=$(sh "$SCRIPT" "$tmp/Dockerfile" 2>&1); rc=$?
+if [ "$rc" -eq 0 ]; then
+  pass=$((pass + 1))
+else
+  failcount=$((failcount + 1))
+  echo "FAIL: byte order mark before directives — expected pass, got exit $rc: $out"
+fi
 
 # Oracle: only cgr.dev/chainguard/wolfi-base is resolved. BuildKit splits
 # words on Unicode spaces (here a no-break space between echo and <<EON), so

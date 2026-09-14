@@ -34,8 +34,10 @@ result pulls from a Chainguard source with Chainguard's provenance; a FROM
 that drifts to another host silently produces an image nobody is maintaining.
 This rule exists because a build-fix pass once "solved" a failing cgr.dev pull
 by swapping the FROM to `ghcr.io/chainguard-images/python:latest-dev` — the
-build went green and the migration was worthless. Run
-`scripts/check-from-lines.sh` on the finished file; any FROM outside the
+build went green and the migration was worthless. The gate is both
+`scripts/check-from-lines.sh`, which reads every FROM line textually, and
+`scripts/check-from-oracle.sh`, which checks every reference BuildKit itself
+resolves for the given target and platform; any reference outside the
 allowlist fails the run.
 
 Correct:
