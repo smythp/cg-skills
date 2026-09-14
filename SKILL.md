@@ -209,7 +209,12 @@ Run `scripts/check-from-lines.sh` on the complete migrated file, with
 `--mirror <prefix>` if one is configured and a repeated `--build-arg
 NAME=value` for every build arg in the captured invocation — the build honors
 those overrides over the Dockerfile's ARG defaults, so a gate run without
-them checks a different file than the one being built. Pass `--platform`
+them checks a different file than the one being built. Pass every named
+context from the captured invocation as a repeated
+`--build-context NAME=SOURCE`, exactly as captured. BuildKit replaces a
+FROM whose reference or stage name matches a context name, so a gate run
+without the contexts checks a different base than the one being built.
+Pass `--platform`
 from the captured invocation, or the daemon's default from
 `docker version --format '{{.Server.Os}}/{{.Server.Arch}}'` when the
 invocation names none, because BuildKit sets the automatic platform
@@ -218,13 +223,13 @@ several platforms, run the gate once per platform. When the invocation has
 `--target`, pass it too, and when the build platform differs from the target
 platform, add `--build-platform` with the daemon's platform. This check
 reads every FROM line textually, reachable or not. For example:
-`scripts/check-from-lines.sh --platform <p> --build-arg NAME=value Dockerfile.chainguard`.
+`scripts/check-from-lines.sh --platform <p> --build-arg NAME=value --build-context NAME=SOURCE Dockerfile.chainguard`.
 
 Run `scripts/check-from-oracle.sh` on the same file with the same options
 plus the build context path. The two scripts share the option set:
 `--mirror <prefix>`, `--platform <os/arch[/variant]>`,
-`--build-platform <os/arch[/variant]>`, `--target <stage>`, and repeated
-`--build-arg NAME=value`. For example:
+`--build-platform <os/arch[/variant]>`, `--target <stage>`, repeated
+`--build-arg NAME=value`, and repeated `--build-context NAME=SOURCE`. For example:
 `timeout -k 30 660 scripts/check-from-oracle.sh --platform <p> --build-arg NAME=value Dockerfile.chainguard <context>`
 (its internal outline call is itself bounded at 600 seconds). It evaluates
 the file with BuildKit's own frontend, which loads image metadata and

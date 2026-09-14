@@ -31,6 +31,7 @@ match BuildKit it exits 1 naming the construct; those rows say so.
 - [Automatic platform arguments](#automatic-platform-arguments)
 - [Variable expansion forms](#variable-expansion-forms)
 - [FROM syntax](#from-syntax)
+- [Named build contexts](#named-build-contexts)
 
 ## Tokenization and quoting on heredoc lines
 
@@ -177,3 +178,28 @@ redeclaration stays allowed.
 | FROM of an earlier alias | stage reference, not a pull | same | stage alias is allowed (existing) |
 | `scratch` | the empty base for the lowercase spelling only, no metadata load; FROM SCRATCH fails to parse as a stage name (repository name library/SCRATCH must be lowercase) | matched case-sensitively; other spellings fall through to the allowlist check and are rejected | scratch is allowed (existing); FROM SCRATCH is rejected as an image reference |
 | BuildKit source policy (`EXPERIMENTAL_BUILDKIT_SOURCE_POLICY` in the environment) | converts a reference after the log names the original | the oracle exits 1 naming the variable when it is set; the textual gate reads no environment beyond its own inputs | source policy shim case in test-check-from-oracle.sh |
+
+## Named build contexts
+
+Both scripts take a repeatable `--build-context NAME=SOURCE`, and step 9
+passes every named context from the captured invocation to both. BuildKit
+matches a context name against the expanded FROM reference and against
+stage names after docker reference normalization on both sides, so a gate
+run without the contexts checks a different base than the build resolves.
+The oracle passes each context through to buildx unchanged; the overridden
+load prints as `#N [context NAME] load metadata for REF`, which the
+label-agnostic parsing reads like any other reference. Every rule below
+was pinned with an outline run, and the scratch row with a real cacheonly
+build, on Docker 29.8.0 with buildx v0.37.0.
+
+| Construct | BuildKit | Gate | Fixture |
+|---|---|---|---|
+| context name matching a FROM reference | the docker-image:// source replaces the base; other source kinds (local directory, git, oci-layout, target) build the base from that source | docker-image://REF puts REF through the allowlist in place of the FROM; any other source kind for a FROM name exits 1 as unsupported for a base | build context overriding a Chainguard FROM to alpine is rejected; build context overriding a FROM to another Chainguard image is allowed; local-directory context for a FROM name is rejected; oracle test case 6 |
+| matching normalization | reference normalization on both sides: a bare name gains docker.io/library/ and :latest, index.docker.io maps to docker.io, the host compares case-insensitively | same rules in norm_ref, shared by both scripts | context name with a tag matches an untagged FROM; fully qualified context name matches a short FROM; index.docker.io context name matches a short FROM; context name with a different tag does not match |
+| matching against the expanded reference | the context match sees the FROM after ARG expansion | same | context matching happens after ARG expansion |
+| context name matching a stage name | the context beats the stage wherever it is referenced | same, checked at each FROM | context overriding a stage alias to alpine is rejected; context overriding a stage alias to a Chainguard image is allowed |
+| context named scratch | `FROM scratch` stays the empty base; a named context cannot override scratch | same | scratch cannot be overridden by a context |
+| digest-pinned FROM | matches a context only on the exact digest string; the bare name does not match | same | context with the exact digest string overrides the FROM; bare context name does not match a digest-pinned FROM |
+| repeated context name | the last value wins | same | repeated context name applies the last value (allowed, rejected) |
+| context name matching no FROM and no stage a FROM uses | ignored for bases (a COPY --from source may still use it, including from a local directory) | same | context whose name matches nothing is ignored; local-directory context for a copy source is ignored by the FROM gate |
+| context name that is not a valid reference | buildx refuses the invocation (invalid context name, lowercase repository rule) | exit 1 naming the context | invalid context name is refused |

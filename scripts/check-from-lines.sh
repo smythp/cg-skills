@@ -5,7 +5,8 @@
 #
 # Usage: check-from-lines.sh [--mirror PREFIX] [--platform OS/ARCH[/VARIANT]]
 #                            [--build-platform OS/ARCH[/VARIANT]] [--target NAME]
-#                            [--build-arg NAME=value ...] DOCKERFILE
+#                            [--build-arg NAME=value ...]
+#                            [--build-context NAME=SOURCE ...] DOCKERFILE
 #   --mirror PREFIX       external pull-through mirror, e.g. my-corp.example.io/cg
 #   --platform P          the platform of the captured build invocation, or
 #                         the daemon's default when the invocation names
@@ -31,6 +32,20 @@
 #                         than the one being built. Overrides of the
 #                         automatic arguments above apply even with no ARG
 #                         declaration, as in docker build.
+#   --build-context NAME=SOURCE  a named build context from the captured
+#                         invocation; repeatable, last value per name wins,
+#                         as in buildx. BuildKit replaces a FROM whose
+#                         reference or stage name matches NAME (after
+#                         reference normalization on both sides), so a gate
+#                         run without these checks a different base than
+#                         the one being built. A docker-image:// source
+#                         replaces the FROM reference for the check; any
+#                         other source kind matching a FROM is rejected,
+#                         because a base taken from a directory, git
+#                         repository, oci layout, or another target cannot
+#                         be checked against a registry allowlist. A NAME
+#                         matching no FROM and no stage used by a FROM is
+#                         ignored, as BuildKit ignores it for bases.
 #
 # Exit codes: 0 = all FROMs allowed; 1 = a FROM (or stage alias, or ARG
 # expansion, or a construct this gate refuses to guess about) is not allowed,
@@ -159,6 +174,17 @@
 #     as before.
 #   - Unresolved variables in a FROM ref are rejected: FROM $UNSET could
 #     resolve to anything at build time, so it cannot pass a static gate.
+#   - Named build contexts: BuildKit matches each --build-context name
+#     against the expanded FROM reference and against stage names, after
+#     docker reference normalization on both sides (a bare name gains
+#     docker.io/library/ and :latest, index.docker.io maps to docker.io, a
+#     digest reference matches only the exact digest string), and the
+#     match beats a stage of the same name while scratch cannot be
+#     overridden at all; each rule pinned by an outline run or a real
+#     build. The gate applies the same matching at each FROM. A matching
+#     docker-image://REF source puts REF through the allowlist in place of
+#     the FROM; a matching source of any other kind is rejected as
+#     unsupported for a base; a name that matches nothing is ignored.
 #   - A stage alias must match ^[a-zA-Z][a-zA-Z0-9_.-]*$ (Docker stage-name
 #     rules) so an image-shaped alias cannot become a trusted name for later
 #     FROMs. Aliases compare case-insensitively.
@@ -175,7 +201,10 @@
 # body, and a final CR with no LF, which BuildKit reads as an ordinary line
 # ending, verified against a real outline run); a global ARG that declares
 # a default for an automatic argument name is rejected even though BuildKit
-# accepts the file (the automatic arguments bullet above says why); and with --platform but no
+# accepts the file (the automatic arguments bullet above says why); a
+# --build-context whose source is not docker-image:// is rejected when its
+# name matches a FROM, where BuildKit would build the base from that
+# source; and with --platform but no
 # --build-platform the BUILD* arguments take the target platform's values,
 # which matches every same-platform build but differs on a cross-platform
 # one until the caller passes --build-platform.
@@ -189,6 +218,7 @@ NL='
 
 MIRROR=""
 BUILD_ARGS=""
+BUILD_CONTEXTS=""
 PLATFORM=""
 BUILD_PLATFORM=""
 TARGET_STAGE=""
@@ -308,13 +338,26 @@ while :; do
       BUILD_ARGS="${BUILD_ARGS}${ba}${NL}"
       shift 2
       ;;
+    --build-context)
+      bc="${2-}"
+      case "$bc" in
+        ''|=*) echo "check-from-lines.sh: --build-context needs NAME=SOURCE" >&2; exit 2 ;;
+        *=*) : ;;
+        *) echo "check-from-lines.sh: --build-context needs NAME=SOURCE, got '$bc'" >&2; exit 2 ;;
+      esac
+      case "$bc" in
+        *"$NL"*) echo "check-from-lines.sh: a --build-context value must not contain a newline" >&2; exit 2 ;;
+      esac
+      BUILD_CONTEXTS="${BUILD_CONTEXTS}${bc}${NL}"
+      shift 2
+      ;;
     *) break ;;
   esac
 done
 
 DOCKERFILE="${1-}"
 if [ -z "$DOCKERFILE" ] || [ ! -f "$DOCKERFILE" ]; then
-  echo "usage: check-from-lines.sh [--mirror PREFIX] [--platform OS/ARCH[/VARIANT]] [--build-platform OS/ARCH[/VARIANT]] [--target NAME] [--build-arg NAME=value ...] DOCKERFILE" >&2
+  echo "usage: check-from-lines.sh [--mirror PREFIX] [--platform OS/ARCH[/VARIANT]] [--build-platform OS/ARCH[/VARIANT]] [--target NAME] [--build-arg NAME=value ...] [--build-context NAME=SOURCE ...] DOCKERFILE" >&2
   exit 2
 fi
 
@@ -383,7 +426,7 @@ fi
 # The platform values reach awk through -v, which is safe here: they are
 # validated above to letters, digits, and [_./-], none of which awk escape
 # processing touches.
-CHECK_FROM_BUILD_ARGS="$BUILD_ARGS" CHECK_FROM_MIRROR="$MIRROR" LC_ALL=C awk \
+CHECK_FROM_BUILD_ARGS="$BUILD_ARGS" CHECK_FROM_BUILD_CONTEXTS="$BUILD_CONTEXTS" CHECK_FROM_MIRROR="$MIRROR" LC_ALL=C awk \
   -v platform_set="$PLATFORM_SET" -v tplat="$T_PLAT" -v tos="$T_OS" \
   -v tarch="$T_ARCH" -v tvar="$T_VAR" -v bplat="$B_PLAT" -v bos="$B_OS" \
   -v barch="$B_ARCH" -v bvar="$B_VAR" -v target_set="$TARGET_SET" \
@@ -466,6 +509,55 @@ function expand_str(s, mode, lineno,   out, j, k, name, c, mod, word, isset) {
     }
   }
   return out
+}
+
+# norm_ref(r): normalize an image reference or stage name the way docker
+# reference normalization does before BuildKit matches it against a named
+# build context, each rule pinned by an outline run (the named-contexts
+# fixtures record the runs). The part before the first / is a registry
+# host only when it contains a dot or a colon or is exactly localhost;
+# index.docker.io maps to docker.io; a docker.io path without a slash
+# gains library/; a reference with neither tag nor digest gains :latest;
+# the host compares case-insensitively; a digest part is kept verbatim.
+# Returns the empty string for a value docker refuses (an uppercase
+# repository, whitespace, empty parts, a colon inside the path). BuildKit
+# fails any build whose FROM needs such a value and buildx refuses such a
+# context name, so an empty result never silently matches.
+function norm_ref(r,   host, rest, dig, tag, slash, last, colon, dpos) {
+  if (r == "") return ""
+  if (r ~ /[ \t\r]/ || index(r, VT) > 0 || index(r, FF) > 0) return ""
+  dig = ""
+  dpos = index(r, "@")
+  if (dpos > 0) {
+    dig = substr(r, dpos)
+    r = substr(r, 1, dpos - 1)
+    if (r == "" || length(dig) < 2) return ""
+  }
+  slash = index(r, "/")
+  if (slash == 0) { host = "docker.io"; rest = r }
+  else {
+    host = substr(r, 1, slash - 1)
+    if (host ~ /[.:]/ || host == "localhost") rest = substr(r, slash + 1)
+    else { host = "docker.io"; rest = r }
+  }
+  host = tolower(host)
+  if (host == "index.docker.io") host = "docker.io"
+  if (host == "" || rest == "") return ""
+  tag = ""
+  last = rest
+  sub(/^.*\//, "", last)
+  colon = index(last, ":")
+  if (colon > 0) {
+    tag = substr(last, colon + 1)
+    rest = substr(rest, 1, length(rest) - length(last) + colon - 1)
+    if (tag == "" || tag ~ /[^A-Za-z0-9_.-]/ || length(tag) > 128) return ""
+  }
+  if (host == "docker.io" && index(rest, "/") == 0) rest = "library/" rest
+  if (rest ~ /[^a-z0-9._\/-]/) return ""
+  if (rest ~ /^[\/.]/ || rest ~ /[\/.]$/ || index(rest, "//") > 0) return ""
+  if (tag == "" && dig == "") tag = "latest"
+  if (tag != "") return host "/" rest ":" tag dig
+  return host "/" rest dig
 }
 
 function strip_quotes(s) {
@@ -666,6 +758,25 @@ BEGIN {
     p = index(ba_lines[b], "=")
     if (p > 1) OVERRIDE[substr(ba_lines[b], 1, p - 1)] = substr(ba_lines[b], p + 1)
   }
+  # Named build contexts, keyed by the normalized name; BuildKit matches a
+  # context against a FROM reference or a stage name after reference
+  # normalization on both sides, and a repeated flag with the same name
+  # wins with its last value, both pinned by outline runs. A name docker
+  # cannot parse is refused here because buildx refuses the invocation
+  # (verified; it names the context and the lowercase repository rule).
+  N_CTX = 0
+  n_bc = split(ENVIRON["CHECK_FROM_BUILD_CONTEXTS"], bc_lines, "\n")
+  for (b = 1; b <= n_bc; b++) {
+    if (bc_lines[b] == "") continue
+    p = index(bc_lines[b], "=")
+    if (p <= 1) continue
+    cname = substr(bc_lines[b], 1, p - 1)
+    cnorm = norm_ref(cname)
+    if (cnorm == "")
+      fail("the build context name \"" cname "\" is not a valid image reference, so buildx refuses this invocation; the captured build cannot run with it")
+    CTX[cnorm] = substr(bc_lines[b], p + 1)
+    N_CTX++
+  }
   # Seed the automatic platform arguments the way BuildKit does: all of them
   # when the platform is known (the OSVERSION pair and a missing variant are
   # set to the empty string, which the :- and :+ modifiers treat as unset),
@@ -780,7 +891,7 @@ END {
   exit EXITCODE + 0
 }
 
-function process(logical, lineno,   n, f, instr, sub2, p, q, ref, resolved, alias, lc, i, ai, t, name, val, inner, litq, LEXW, ln) {
+function process(logical, lineno,   n, f, instr, sub2, p, q, ref, resolved, alias, lc, i, ai, t, name, val, inner, litq, cnorm, csrc, checked, lc2, LEXW, ln) {
   n = split(logical, f, WS)
   if (n == 0) return
   instr = toupper(f[1])
@@ -883,11 +994,32 @@ function process(logical, lineno,   n, f, instr, sub2, p, q, ref, resolved, alia
   ok = 0
   # scratch case-sensitively: BuildKit gives the empty base only for the
   # lowercase spelling and rejects FROM SCRATCH as an image reference whose
-  # repository name must be lowercase.
+  # repository name must be lowercase. scratch comes before the context
+  # check because a named context cannot override scratch (pinned by a
+  # real build), and the context check comes before the alias table
+  # because a context beats a stage of the same name (also pinned).
   if (resolved == "scratch") ok = 1
-  else if (lc in ALIASES) ok = 1
-  else if (substr(lc, 1, 8) == "cgr.dev/") ok = 1
-  else if (mirror != "" && substr(lc, 1, length(mirror) + 1) == mirror "/") ok = 1
+  else {
+    if (N_CTX > 0) {
+      cnorm = norm_ref(resolved)
+      if (cnorm != "" && (cnorm in CTX)) {
+        csrc = CTX[cnorm]
+        if (substr(csrc, 1, 15) != "docker-image://")
+          fail("FROM \"" resolved "\" at line " lineno " is overridden by a --build-context whose source (" csrc ") is not a docker-image:// reference. A base taken from a local directory, a git repository, an oci layout, or another build target cannot be checked against the allowlist, so a named context of that kind is unsupported for a base")
+        checked = substr(csrc, 16)
+        lc2 = tolower(checked)
+        if (substr(lc2, 1, 8) == "cgr.dev/") ok = 1
+        else if (mirror != "" && substr(lc2, 1, length(mirror) + 1) == mirror "/") ok = 1
+        if (!ok)
+          fail("FROM \"" resolved "\" at line " lineno " is overridden by --build-context to \"" checked "\", which is not allowed: base images must come from cgr.dev/* or the configured external mirror")
+      }
+    }
+    if (!ok) {
+      if (lc in ALIASES) ok = 1
+      else if (substr(lc, 1, 8) == "cgr.dev/") ok = 1
+      else if (mirror != "" && substr(lc, 1, length(mirror) + 1) == mirror "/") ok = 1
+    }
+  }
 
   if (!ok)
     fail("FROM \"" resolved "\" at line " lineno " is not allowed: base images must come from cgr.dev/* or the configured external mirror")

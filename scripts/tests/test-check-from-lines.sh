@@ -25,7 +25,8 @@ failcount=0
 # run_case NAME MIRROR EXPECT CONTAINS [ARG...]  (dockerfile on stdin)
 #   EXPECT: ok  -> script must exit 0
 #           err -> script must exit non-zero and output must contain CONTAINS
-#   An extra argument of --platform, --build-platform, or --target passes
+#   An extra argument of --platform, --build-platform, --target, or
+#   --build-context passes
 #   through with its following value; every other extra argument is passed
 #   as --build-arg NAME=value.
 run_case() {
@@ -38,7 +39,7 @@ run_case() {
   for a in "$@"; do
     if [ "$pend" -eq 1 ]; then extra="$extra $a"; pend=0; continue; fi
     case "$a" in
-      --platform|--build-platform|--target) extra="$extra $a"; pend=1 ;;
+      --platform|--build-platform|--target|--build-context) extra="$extra $a"; pend=1 ;;
       *) extra="$extra --build-arg $a" ;;
     esac
   done
@@ -707,6 +708,134 @@ EOF
 # A multi-platform value is a usage error; the caller runs the gate once
 # per platform (exit 2, no oracle involved).
 run_case "multi-platform value is refused" "" err "one platform per run" --platform linux/amd64,linux/arm64 <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+EOF
+
+# --- named build contexts -------------------------------------------------
+# Every expected result below was pinned with an outline run on Docker
+# 29.8.0 / buildx v0.37.0, whose progress log shows the overridden load as
+# "#N [context NAME] load metadata for REF"; the scratch case was pinned
+# with a real cacheonly build because the outline resolves nothing there.
+
+# Oracle: with --build-context cgr.dev/chainguard/wolfi-base=
+# docker-image://alpine:latest the run loads metadata for alpine:latest
+# under the [context] label and never touches wolfi-base. The pull-request
+# reproduction: a Chainguard FROM that the build resolves to alpine.
+run_case "build context overriding a Chainguard FROM to alpine is rejected" "" err "overridden by --build-context" --build-context cgr.dev/chainguard/wolfi-base=docker-image://alpine:latest <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo hi
+EOF
+
+# Oracle: the same override pointed at cgr.dev/chainguard/static:latest
+# loads static under the [context] label; the substituted reference is on
+# the allowlist.
+run_case "build context overriding a FROM to another Chainguard image is allowed" "" ok "" --build-context cgr.dev/chainguard/wolfi-base=docker-image://cgr.dev/chainguard/static:latest <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo hi
+EOF
+
+# Oracle: with a local-directory source the outline resolves no metadata at
+# all for the overridden name; the base comes from the directory, which no
+# registry allowlist can vouch for.
+run_case "local-directory context for a FROM name is rejected" "" err "unsupported for a base" --build-context cgr.dev/chainguard/wolfi-base=./ctxdir <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo hi
+EOF
+
+# Oracle: a context whose name matches no FROM and no stage changes
+# nothing; the run resolves wolfi-base as if the flag were absent.
+run_case "context whose name matches nothing is ignored" "" ok "" --build-context zzz=docker-image://alpine:latest <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo hi
+EOF
+
+# Oracle: a local-directory context for a name only COPY --from uses leaves
+# every FROM untouched; artifact sources may come from directories.
+run_case "local-directory context for a copy source is ignored by the FROM gate" "" ok "" --build-context assets=./ctxdir <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+COPY --from=assets f /f
+EOF
+
+# Oracle: the context name alpine:latest matches FROM alpine; both sides
+# normalize to docker.io/library/alpine:latest before the comparison.
+run_case "context name with a tag matches an untagged FROM" "" ok "" --build-context alpine:latest=docker-image://cgr.dev/chainguard/static:latest <<'EOF'
+FROM alpine
+EOF
+
+# Oracle: the context name docker.io/library/alpine matches FROM alpine;
+# the short name gains docker.io/library/ before the comparison.
+run_case "fully qualified context name matches a short FROM" "" ok "" --build-context docker.io/library/alpine=docker-image://cgr.dev/chainguard/static:latest <<'EOF'
+FROM alpine
+EOF
+
+# Oracle: index.docker.io maps to docker.io in the normalization, so this
+# context name also matches FROM alpine.
+run_case "index.docker.io context name matches a short FROM" "" ok "" --build-context index.docker.io/library/alpine=docker-image://cgr.dev/chainguard/static:latest <<'EOF'
+FROM alpine
+EOF
+
+# Oracle: FROM alpine:3.20 loads alpine:3.20 under the [internal] label;
+# the context named alpine (normalized tag latest) does not match a
+# different tag, so the FROM stays alpine and stays rejected.
+run_case "context name with a different tag does not match" "" err "docker.io/library/alpine" --build-context alpine=docker-image://cgr.dev/chainguard/static:latest <<'EOF'
+FROM docker.io/library/alpine:3.20
+EOF
+
+# Oracle: with --build-context dep=docker-image://alpine:latest the second
+# stage loads alpine under [context dep]; a named context beats a stage of
+# the same name.
+run_case "context overriding a stage alias to alpine is rejected" "" err "overridden by --build-context" --build-context dep=docker-image://alpine:latest <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base AS dep
+FROM dep
+EOF
+
+run_case "context overriding a stage alias to a Chainguard image is allowed" "" ok "" --build-context dep=docker-image://cgr.dev/chainguard/static:latest <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base AS dep
+FROM dep
+EOF
+
+# Oracle: ARG B=alpine, FROM ${B}, and a context named alpine loads the
+# context's source; the match happens after variable expansion.
+run_case "context matching happens after ARG expansion" "" ok "" --build-context alpine=docker-image://cgr.dev/chainguard/static:latest <<'EOF'
+ARG B=alpine
+FROM ${B}
+EOF
+
+# Real build (cacheonly): FROM scratch with a context named scratch pulls
+# nothing and loads no metadata; scratch cannot be overridden by a named
+# context, so the empty base stays allowed.
+run_case "scratch cannot be overridden by a context" "" ok "" --build-context scratch=docker-image://alpine:latest <<'EOF'
+FROM scratch
+EOF
+
+# Oracle: a digest reference matches a context only on the exact digest
+# string (pinned with wolfi-base's live digest; the fixture digest is
+# synthetic, the matching is textual either way).
+run_case "context with the exact digest string overrides the FROM" "" err "overridden by --build-context" --build-context cgr.dev/chainguard/wolfi-base@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=docker-image://alpine:latest <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+EOF
+
+# Oracle: the bare name does not match the digest-pinned FROM (the digest
+# FROM loads under [internal] with the context present), so the FROM is
+# checked as written and stays allowed.
+run_case "bare context name does not match a digest-pinned FROM" "" ok "" --build-context cgr.dev/chainguard/wolfi-base=docker-image://alpine:latest <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+EOF
+
+# Oracle: a repeated context name applies its last value, so the run loads
+# the second source.
+run_case "repeated context name applies the last value (allowed)" "" ok "" --build-context alpine=docker-image://alpine:latest --build-context alpine=docker-image://cgr.dev/chainguard/static:latest <<'EOF'
+FROM alpine
+EOF
+
+run_case "repeated context name applies the last value (rejected)" "" err "overridden by --build-context" --build-context alpine=docker-image://cgr.dev/chainguard/static:latest --build-context alpine=docker-image://alpine:latest <<'EOF'
+FROM alpine
+EOF
+
+# buildx itself refuses a context name that is not a valid reference
+# (invalid context name DEP, repository name must be lowercase), so the
+# captured invocation cannot build with it.
+run_case "invalid context name is refused" "" err "not a valid image reference" --build-context DEP=docker-image://alpine:latest <<'EOF'
 FROM cgr.dev/chainguard/wolfi-base
 EOF
 

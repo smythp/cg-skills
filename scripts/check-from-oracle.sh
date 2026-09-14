@@ -15,7 +15,16 @@
 # Usage: check-from-oracle.sh [--mirror PREFIX] [--platform OS/ARCH[/VARIANT]]
 #                             [--build-platform OS/ARCH[/VARIANT]]
 #                             [--build-arg NAME=value ...] [--target NAME]
+#                             [--build-context NAME=SOURCE ...]
 #                             DOCKERFILE CONTEXT
+#
+# Named build contexts from the captured invocation pass through to buildx
+# unchanged, because BuildKit replaces a FROM whose reference or stage name
+# matches a context name; an outline run without them resolves a different
+# base than the build. The progress line for an overridden name has the
+# form "#N [context NAME] load metadata for REF", which the label-agnostic
+# reference parsing below reads like any other load, so REF is checked
+# against the allowlist like any base.
 #
 # The frontend is evaluated with docker buildx build
 # --call=outline,format=json, which loads image metadata over the network
@@ -86,7 +95,7 @@
 set -u
 
 usage() {
-  echo "usage: check-from-oracle.sh [--mirror PREFIX] [--platform OS/ARCH[/VARIANT]] [--build-platform OS/ARCH[/VARIANT]] [--build-arg NAME=value ...] [--target NAME] DOCKERFILE CONTEXT" >&2
+  echo "usage: check-from-oracle.sh [--mirror PREFIX] [--platform OS/ARCH[/VARIANT]] [--build-platform OS/ARCH[/VARIANT]] [--build-arg NAME=value ...] [--target NAME] [--build-context NAME=SOURCE ...] DOCKERFILE CONTEXT" >&2
   exit 2
 }
 
@@ -97,6 +106,7 @@ TARGET_STAGE=""
 NL='
 '
 USER_ARGS=""
+BUILD_CONTEXTS=""
 
 # normalize_platform VALUE FLAG: split VALUE into NORM_OS, NORM_ARCH,
 # NORM_VARIANT and apply the normalizations the docker CLI applies before
@@ -210,6 +220,19 @@ while :; do
           exit 2
           ;;
       esac
+      shift 2
+      ;;
+    --build-context)
+      bc="${2-}"
+      case "$bc" in
+        ''|=*) echo "check-from-oracle.sh: --build-context needs NAME=SOURCE" >&2; exit 2 ;;
+        *=*) : ;;
+        *) echo "check-from-oracle.sh: --build-context needs NAME=SOURCE, got '$bc'" >&2; exit 2 ;;
+      esac
+      case "$bc" in
+        *"$NL"*) echo "check-from-oracle.sh: a --build-context value must not contain a newline" >&2; exit 2 ;;
+      esac
+      BUILD_CONTEXTS="${BUILD_CONTEXTS}${bc}${NL}"
       shift 2
       ;;
     *) break ;;
@@ -398,6 +421,12 @@ old_ifs=$IFS
 IFS=$NL
 for ba in $USER_ARGS; do
   [ -n "$ba" ] && set -- "$@" --build-arg "$ba"
+done
+# Named contexts pass through unchanged (their values contain no newlines,
+# checked at the option); buildx applies the last value per name, and it
+# refuses a name that is not a valid reference, which fails the run.
+for bc in $BUILD_CONTEXTS; do
+  [ -n "$bc" ] && set -- "$@" --build-context "$bc"
 done
 IFS=$old_ifs
 set +f

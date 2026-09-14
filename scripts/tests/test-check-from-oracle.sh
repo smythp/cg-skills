@@ -17,6 +17,9 @@
 #      not-a-pass message, never a pass
 #   5. --build-platform: the BUILD* overrides reach the frontend (the run
 #      names alpine:b-arm64, not the daemon's own architecture)
+#   6. a named build context that overrides a Chainguard FROM to alpine —
+#      the [context NAME] labeled reference is rejected, and the same
+#      override pointed at another Chainguard image passes
 #
 # The shim cases need no container engine: a docker shim on PATH prints
 # canned output (and a timeout shim shortens the bound), pinning the exit
@@ -204,6 +207,36 @@ else
   case "$out" in
     *"alpine:b-arm64"*) ok ;;
     *) bad "build-platform override: the output should name alpine:b-arm64, got: $out" ;;
+  esac
+fi
+
+echo "--- case 6: named build context override ---"
+# The pull-request reproduction. The override makes the Chainguard FROM
+# resolve to alpine; the progress line has the [context NAME] label and the
+# label-agnostic parsing must reject its reference. The same override
+# pointed at another Chainguard image must pass.
+cat > "$tmp/Dockerfile" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo hi
+EOF
+out=$(sh "$SCRIPT" --build-context cgr.dev/chainguard/wolfi-base=docker-image://alpine:latest \
+      "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -eq 0 ]; then
+  bad "context override to alpine: expected rejection, got a pass"
+else
+  case "$out" in
+    *"REJECTED alpine:latest"*) ok ;;
+    *) bad "context override to alpine: should reject alpine:latest, got: $out" ;;
+  esac
+fi
+out=$(sh "$SCRIPT" --build-context cgr.dev/chainguard/wolfi-base=docker-image://cgr.dev/chainguard/static:latest \
+      "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  bad "context override to static: expected pass, exit $rc: $out"
+else
+  case "$out" in
+    *"allowed  cgr.dev/chainguard/static:latest"*) ok ;;
+    *) bad "context override to static: should allow static, got: $out" ;;
   esac
 fi
 
