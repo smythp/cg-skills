@@ -852,6 +852,25 @@ FROM ubuntu:22.04
 F1
 EOF
 
+# Oracle: docker.io/library/ubuntu:22.04 is resolved for the second stage;
+# a bare << at the end of the line opens no heredoc, so the FROM line after
+# it is a real instruction.
+run_case "bare << at end of line is not a heredoc" "" err "ubuntu:22.04" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo <<
+FROM ubuntu:22.04
+EOF
+
+# Oracle: docker.io/library/ubuntu:22.04 is resolved for the second stage;
+# a marker whose rest contains another < (<<<F1, the shell herestring
+# spelling) is not a heredoc to BuildKit, so the FROM line after it is a
+# real instruction.
+run_case "marker with an additional < is not a heredoc" "" err "ubuntu:22.04" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN cat <<<F1
+FROM ubuntu:22.04
+EOF
+
 # Oracle: only cgr.dev/chainguard/wolfi-base is resolved; a leading file
 # descriptor digit (2<<F1) still starts a heredoc.
 run_case "file-descriptor heredoc marker is recognized" "" ok "" <<'EOF'

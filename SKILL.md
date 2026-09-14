@@ -217,12 +217,16 @@ arguments on every build and a FROM can read them. When the invocation lists
 several platforms, run the gate once per platform. When the invocation has
 `--target`, pass it too, and when the build platform differs from the target
 platform, add `--build-platform` with the daemon's platform. This check
-reads every FROM line textually, reachable or not.
+reads every FROM line textually, reachable or not. For example:
+`scripts/check-from-lines.sh --platform <p> --build-arg NAME=value Dockerfile.chainguard`.
 
 Run `scripts/check-from-oracle.sh` on the same file with the same options
-plus the build context path
-(`timeout -k 30 660 scripts/check-from-oracle.sh --platform <p> <file> <context>`;
-its internal outline call is itself bounded at 600 seconds). It evaluates
+plus the build context path. The two scripts share the option set:
+`--mirror <prefix>`, `--platform <os/arch[/variant]>`,
+`--build-platform <os/arch[/variant]>`, `--target <stage>`, and repeated
+`--build-arg NAME=value`. For example:
+`timeout -k 30 660 scripts/check-from-oracle.sh --platform <p> --build-arg NAME=value Dockerfile.chainguard <context>`
+(its internal outline call is itself bounded at 600 seconds). It evaluates
 the file with BuildKit's own frontend, which loads image metadata and
 executes nothing, and checks every reference the builder actually resolves
 for the given target and platform.

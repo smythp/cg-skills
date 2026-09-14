@@ -3,11 +3,15 @@
 The FROM gate is two scripts. `scripts/check-from-lines.sh` reads every FROM
 line textually, reachable or not, by reimplementing the parsing rules below.
 `scripts/check-from-oracle.sh` asks BuildKit itself, by evaluating the file
-with `timeout -k 30 600 docker buildx build --call=outline --progress=plain`
-and checking every reference the builder resolves for the given target and
-platform. The oracle covers exactly what the build will pull; the textual
-check also covers stages the target does not reach. A migration passes only
-when both pass.
+with `timeout -k 30 600 docker buildx build --call=outline,format=json
+--progress=plain` and checking every reference the builder resolves for the
+given target and platform. The oracle requires positive evidence in the run
+output that the outline was performed (the load-build-definition step and
+the JSON outline result), refuses to answer when a BuildKit source policy
+is configured in the environment, and treats any line containing "load
+metadata for" as a reference whatever its bracketed step label. The oracle
+covers exactly what the build will pull; the textual check also covers
+stages the target does not reach. A migration passes only when both pass.
 
 Every construct below was enumerated from the Dockerfile frontend vendored
 in the Docker 29.8 daemon (BuildKit's `frontend/dockerfile` at the moby
@@ -54,8 +58,8 @@ the backtick.
 | `<< NAME` separated | whitespace glued, heredoc | same | separated << NAME heredoc is recognized (existing) |
 | `<<- NAME` separated | not a heredoc | same | separated <<- NAME is not a heredoc (existing) |
 | `<< -NAME` | heredoc named -NAME | same | separated delimiter starting with a dash |
-| bare `<<` at end of line | not a heredoc | same | covered inside the separated-form fixtures (existing) |
-| marker whose rest contains `<` | not a heredoc | same | covered by the marker shape rule (existing round-1 verification) |
+| bare `<<` at end of line | not a heredoc | same | bare << at end of line is not a heredoc |
+| marker whose rest contains `<` | not a heredoc | same | marker with an additional < is not a heredoc |
 | delimiter line with trailing whitespace | does not terminate | same | delimiter line with trailing whitespace does not terminate (existing) |
 | `<<-` tab chomping of the delimiter | tabs stripped before comparison | same | tab-indented delimiter ends a <<- heredoc (existing) |
 | two heredocs on one line | bodies consumed in order | same | COPY with two heredocs consumes both bodies in order (existing) |
@@ -115,7 +119,7 @@ because buildx 0.37 drops `--platform` on `--call` runs.
 | automatic argument read by a global ARG default or FROM | value available undeclared | seeded with --platform; exit 1 asking for --platform without it | automatic TARGETARCH reaches a global ARG default; automatic platform argument without --platform fails closed |
 | `$BUILDPLATFORM` inside a FROM `--platform=` flag | names a manifest platform, not an image | flag skipped, no --platform needed | BUILDPLATFORM in a FROM flag needs no --platform |
 | TARGETVARIANT on a variantless platform | set to the empty string; `:-` and `:+` treat empty as unset | same | TARGETVARIANT is empty-set on a variantless platform |
-| platform normalization | x86_64 and aarch64 to amd64 and arm64, i386 to 386, armhf and armel to arm/v7 and arm/v6, arm64/v8 drops v8, bare arm gains v7 | same rules | arm64/v8 normalizes to an empty TARGETVARIANT; arm/v7 keeps its TARGETVARIANT; x86_64 normalizes to amd64 |
+| platform normalization | containerd platforms.Normalize: x86_64 and x86-64 to amd64, aarch64 to arm64, i386 to 386 dropping any variant, armhf to arm/v7 and armel to arm/v6 replacing any variant, amd64 drops a v1 variant, arm64 drops an 8 or v8 variant, bare arm gains v7, the numeric arm variants 5, 6, 7, 8 gain the v prefix, every other variant passes through | same rules | amd64/v1 normalizes to an empty TARGETVARIANT; amd64/v2 keeps its TARGETVARIANT; arm64/v8 and arm64/8 normalize to an empty TARGETVARIANT; bare arm gains the v7 variant; arm/5 through arm/8 normalize to the v5 through v8 variants; arm/v8 keeps its TARGETVARIANT; x86_64 and x86-64 normalize to amd64; aarch64 normalizes to arm64; armhf normalizes to arm/v7 (with or without a variant); armel normalizes to arm/v6; i386 normalizes to 386 and drops any variant; arm/v7 keeps its TARGETVARIANT |
 | bare global `ARG TARGETARCH` | keeps the automatic value | same | bare global ARG redeclaration keeps the automatic value |
 | global `ARG TARGETARCH=value` | the default replaces the automatic value | same | global ARG default replaces the automatic value |
 | `--build-arg TARGETARCH=...` undeclared | overrides the automatic value | same | build-arg overrides an automatic argument undeclared |
@@ -147,3 +151,4 @@ because buildx 0.37 drops `--platform` on `--call` runs.
 | `AS alias` stage names | letters, digits, `_ . -`, starting with a letter; case-insensitive reuse | same, image-shaped aliases rejected | image-shaped alias with slash is rejected (existing) |
 | FROM of an earlier alias | stage reference, not a pull | same | stage alias is allowed (existing) |
 | `scratch` | no metadata load | allowed by name | scratch is allowed (existing) |
+| BuildKit source policy (`EXPERIMENTAL_BUILDKIT_SOURCE_POLICY` in the environment) | converts a reference after the log names the original | the oracle exits 1 naming the variable when it is set; the textual gate reads no environment beyond its own inputs | source policy shim case in test-check-from-oracle.sh |
