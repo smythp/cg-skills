@@ -629,11 +629,43 @@ FROM ${TARGETARCH:+docker.io/library/alpine:3.20}
 EOF
 
 # Oracle: docker.io/library/alpine:arch-riscv64 is resolved under
-# --platform linux/amd64. A global declaration with a default replaces the
-# automatic value, unlike a bare redeclaration.
-run_case "global ARG default replaces the automatic value" "" err "alpine:arch-riscv64" --platform linux/amd64 <<'EOF'
+# --platform linux/amd64; the declared default beats the automatic value,
+# unlike a bare redeclaration, while a --build-arg would beat the default.
+# The oracle gate can pass a platform only as --build-arg overrides, which
+# would reverse that precedence, so the gate rejects the declaration
+# itself, naming the line, rather than resolving a different file than the
+# build.
+run_case "global ARG default for an automatic argument name is rejected" "" err "declares a default for the automatic argument TARGETARCH" --platform linux/amd64 <<'EOF'
 ARG TARGETARCH=riscv64
 FROM alpine:arch-${TARGETARCH}
+EOF
+
+# Oracle: the real build keeps the single-quoted default literal, so
+# TARGETVARIANT holds the seven characters ${UNSET}, BASE becomes alpine
+# through the :+ modifier, and docker.io/library/alpine:latest is resolved
+# on every platform. The pull-request reproduction. The gate rejects the
+# declaration line under both platforms.
+run_case "declared automatic default with a single-quoted literal is rejected (amd64)" "" err "declares a default for the automatic argument TARGETVARIANT" --platform linux/amd64 <<'EOF'
+ARG TARGETVARIANT='${UNSET}'
+ARG BASE=${TARGETVARIANT:+alpine}
+FROM ${BASE:-cgr.dev/chainguard/wolfi-base}
+EOF
+
+run_case "declared automatic default with a single-quoted literal is rejected (arm64)" "" err "declares a default for the automatic argument TARGETVARIANT" --platform linux/arm64 <<'EOF'
+ARG TARGETVARIANT='${UNSET}'
+ARG BASE=${TARGETVARIANT:+alpine}
+FROM ${BASE:-cgr.dev/chainguard/wolfi-base}
+EOF
+
+# Oracle: cgr.dev/chainguard/wolfi-base:latest is resolved. BuildKit keeps
+# a single-quoted ARG default literal, so X holds the characters ${UNSET},
+# it is set and non-empty for the :+ modifier, and B becomes the wolfi-base
+# reference. A gate that expanded inside the single quotes would empty X
+# and check docker.io/library/alpine instead.
+run_case "single-quoted ARG default keeps its variable text literal" "" ok "" <<'EOF'
+ARG X='${UNSET}'
+ARG B=${X:+cgr.dev/chainguard/wolfi-base}
+FROM ${B:-docker.io/library/alpine}
 EOF
 
 # Oracle: docker.io/library/alpine:o-xyz is resolved with --build-arg

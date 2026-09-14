@@ -90,6 +90,49 @@ else
   esac
 fi
 
+echo "--- case 1d: declared default for an automatic argument is rejected ---"
+# The pull-request reproduction. The real build keeps the single-quoted
+# default literal, so TARGETVARIANT is set and non-empty, BASE becomes
+# alpine, and alpine is pulled, while the script's synthetic TARGETVARIANT
+# override would empty it and resolve wolfi-base. The scan rejects the
+# declaration before the outline runs, under both platforms.
+cat > "$tmp/Dockerfile" <<'EOF'
+ARG TARGETVARIANT='${UNSET}'
+ARG BASE=${TARGETVARIANT:+alpine}
+FROM ${BASE:-cgr.dev/chainguard/wolfi-base}
+EOF
+for plat in linux/amd64 linux/arm64; do
+  out=$(sh "$SCRIPT" --platform "$plat" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+  if [ "$rc" -eq 0 ]; then
+    bad "declared automatic default ($plat): expected rejection, got a pass"
+  else
+    case "$out" in
+      *"declares a default for the automatic argument TARGETVARIANT"*) ok ;;
+      *) bad "declared automatic default ($plat): should name TARGETVARIANT, got: $out" ;;
+    esac
+  fi
+done
+
+echo "--- case 1e: single-quoted ARG default stays literal in the frontend ---"
+# BuildKit keeps the single-quoted default literal (verified by this very
+# run), so X is set and non-empty, B becomes the wolfi-base reference, and
+# the outline resolves cgr.dev/chainguard/wolfi-base:latest. A frontend
+# that expanded inside single quotes would resolve alpine and fail the run.
+cat > "$tmp/Dockerfile" <<'EOF'
+ARG X='${UNSET}'
+ARG B=${X:+cgr.dev/chainguard/wolfi-base}
+FROM ${B:-docker.io/library/alpine}
+EOF
+out=$(sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  bad "single-quoted literal default: expected pass, exit $rc: $out"
+else
+  case "$out" in
+    *"allowed  cgr.dev/chainguard/wolfi-base:latest"*) ok ;;
+    *) bad "single-quoted literal default: should allow wolfi-base, got: $out" ;;
+  esac
+fi
+
 echo "--- case 2: multi-stage file on the allowlist ---"
 cat > "$tmp/Dockerfile" <<'EOF'
 FROM cgr.dev/chainguard/wolfi-base AS builder

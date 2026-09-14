@@ -35,12 +35,27 @@
 # (scratch-only, alias-only) passes only with that evidence present.
 #
 # buildx 0.37 drops --platform on --call runs (verified against a real
-# build), so the platform travels as explicit --build-arg overrides of the
+# build on this daemon with both the docker driver and a docker-container
+# builder, and for --call=targets as well as --call=outline), so the
+# platform travels as explicit --build-arg overrides of the
 # automatic platform arguments, which BuildKit applies the same way with or
 # without a declaration (also verified). With --build-platform the BUILD*
 # arguments travel the same way; without it they keep the daemon's own
 # platform, which is what a real build on this daemon uses. User --build-arg
 # values follow the platform packs, so they win, as in docker build.
+#
+# The overrides have one precedence difference from a real build. BuildKit
+# lets a global ARG that declares a default for an automatic argument name
+# beat the automatic value, while a --build-arg beats that default, so an
+# override would reverse what the build resolves for such a file. The
+# script therefore scans the file before the outline runs and exits 1
+# naming the line when a global ARG gives a default to any of the eleven
+# automatic argument names (TARGETPLATFORM, TARGETOS, TARGETARCH,
+# TARGETVARIANT, TARGETOSVERSION, TARGETSTAGE, BUILDPLATFORM, BUILDOS,
+# BUILDARCH, BUILDVARIANT, BUILDOSVERSION); a bare redeclaration such as
+# ARG TARGETARCH stays allowed. So the scan can trust its own line
+# splitting, a NUL byte anywhere in the file and a CR that is not part of
+# a CRLF ending are rejected first, as check-from-lines.sh rejects them.
 #
 # The Dockerfile and context paths are made absolute and the context is
 # passed after --, so a path shaped like an option (a context directory
@@ -57,10 +72,13 @@
 #   1 — a resolved reference is off the allowlist, or the outline run
 #       failed, lacked the evidence, or printed a load-metadata line this
 #       script cannot parse, or a source policy is configured in the
-#       environment; none of these is a pass
+#       environment, or the file declares a default for an automatic
+#       argument name, or it contains a NUL byte or a bare CR; none of
+#       these is a pass
 #   2 — usage error
 #
-# Dependencies: sh, grep, sed, sort, tr, docker with buildx (daemon running,
+# Dependencies: sh, awk, od, grep, sed, sort, tr, docker with buildx
+# (daemon running,
 # egress to the registries the file references). The outline call is bounded
 # with timeout (or gtimeout, the Homebrew coreutils name on macOS); with
 # neither installed it runs unbounded, after one stderr warning.
@@ -219,7 +237,7 @@ not_a_pass() {
   exit 1
 }
 
-for dep in docker grep sed sort tr; do
+for dep in docker awk od grep sed sort tr; do
   command -v "$dep" >/dev/null 2>&1 || not_a_pass "required command not found: $dep"
 done
 
@@ -228,6 +246,107 @@ done
 # to answer rather than read a log that may not match the build.
 if [ "${EXPERIMENTAL_BUILDKIT_SOURCE_POLICY+set}" = set ]; then
   not_a_pass "EXPERIMENTAL_BUILDKIT_SOURCE_POLICY is set in the environment; a source policy can convert a reference while the log names the original. Unset it and run the gate again"
+fi
+
+# The declared-default scan below reads the file line by line, so it needs
+# the same physical-line guarantee as check-from-lines.sh. A NUL byte
+# anywhere, or a CR that is not immediately followed by LF, is rejected
+# naming the line; BuildKit keeps both bytes inside the surrounding line
+# where a line-based scan would split it, and awk implementations disagree
+# about NUL bytes in input. CRLF endings are accepted.
+BAD_BYTE=$(od -An -v -t o1 < "$DOCKERFILE" | LC_ALL=C awk '
+  {
+    for (i = 1; i <= NF; i++) {
+      if (pcr && $i != "012") { print "CR " nl + 1; found = 1; exit }
+      if ($i == "000") { print "NUL " nl + 1; found = 1; exit }
+      pcr = ($i == "015")
+      if ($i == "012") nl++
+    }
+  }
+  END { if (!found && pcr) print "CR " nl + 1 }
+')
+if [ -n "$BAD_BYTE" ]; then
+  case "$BAD_BYTE" in
+    NUL*) not_a_pass "line ${BAD_BYTE#* } of $DOCKERFILE contains a NUL byte; this script cannot scan such a file the way BuildKit reads it" ;;
+    *)    not_a_pass "line ${BAD_BYTE#* } of $DOCKERFILE contains a CR that is not part of a CRLF line ending; this script cannot scan such a file the way BuildKit reads it (CRLF endings are accepted)" ;;
+  esac
+fi
+
+# A global ARG that declares a default for an automatic argument name would
+# resolve differently under this script's overrides than under a real
+# build (the header says why), so the file is rejected before the outline
+# runs. The scan mirrors check-from-lines.sh's line assembly (BOM, the
+# escape directive, comments and blank lines inside continuations) and
+# stops at the first FROM; a bare redeclaration has no = and passes. An
+# escape character inside an ARG token is rejected rather than decoded,
+# as the textual gate rejects it, so an escape cannot hide a name from
+# this scan.
+ARG_SCAN=$(LC_ALL=C awk '
+function fail(msg) { print msg; FOUND = 1; exit }
+BEGIN {
+  BOM = sprintf("%c%c%c", 239, 187, 191)
+  WS  = sprintf("[ \t\r%c%c]+", 11, 12)
+  ESC = "\\"
+  directive_mode = 1
+  buf = ""; bufline = 0
+  n_auto = split("TARGETPLATFORM TARGETOS TARGETARCH TARGETVARIANT TARGETOSVERSION TARGETSTAGE BUILDPLATFORM BUILDOS BUILDARCH BUILDVARIANT BUILDOSVERSION", auto_names, " ")
+  for (b = 1; b <= n_auto; b++) AUTO[auto_names[b]] = 1
+}
+{
+  raw = $0
+  if (NR == 1 && substr(raw, 1, 3) == BOM) raw = substr(raw, 4)
+  line = raw
+  sub(/\r$/, "", line); sub(/[ \t]+$/, "", line)
+  trimmed = line
+  sub("^" WS, "", trimmed)
+  if (directive_mode) {
+    if (trimmed ~ /^#[ \t]*[A-Za-z][A-Za-z0-9]*[ \t]*=[ \t]*[^ \t]/) {
+      dkey = trimmed
+      sub(/^#[ \t]*/, "", dkey)
+      dval = dkey
+      sub(/[ \t]*=.*$/, "", dkey)
+      dkey = tolower(dkey)
+      sub(/^[A-Za-z][A-Za-z0-9]*[ \t]*=[ \t]*/, "", dval)
+      sub(/[ \t]+$/, "", dval)
+      if (dkey == "escape" || dkey == "syntax" || dkey == "check") {
+        if (dkey == "escape" && dval == "`") ESC = "`"
+        next
+      }
+      directive_mode = 0
+    } else {
+      directive_mode = 0
+    }
+  }
+  if (trimmed ~ /^#/) next
+  if (trimmed == "") next
+  if (buf == "") bufline = NR
+  llen = length(line)
+  if (substr(line, llen, 1) == ESC && (llen == 1 || substr(line, llen - 1, 1) != ESC)) {
+    buf = buf substr(line, 1, llen - 1)
+    next
+  }
+  buf = buf line
+  logical = buf; buf = ""
+  sub("^" WS, "", logical)
+  n = split(logical, f, WS)
+  if (n == 0) next
+  instr = toupper(f[1])
+  if (instr == "FROM") exit
+  if (instr != "ARG") next
+  for (ai = 2; ai <= n; ai++) {
+    t = f[ai]
+    if (index(t, ESC) > 0)
+      fail("line " bufline " has an ARG token containing the escape character; this script cannot tell what name it declares, so the file is rejected rather than guessed at")
+    p = index(t, "=")
+    if (p <= 1) continue
+    name = substr(t, 1, p - 1)
+    if (name in AUTO)
+      fail("line " bufline " declares a default for the automatic argument " name ". BuildKit lets that default beat the automatic value while a --build-arg beats the default, and this script can pass the platform only as --build-arg overrides, so the outline would resolve a different file than the build. Redeclare it bare (ARG " name ") or use another name")
+  }
+}
+' < "$DOCKERFILE")
+if [ -n "$ARG_SCAN" ]; then
+  not_a_pass "$ARG_SCAN"
 fi
 
 # 10-minute bound on the outline call. TIMEOUT_BIN is timeout if present,

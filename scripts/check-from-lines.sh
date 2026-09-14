@@ -102,13 +102,19 @@
 #     rejects it.
 #   - ARG lines before the first FROM: every NAME=value assignment on the
 #     line is processed, matching docker build, not just the first. A value
-#     may be wrapped in one pair of quotes; a quoted value spanning
+#     may be wrapped in one pair of quotes; a single-quoted value is kept
+#     literally, with no variable expansion inside it, as BuildKit keeps it
+#     (verified with an outline run), while double-quoted and unquoted
+#     values expand. A quoted value spanning
 #     whitespace, a stray quote, or an escape character in any token is
 #     rejected with exit 1 rather than reassembled. ARGs declared after a
 #     FROM are ignored for FROM resolution. A --build-arg override replaces
 #     the default of a matching ARG declared before the first FROM, and gives
 #     a value to a global ARG declared with no default. An override whose
-#     name no ARG declares is ignored, as in docker build.
+#     name no ARG declares is ignored, as in docker build. A global ARG
+#     that declares a default for one of the automatic argument names is
+#     rejected with exit 1 naming the line (see the automatic arguments
+#     bullet); a bare redeclaration stays allowed.
 #   - Variable expansion supports $NAME, ${NAME}, ${NAME:-default} (default
 #     when unset or empty) and ${NAME:+alt} (alt when set and non-empty),
 #     with BuildKit's semantics. Every other modifier (%, #, /, ^, and the
@@ -137,9 +143,16 @@
 #     arguments are set to the
 #     empty string when the platform has none, which matters for the :- and
 #     :+ modifiers. A bare global redeclaration (ARG TARGETARCH) keeps the
-#     seeded value, a global declaration with a default replaces it, and a
-#     --build-arg override beats both, with or without a declaration, all
-#     matching BuildKit. When --platform was not given and FROM resolution
+#     seeded value, matching BuildKit, and a --build-arg override beats a
+#     declaration with or without it. A global declaration that gives one
+#     of these names a default is rejected with exit 1 naming the line.
+#     BuildKit lets the declared default beat the automatic value while a
+#     --build-arg beats the default, and the oracle gate can pass a
+#     platform only as --build-arg overrides, so such a file would resolve
+#     differently under the oracle than under the build. BuildKit itself
+#     accepts the file, so this rejection is conservative, and it keeps
+#     the two gate scripts answering for the same file.
+#     When --platform was not given and FROM resolution
 #     reads one of these names, the gate exits 1 naming it and asking for
 #     --platform (or --target, for TARGETSTAGE), because BuildKit resolves
 #     a value the gate does not know. A file that never reads them behaves
@@ -160,10 +173,9 @@
 # rejected rather than emulated; a NUL byte or a bare CR is rejected
 # file-wide, even where BuildKit tolerates it (inside a comment or a heredoc
 # body, and a final CR with no LF, which BuildKit reads as an ordinary line
-# ending, verified against a real outline run); a single-quoted ARG
-# default is expanded like a double-quoted one, where BuildKit keeps it
-# literal (a literal $ never survives into a valid image ref, so this cannot
-# admit a ref the builder resolves elsewhere); and with --platform but no
+# ending, verified against a real outline run); a global ARG that declares
+# a default for an automatic argument name is rejected even though BuildKit
+# accepts the file (the automatic arguments bullet above says why); and with --platform but no
 # --build-platform the BUILD* arguments take the target platform's values,
 # which matches every same-platform build but differs on a cross-platform
 # one until the caller passes --build-platform.
@@ -768,7 +780,7 @@ END {
   exit EXITCODE + 0
 }
 
-function process(logical, lineno,   n, f, instr, sub2, p, q, ref, resolved, alias, lc, i, ai, t, name, val, inner, LEXW, ln) {
+function process(logical, lineno,   n, f, instr, sub2, p, q, ref, resolved, alias, lc, i, ai, t, name, val, inner, litq, LEXW, ln) {
   n = split(logical, f, WS)
   if (n == 0) return
   instr = toupper(f[1])
@@ -809,14 +821,28 @@ function process(logical, lineno,   n, f, instr, sub2, p, q, ref, resolved, alia
         fail("ARG at line " lineno " declares an assignment with an empty name (\"" t "\")")
       name = substr(t, 1, p - 1)
       val = substr(t, p + 1)
+      # A declared default for an automatic argument name is rejected, not
+      # emulated. BuildKit lets the declared default beat the automatic
+      # value while a --build-arg beats the default, and the oracle gate
+      # can pass a platform only as --build-arg overrides, so a default
+      # here would make the oracle check a different file than the build
+      # resolves. A bare redeclaration (ARG TARGETARCH) stays allowed.
+      if (name in AUTO)
+        fail("ARG at line " lineno " declares a default for the automatic argument " name ". The FROM gate passes the platform as --build-arg overrides, which beat a declared default where the automatic value would lose to it, so the gate cannot check this file the way the build resolves it. Redeclare it bare (ARG " name ") or use another name")
+      litq = 0
       if (index(val, "\"") > 0 || index(val, SQ) > 0) {
         q = substr(val, 1, 1)
         inner = substr(val, 2, length(val) - 2)
         if ((q != "\"" && q != SQ) || length(val) < 2 || substr(val, length(val), 1) != q || index(inner, q) > 0)
           fail("ARG at line " lineno " has a quoted value this gate cannot take apart (\"" t "\"): a quoted value spanning whitespace or a stray quote is not supported. Quote the whole value or none of it")
         val = inner
+        # BuildKit keeps a single-quoted default literal (verified with an
+        # outline run; the value ${UNSET} survives as those seven
+        # characters), where a double-quoted or unquoted default expands.
+        if (q == SQ) litq = 1
       }
       if (name in OVERRIDE) ARGS[name] = OVERRIDE[name]
+      else if (litq) ARGS[name] = val
       else ARGS[name] = expand_str(val, "default", lineno)
     }
     return

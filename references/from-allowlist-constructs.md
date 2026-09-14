@@ -127,7 +127,15 @@ TARGETOSVERSION, TARGETSTAGE, BUILDPLATFORM, BUILDOS, BUILDARCH,
 BUILDVARIANT, and BUILDOSVERSION in the global scope on every build. The
 textual gate seeds the same values from `--platform`, `--build-platform`,
 and `--target`; the oracle passes them to BuildKit as explicit overrides,
-because buildx 0.37 drops `--platform` on `--call` runs.
+because buildx 0.37 drops `--platform` on `--call` runs (verified on both
+the docker driver and a docker-container builder, for `--call=outline` and
+`--call=targets` alike). The overrides carry one precedence difference
+from a real build. BuildKit lets a global ARG that declares a default for
+one of these names beat the automatic value, while a `--build-arg` beats
+the default, so the oracle's overrides would reverse what the build
+resolves for such a file. Both scripts therefore exit 1 naming the line
+when a global ARG gives any of the eleven names a default; a bare
+redeclaration stays allowed.
 
 | Construct | BuildKit | Gate | Fixture |
 |---|---|---|---|
@@ -136,7 +144,7 @@ because buildx 0.37 drops `--platform` on `--call` runs.
 | TARGETVARIANT on a variantless platform | set to the empty string; `:-` and `:+` treat empty as unset | same | TARGETVARIANT is empty-set on a variantless platform |
 | platform normalization | containerd platforms.Normalize: x86_64 and x86-64 to amd64, aarch64 to arm64, i386 to 386 dropping any variant, armhf to arm/v7 and armel to arm/v6 replacing any variant, amd64 drops a v1 variant, arm64 drops an 8 or v8 variant, bare arm gains v7, the numeric arm variants 5, 6, 7, 8 gain the v prefix, every other variant passes through | same rules | amd64/v1 normalizes to an empty TARGETVARIANT; amd64/v2 keeps its TARGETVARIANT; arm64/v8 and arm64/8 normalize to an empty TARGETVARIANT; bare arm gains the v7 variant; arm/5 through arm/8 normalize to the v5 through v8 variants; arm/v8 keeps its TARGETVARIANT; x86_64 and x86-64 normalize to amd64; aarch64 normalizes to arm64; armhf normalizes to arm/v7 (with or without a variant); armel normalizes to arm/v6; i386 normalizes to 386 and drops any variant; arm/v7 keeps its TARGETVARIANT |
 | bare global `ARG TARGETARCH` | keeps the automatic value | same | bare global ARG redeclaration keeps the automatic value |
-| global `ARG TARGETARCH=value` | the default replaces the automatic value | same | global ARG default replaces the automatic value |
+| global `ARG TARGETARCH=value` | the default replaces the automatic value; a --build-arg replaces the default | exit 1 naming the line, in both scripts; the gate can pass a platform only as overrides, which would reverse that precedence | global ARG default for an automatic argument name is rejected; declared automatic default with a single-quoted literal is rejected (amd64, arm64); oracle test case 1d |
 | `--build-arg TARGETARCH=...` undeclared | overrides the automatic value | same | build-arg overrides an automatic argument undeclared |
 | BUILD* on a cross-platform build | the builder's own platform | target platform unless --build-platform is passed; a documented deviation | BUILDARCH follows --build-platform on a cross build; BUILDARCH defaults to the target platform without --build-platform |
 | TARGETSTAGE | the --target stage name, else the final stage's | seeded from --target; exit 1 asking for --target when read without it | TARGETSTAGE carries the --target stage name; TARGETSTAGE without --target fails closed |
@@ -147,6 +155,7 @@ because buildx 0.37 drops `--platform` on `--call` runs.
 | Construct | BuildKit | Gate | Fixture |
 |---|---|---|---|
 | `$NAME`, `${NAME}` | expanded | same | public cgr.dev via ARG default is allowed (existing) |
+| single-quoted ARG default (`ARG A='${X}'`) | kept literal, no expansion inside single quotes; double-quoted and unquoted defaults expand | same | single-quoted ARG default keeps its variable text literal; oracle test case 1e |
 | `${NAME:-default}` | default when unset or empty | same | colon-dash default applies when unset (existing) |
 | `${NAME:+alt}` | alt when set and non-empty | same | colon-plus substitutes when set (existing) |
 | `${NAME-d}`, `${NAME+a}` colon-less | unset test only, empty counts as set | exit 1 naming the modifier | colon-less minus modifier is rejected, not emulated |
