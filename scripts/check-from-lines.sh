@@ -36,17 +36,35 @@
 #     goes on, matching BuildKit's empty-continuation-line behavior.
 #   - Heredocs on RUN, COPY, ADD, and ONBUILD RUN/COPY/ADD: <<NAME, <<-NAME,
 #     <<'NAME', <<"NAME", an optional leading file-descriptor digit string
-#     (2<<NAME), and BuildKit's separated form << NAME (the lexer attaches
-#     the following word as the delimiter; <<- NAME with a space is NOT a
-#     heredoc, and a bare << at end of line is not either). The content lines
-#     up to and including the line equal to each delimiter, in order, are
-#     file content, not instructions and not comments; for <<- the delimiter
-#     comparison strips leading tabs; otherwise the comparison is exact, so a
-#     delimiter line with trailing whitespace does not terminate. A heredoc
-#     marker this gate cannot classify with certainty (a quoted name spanning
-#     whitespace, a name containing a quote, $, the escape character, or
-#     other unusual characters) is rejected with exit 1 rather than guessed
-#     at, and an unterminated heredoc is rejected as BuildKit rejects it.
+#     (2<<NAME), and BuildKit's separated form << NAME (the lexer glues the
+#     whitespace and the following word into one heredoc word; <<- NAME with
+#     a space is NOT a heredoc, and a bare << at end of line is not either).
+#     Heredoc markers are found by tokenizing the whole logical line the way
+#     BuildKit's heredoc scan does: unquoted whitespace splits words, single
+#     and double quotes run to their closing quote, a backslash escapes the
+#     next character (inside double quotes it escapes ", $ and backslash),
+#     and a heredoc starts only at a word whose unquoted start is the
+#     optional digits and <<. So << inside a quoted string is plain text,
+#     while a real heredoc after a quoted string on the same line still
+#     counts. This tokenizer always escapes with backslash: BuildKit
+#     hardcodes it for heredoc scanning even when '# escape=`' changes the
+#     escape character (verified against the oracle). A line this tokenizer
+#     cannot split with certainty is rejected with exit 1 rather than
+#     guessed at: an unbalanced quote (BuildKit silently scans no heredocs
+#     on such a line), a ${...} expansion on a heredoc-capable line in any
+#     form other than ${NAME}, ${NAME:-word} or ${NAME:+word} with a plain
+#     word (other forms can shift BuildKit's word boundaries or disable its
+#     heredoc scan entirely), and a Unicode space character on such a line
+#     (BuildKit splits words on those; this byte-wise scan cannot). The
+#     content lines up to and including the line equal to each delimiter, in
+#     order, are file content, not instructions and not comments; for <<-
+#     the delimiter comparison strips leading tabs; otherwise the comparison
+#     is exact, so a delimiter line with trailing whitespace does not
+#     terminate. A heredoc marker this gate cannot classify with certainty
+#     (a quoted name spanning whitespace, a name containing a quote, $, a
+#     backslash, or other unusual characters) is rejected with exit 1 rather
+#     than guessed at, and an unterminated heredoc is rejected as BuildKit
+#     rejects it.
 #   - ARG lines before the first FROM: every NAME=value assignment on the
 #     line is processed, matching docker build, not just the first. A value
 #     may be wrapped in one pair of quotes; a quoted value spanning
@@ -72,11 +90,13 @@
 #
 # Known conservative deviations (this gate may reject what Docker accepts,
 # never the reverse): the modifiers beyond ${NAME:-default} and ${NAME:+alt},
-# quoted or escaped whitespace in ARG values, ambiguous heredoc markers, and
-# non-stable '# syntax=' frontends are all rejected rather than emulated; and
-# a single-quoted ARG default is expanded like a double-quoted one, where
-# BuildKit keeps it literal (a literal $ never survives into a valid image
-# ref, so this cannot admit a ref the builder resolves elsewhere).
+# quoted or escaped whitespace in ARG values, ambiguous heredoc markers,
+# unbalanced quotes and restricted ${...} forms and Unicode spaces on
+# heredoc-capable lines, and non-stable '# syntax=' frontends are all
+# rejected rather than emulated; and a single-quoted ARG
+# default is expanded like a double-quoted one, where BuildKit keeps it
+# literal (a literal $ never survives into a valid image ref, so this cannot
+# admit a ref the builder resolves elsewhere).
 #
 # Dependencies: sh, awk (POSIX). No network, no writes.
 
@@ -122,7 +142,10 @@ fi
 # The Dockerfile is fed on stdin, not as an operand: a bare operand shaped
 # like name=value is treated by POSIX awk as a variable assignment, so a file
 # literally named "from=allowed" would never be read and the gate would pass.
-CHECK_FROM_BUILD_ARGS="$BUILD_ARGS" awk -v mirror="$MIRROR" '
+# LC_ALL=C keeps awk bytewise: in a UTF-8 locale, gawk builds sprintf("%c")
+# strings and indexes substrings by character, which would break the BOM
+# comparison and the Unicode-space detection.
+CHECK_FROM_BUILD_ARGS="$BUILD_ARGS" LC_ALL=C awk -v mirror="$MIRROR" '
 # rtrim_c trims only what BuildKit ignores before its continuation check
 # (\r from CRLF, then spaces and tabs); ltrim matches BuildKit trimming
 # any leading whitespace before the comment and blank-line checks.
@@ -211,44 +234,145 @@ function strict_heredoc_name(s,   q, inner) {
   return ""
 }
 
+# Tokenize a logical heredoc-capable line into the words that the BuildKit
+# heredoc scan sees. Unquoted whitespace (space, tab, CR, VT, FF) splits words;
+# single quotes run to the closing quote; double quotes run to the closing
+# quote, inside which a backslash escapes ", $ and backslash; an unquoted
+# backslash escapes the next character; << glues the space, tab, or CR
+# characters after it and the following characters into the same word.
+# Quotes, escapes, and glued whitespace are kept in the word (BuildKit lexes
+# them raw), so a << inside or after quoted text never starts a word. The
+# escape character here is always backslash, whatever the escape directive
+# says: BuildKit hardcodes it for heredoc scanning. ${...} is passed through
+# literally in the forms ${NAME}, ${NAME:-word} and ${NAME:+word} with a
+# plain word; every other form is rejected, because it could shift the
+# word boundaries BuildKit computes (a word with whitespace splits the
+# enclosing word) or error inside the BuildKit lexer, which then silently
+# scans no heredocs on the line. Fills W[1..n] and returns n; fails the run on an unbalanced
+# quote or a Unicode space character, which this byte-wise scan cannot split
+# the way BuildKit does.
+function lex_words(s, lineno, W,   n, i, len, c, w, inw, j, k, q, nc, inner) {
+  for (j = 1; j <= N_USPACE; j++)
+    if (index(s, USPACE[j]) > 0)
+      fail("line " lineno " combines a heredoc-capable instruction with a Unicode space character; this gate cannot split its words the way BuildKit does. Use ASCII spaces on lines that open heredocs")
+  n = 0; w = ""; inw = 0
+  len = length(s); i = 1
+  while (i <= len) {
+    c = substr(s, i, 1)
+    if (c == " " || c == "\t" || c == "\r" || c == VT || c == FF) {
+      if (inw) { n++; W[n] = w; w = ""; inw = 0 }
+      i++
+      continue
+    }
+    if (c == "\\") {
+      # The pair stays in the word raw; an escaped quote opens nothing and
+      # an escaped space splits nothing. A trailing backslash stays as-is.
+      if (i == len) { w = w c; inw = 1; i++ }
+      else { w = w c substr(s, i + 1, 1); inw = 1; i += 2 }
+      continue
+    }
+    if (c == SQ) {
+      j = index(substr(s, i + 1), SQ)
+      if (j == 0)
+        fail("unbalanced single quote on a heredoc-capable instruction at line " lineno ": this gate cannot tell where its words end (BuildKit scans no heredocs on such a line). Balance the quote")
+      w = w substr(s, i, j + 1); inw = 1; i += j + 1
+      continue
+    }
+    if (c == "\"") {
+      w = w c; inw = 1; i++
+      q = 0
+      while (i <= len) {
+        c = substr(s, i, 1)
+        if (c == "\\") {
+          nc = substr(s, i + 1, 1)
+          if (nc == "\"" || nc == "$" || nc == "\\") { w = w c nc; i += 2 }
+          else { w = w c; i++ }
+          continue
+        }
+        if (c == "\"") { w = w c; i++; q = 1; break }
+        if (c == "$" && substr(s, i + 1, 1) == "{") {
+          k = lex_brace(s, i, lineno)
+          w = w substr(s, i, k - i + 1); i = k + 1
+          continue
+        }
+        w = w c; i++
+      }
+      if (!q)
+        fail("unbalanced double quote on a heredoc-capable instruction at line " lineno ": this gate cannot tell where its words end (BuildKit scans no heredocs on such a line). Balance the quote")
+      continue
+    }
+    if (c == "$" && substr(s, i + 1, 1) == "{") {
+      k = lex_brace(s, i, lineno)
+      w = w substr(s, i, k - i + 1); inw = 1; i = k + 1
+      continue
+    }
+    if (c == "<" && substr(s, i + 1, 1) == "<") {
+      # BuildKit glues space, tab, and CR after << into the same word, so
+      # << NAME is one heredoc word; VT and FF are not glued and split it.
+      w = w "<<"; inw = 1; i += 2
+      while (i <= len) {
+        c = substr(s, i, 1)
+        if (c != " " && c != "\t" && c != "\r") break
+        w = w c; i++
+      }
+      continue
+    }
+    w = w c; inw = 1; i++
+  }
+  if (inw) { n++; W[n] = w }
+  return n
+}
+
+# Validate a ${...} expansion starting at position i of s (s[i] is the $)
+# on a heredoc-capable line and return the position of its closing brace.
+# Only ${NAME}, ${NAME:-word} and ${NAME:+word} with a word free of
+# whitespace, quotes, backslashes, <, $ and { pass; anything else could
+# change how BuildKit splits the line into words, or error inside its
+# lexer, so the gate refuses to guess.
+function lex_brace(s, i, lineno,   k, inner, ok) {
+  k = index(substr(s, i + 2), "}")
+  if (k == 0)
+    fail("missing } in a ${ expansion on a heredoc-capable instruction at line " lineno)
+  inner = substr(s, i + 2, k - 1)
+  ok = 0
+  if (inner ~ /^[A-Za-z_][A-Za-z0-9_]*$/) ok = 1
+  else if (inner ~ /^[A-Za-z_][A-Za-z0-9_]*:[-+][^ \t\r"\\<$]*$/ &&
+           index(inner, SQ) == 0 && index(inner, VT) == 0 && index(inner, FF) == 0)
+    ok = 1
+  if (!ok)
+    fail("the expansion \"${" inner "}\" at line " lineno " is not supported on a heredoc-capable instruction: only ${NAME}, ${NAME:-word} and ${NAME:+word} with a plain word can be split into words the way BuildKit does. Rewrite the expansion or move it off the line that opens the heredoc")
+  return i + 1 + k
+}
+
 # Detect the heredocs a logical RUN/COPY/ADD (or ONBUILD thereof) line opens,
-# in order, mirroring BuildKit: a token of optional digits then << starts one.
-# An attached rest (<<EOF, <<-EOF, quoted forms) carries the name; a bare <<
-# takes the NEXT token as its name (the lexer glues the whitespace and the
-# following word into one heredoc word); a bare <<- followed by whitespace is
-# not a heredoc, and neither is a rest containing another < character.
-function scan_heredocs(f, n, lineno,   i, t, body, chomp, name) {
-  for (i = 2; i <= n; i++) {
-    t = f[i]
+# in order, from its lexed words, mirroring the BuildKit per-word test
+# (^digits<<, optional -, optional glued whitespace, then a delimiter with no
+# further <): <<EOF, <<-EOF, quoted forms, 2<<EOF, and the separated << EOF
+# all carry their name inside one word; <<- NAME with a space is not a
+# heredoc (the dash blocks the whitespace glue), and neither is a bare << at
+# end of line or a rest containing another < character.
+function scan_heredocs(W, n, lineno,   i, t, body, chomp, name) {
+  for (i = 1; i <= n; i++) {
+    t = W[i]
     if (t !~ /^[0-9]*<</) continue
     body = t
     sub(/^[0-9]*<</, "", body)
-    if (body == "") {
-      # bare << (or fd<<): the next token is the delimiter
-      if (i == n) continue
-      i++
-      name = strict_heredoc_name(f[i])
-      if (name == "")
-        fail("heredoc marker \"" t " " f[i] "\" at line " lineno " is not supported by this gate: the delimiter could not be classified with certainty, so the following lines cannot be told apart from instructions. Use a plain <<NAME heredoc")
-      HD_N++; HD_NAME[HD_N] = name; HD_CHOMP[HD_N] = 0
-    } else if (body == "-") {
-      # "<<- NAME" with a space is not a heredoc to BuildKit; the marker is
-      # inert and the following lines stay instructions for both of us.
-      continue
-    } else {
-      chomp = 0
-      if (substr(body, 1, 1) == "-") { chomp = 1; body = substr(body, 2) }
-      if (index(body, "<") > 0) continue   # not a heredoc to BuildKit either
-      name = strict_heredoc_name(body)
-      if (name == "")
-        fail("heredoc marker \"" t "\" at line " lineno " is not supported by this gate: the delimiter could not be classified with certainty, so the following lines cannot be told apart from instructions. Use a plain <<NAME heredoc")
-      HD_N++; HD_NAME[HD_N] = name; HD_CHOMP[HD_N] = chomp
-    }
+    chomp = 0
+    if (substr(body, 1, 1) == "-") { chomp = 1; body = substr(body, 2) }
+    else sub(/^[ \t\r]+/, "", body)   # whitespace glued by the lexer
+    if (body == "") continue           # bare <<, <<- or fd<<: not a heredoc
+    if (index(body, "<") > 0) continue # not a heredoc to BuildKit either
+    name = strict_heredoc_name(body)
+    if (name == "")
+      fail("heredoc marker \"" t "\" at line " lineno " is not supported by this gate: the delimiter could not be classified with certainty, so the following lines cannot be told apart from instructions. Use a plain <<NAME heredoc")
+    HD_N++; HD_NAME[HD_N] = name; HD_CHOMP[HD_N] = chomp
   }
 }
 
 BEGIN {
   SQ = sprintf("%c", 39)   # single quote, kept out of the awk source for portability
+  VT = sprintf("%c", 11)
+  FF = sprintf("%c", 12)
   BOM = sprintf("%c%c%c", 239, 187, 191)
   # Word splitting and leading-whitespace trimming match BuildKit, which
   # treats vertical tab and form feed as separators too.
@@ -256,6 +380,22 @@ BEGIN {
   WSL = "^" WS
   CTRL_WS = sprintf("[%c%c\r]", 11, 12)
   ESC = "\\"
+  # The UTF-8 byte sequences of the Unicode space characters the BuildKit
+  # heredoc lexer splits words on beyond ASCII (unicode.IsSpace): NEL, NBSP,
+  # OGHAM SPACE MARK, EN QUAD through HAIR SPACE, LINE SEPARATOR, PARAGRAPH
+  # SEPARATOR, NARROW NBSP, MEDIUM MATHEMATICAL SPACE, IDEOGRAPHIC SPACE.
+  # The gate runs awk under LC_ALL=C so these build and compare bytewise.
+  N_USPACE = 0
+  USPACE[++N_USPACE] = sprintf("%c%c", 194, 133)
+  USPACE[++N_USPACE] = sprintf("%c%c", 194, 160)
+  USPACE[++N_USPACE] = sprintf("%c%c%c", 225, 154, 128)
+  for (u = 128; u <= 138; u++)
+    USPACE[++N_USPACE] = sprintf("%c%c%c", 226, 128, u)
+  USPACE[++N_USPACE] = sprintf("%c%c%c", 226, 128, 168)
+  USPACE[++N_USPACE] = sprintf("%c%c%c", 226, 128, 169)
+  USPACE[++N_USPACE] = sprintf("%c%c%c", 226, 128, 175)
+  USPACE[++N_USPACE] = sprintf("%c%c%c", 226, 129, 159)
+  USPACE[++N_USPACE] = sprintf("%c%c%c", 227, 128, 128)
   seen_from = 0
   buf = ""; bufline = 0
   directive_mode = 1
@@ -353,19 +493,26 @@ END {
   exit EXITCODE + 0
 }
 
-function process(logical, lineno,   n, f, instr, sub2, p, q, ref, resolved, alias, lc, i, ai, t, name, val, inner) {
+function process(logical, lineno,   n, f, instr, sub2, p, q, ref, resolved, alias, lc, i, ai, t, name, val, inner, LEXW, ln) {
   n = split(logical, f, WS)
   if (n == 0) return
   instr = toupper(f[1])
 
+  # Heredoc scanning lexes the whole logical line, as BuildKit does, so a
+  # marker is recognized only where its << starts an unquoted word.
   if (instr == "RUN" || instr == "COPY" || instr == "ADD") {
-    if (index(logical, "<<") > 0) scan_heredocs(f, n, lineno)
+    if (index(logical, "<<") > 0) {
+      ln = lex_words(logical, lineno, LEXW)
+      scan_heredocs(LEXW, ln, lineno)
+    }
     return
   }
   if (instr == "ONBUILD" && n >= 2) {
     sub2 = toupper(f[2])
-    if ((sub2 == "RUN" || sub2 == "COPY" || sub2 == "ADD") && index(logical, "<<") > 0)
-      scan_heredocs(f, n, lineno)
+    if ((sub2 == "RUN" || sub2 == "COPY" || sub2 == "ADD") && index(logical, "<<") > 0) {
+      ln = lex_words(logical, lineno, LEXW)
+      scan_heredocs(LEXW, ln, lineno)
+    }
     return
   }
 

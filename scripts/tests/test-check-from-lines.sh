@@ -658,6 +658,83 @@ FROM ubuntu:22.04
 $F1
 EOF
 
+# Oracle: docker.io/library/alpine:latest is resolved for the final stage.
+# The << inside the double-quoted string is plain text to BuildKit (its
+# heredoc lexer splits the line into shell words first), so no heredoc opens
+# on the first RUN, the FROM alpine line is a real instruction, and the
+# later RUN <<EOT is the only heredoc.
+run_case "heredoc marker inside double quotes is plain text" "" err "alpine" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo " <<EOT "
+FROM alpine
+RUN <<EOT
+echo hi
+EOT
+EOF
+
+# Oracle: docker.io/library/alpine:latest is resolved for the final stage,
+# the same as the double-quoted form.
+run_case "heredoc marker inside single quotes is plain text" "" err "alpine" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo ' <<EOT '
+FROM alpine
+RUN <<EOT
+echo hi
+EOT
+EOF
+
+# Oracle: only cgr.dev/chainguard/wolfi-base is resolved. A real heredoc
+# after a quoted string on the same line still opens, so the FROM in the
+# body is content.
+run_case "real heredoc after a quoted string still opens" "" ok "" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo "x" <<EOF2
+FROM ubuntu:22.04
+EOF2
+EOF
+
+# Oracle: only cgr.dev/chainguard/wolfi-base is resolved. The backslash
+# escapes the quote, so no string opens and the <<EOF2 word is a heredoc.
+run_case "escaped quote before a heredoc marker" "" ok "" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo \" <<EOF2
+FROM ubuntu:22.04
+EOF2
+EOF
+
+# Oracle: docker.io/library/alpine:latest is resolved. BuildKit's heredoc
+# lexer errors on the unbalanced quote and silently scans no heredocs on the
+# line, so the FROM alpine line is a real instruction. The gate cannot split
+# the line either and refuses the file instead.
+run_case "unbalanced quote on a heredoc-capable line fails closed" "" err "unbalanced double quote" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo "oops <<EOF2
+FROM alpine
+EOF
+
+# Oracle: only cgr.dev/chainguard/wolfi-base is resolved. BuildKit hardcodes
+# backslash as the escape character of its heredoc lexer even under
+# escape=`, so the quote is escaped and <<EOT is a heredoc whose body
+# swallows the FROM alpine line.
+run_case "heredoc lexing escapes with backslash even under escape=backtick" "" ok "" <<'EOF'
+# escape=`
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo \" <<EOT
+FROM alpine
+EOT
+EOF
+
+# Oracle: only cgr.dev/chainguard/wolfi-base is resolved. BuildKit detects
+# the heredoc (words split at the spaces the expansion carries), but an
+# expansion with whitespace shifts word boundaries this gate cannot follow,
+# so it refuses the file instead of guessing.
+run_case "expansion with whitespace on a heredoc line fails closed" "" err "not supported on a heredoc-capable instruction" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo ${A:-x y} <<EON
+FROM ubuntu:22.04
+EON
+EOF
+
 # Oracle: only cgr.dev/chainguard/wolfi-base is resolved; the stable
 # docker/dockerfile:1 frontend parses these constructs as the builtin
 # frontend does.
@@ -777,6 +854,26 @@ run_case "escape character in an ARG value fails closed" "" err "escape characte
 ARG OTHER=a\ BASE=alpine
 FROM cgr.dev/chainguard/wolfi-base
 EOF
+
+# Oracle: only cgr.dev/chainguard/wolfi-base is resolved. BuildKit splits
+# words on Unicode spaces (here a no-break space between echo and <<EON), so
+# the heredoc opens and its body swallows the FROM. The gate splits bytewise
+# and refuses the file instead of guessing. The fixture is built with printf
+# because a literal no-break space in this file would be invisible.
+printf 'FROM cgr.dev/chainguard/wolfi-base\nRUN echo\302\240<<EON\nFROM ubuntu:22.04\nEON\n' > "$tmp/Dockerfile"
+out=$(sh "$SCRIPT" "$tmp/Dockerfile" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  case "$out" in
+    *"Unicode space"*) pass=$((pass + 1)) ;;
+    *)
+      failcount=$((failcount + 1))
+      echo "FAIL: Unicode space on a heredoc line — error should name the Unicode space, got: $out"
+      ;;
+  esac
+else
+  failcount=$((failcount + 1))
+  echo "FAIL: Unicode space on a heredoc line — expected rejection, but it passed"
+fi
 
 # A Dockerfile whose bare name contains '=' must still be read: a POSIX awk
 # operand shaped like name=value is a variable assignment, not a filename, so
