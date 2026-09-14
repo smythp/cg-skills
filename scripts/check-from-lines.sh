@@ -39,15 +39,29 @@
 # Semantics ported from Guardener's static validator and checked against
 # BuildKit (the parser rules below were each verified against
 # docker buildx build --call=outline on the builtin Dockerfile frontend):
+#   - Physical lines: a NUL byte anywhere in the file, and a CR that is not
+#     immediately followed by LF, are rejected before parsing, naming the
+#     line. BuildKit keeps both bytes inside the surrounding line where this
+#     parser would split it (its FROM reproductions fail with "FROM requires
+#     either one or three arguments"), awk implementations disagree about
+#     NUL bytes in input, and once the file is split into records a final CR
+#     with no LF cannot be told apart from a CRLF ending. CRLF line endings
+#     are accepted as before.
 #   - Parser directives: consecutive '# key=value' lines from the top of the
 #     file (leading whitespace and a UTF-8 BOM allowed, keys case-insensitive).
 #     The block ends at the first line that is not a known directive (a
 #     plain comment, a blank line, an unknown key, or an instruction). '# escape=' is
 #     honored for backslash and backtick; any other value is rejected with
 #     exit 1, as BuildKit itself errors on it. A duplicate directive is
-#     rejected the same way. '# syntax=' is accepted only for the stable
-#     docker/dockerfile:1 frontend; any other frontend may parse the file by
-#     different rules than this gate implements, so it is rejected.
+#     rejected the same way. '# syntax=' is accepted only when its value is
+#     exactly docker/dockerfile:1 or docker.io/docker/dockerfile:1, the
+#     rolling tag of the frontend these rules were verified against; every
+#     other value is rejected naming the frontend. A pinned tag parses by
+#     the pin's rules, not the rolling frontend's (under docker/dockerfile:1.0
+#     a heredoc body is ordinary instructions), and buildx can answer a
+#     --call=outline for a pinned frontend through a different,
+#     subrequest-capable frontend, so neither this gate nor the outline
+#     oracle can vouch for what a pinned frontend builds.
 #   - Line continuation matches BuildKit: a line continues when its last
 #     non-whitespace character is the escape character and the character
 #     before it is not also the escape character (so a line ending in two
@@ -101,6 +115,13 @@
 #     colon-less - and + forms) is rejected with exit 1 naming the
 #     expression, never expanded to an empty string.
 #   - FROM flags such as --platform=... are skipped to reach the image ref.
+#     After the flags, a FROM has exactly one image reference, optionally
+#     followed by AS and a stage name; any other token count is rejected
+#     quoting the line, as BuildKit fails such a line with "FROM requires
+#     either one or three arguments" (a middle token other than AS draws the
+#     same message). scratch is matched case-sensitively; BuildKit treats
+#     only the lowercase spelling as the empty base and rejects FROM SCRATCH
+#     as an invalid reference (repository names must be lowercase).
 #   - Automatic platform arguments: BuildKit seeds TARGETPLATFORM, TARGETOS,
 #     TARGETARCH, TARGETVARIANT, TARGETOSVERSION, TARGETSTAGE, BUILDPLATFORM,
 #     BUILDOS, BUILDARCH, BUILDVARIANT, and BUILDOSVERSION in the global
@@ -136,7 +157,10 @@
 # quoted or escaped whitespace in ARG values, ambiguous heredoc markers,
 # unbalanced quotes and restricted ${...} forms and Unicode spaces on
 # heredoc-capable lines, and non-stable '# syntax=' frontends are all
-# rejected rather than emulated; a single-quoted ARG
+# rejected rather than emulated; a NUL byte or a bare CR is rejected
+# file-wide, even where BuildKit tolerates it (inside a comment or a heredoc
+# body, and a final CR with no LF, which BuildKit reads as an ordinary line
+# ending, verified against a real outline run); a single-quoted ARG
 # default is expanded like a double-quoted one, where BuildKit keeps it
 # literal (a literal $ never survives into a valid image ref, so this cannot
 # admit a ref the builder resolves elsewhere); and with --platform but no
@@ -144,7 +168,7 @@
 # which matches every same-platform build but differs on a cross-platform
 # one until the caller passes --build-platform.
 #
-# Dependencies: sh, awk (POSIX). No network, no writes.
+# Dependencies: sh, awk, od (POSIX). No network, no writes.
 
 set -u
 
@@ -285,6 +309,34 @@ fi
 if [ -n "$BUILD_PLATFORM" ] && [ -z "$PLATFORM" ]; then
   echo "check-from-lines.sh: --build-platform needs --platform as well" >&2
   exit 2
+fi
+
+# NUL bytes and bare CRs (a CR not immediately followed by LF) are rejected
+# before parsing, naming the line, for the reasons in the header. The scan
+# walks od's octal byte dump so no awk implementation ever reads the bytes
+# themselves; the line count follows LF bytes, and a CR as the very last
+# byte of the file is caught by the END block.
+BAD_BYTE=$(od -An -v -t o1 < "$DOCKERFILE" | LC_ALL=C awk '
+  {
+    for (i = 1; i <= NF; i++) {
+      if (pcr && $i != "012") { print "CR " nl + 1; found = 1; exit }
+      if ($i == "000") { print "NUL " nl + 1; found = 1; exit }
+      pcr = ($i == "015")
+      if ($i == "012") nl++
+    }
+  }
+  END { if (!found && pcr) print "CR " nl + 1 }
+')
+if [ -n "$BAD_BYTE" ]; then
+  case "$BAD_BYTE" in
+    NUL*)
+      echo "check-from-lines: line ${BAD_BYTE#* } contains a NUL byte; this gate cannot split such a line the way BuildKit does, so the file is rejected rather than guessed at"
+      ;;
+    *)
+      echo "check-from-lines: line ${BAD_BYTE#* } contains a CR that is not part of a CRLF line ending; this gate cannot split such a line the way BuildKit does, so the file is rejected rather than guessed at (CRLF endings are accepted)"
+      ;;
+  esac
+  exit 1
 fi
 
 # Resolve the automatic platform argument values BuildKit would seed. The
@@ -668,8 +720,16 @@ BEGIN {
             fail("invalid escape directive value " SQ dval SQ " at line " NR ": must be \\ or ` (BuildKit rejects this file too)")
           ESC = dval
         } else if (dkey == "syntax") {
-          if (tolower(dval) !~ /^(docker\.io\/)?docker\/dockerfile:1(\.[0-9]+)*$/)
-            fail("syntax directive " SQ dval SQ " at line " NR " selects a frontend whose parsing rules this gate cannot verify; only the stable docker/dockerfile:1 syntax is supported")
+          # Only the rolling tag, byte for byte. A pinned tag parses by the
+          # pin, not by the rules this gate implements (BuildKit under
+          # docker/dockerfile:1.0 treats a heredoc body as ordinary
+          # instructions, so a FROM inside it is a real FROM), buildx can
+          # answer --call=outline for a pinned frontend through a different
+          # subrequest-capable frontend, and BuildKit itself rejects an
+          # uppercase spelling such as Docker/Dockerfile:1 as an invalid
+          # reference.
+          if (dval != "docker/dockerfile:1" && dval != "docker.io/docker/dockerfile:1")
+            fail("syntax directive " SQ dval SQ " at line " NR " selects a frontend whose parsing rules this gate cannot verify; only the rolling docker/dockerfile:1 tag (an optional docker.io/ prefix allowed) is supported")
         }
         next
       }
@@ -770,6 +830,13 @@ function process(logical, lineno,   n, f, instr, sub2, p, q, ref, resolved, alia
   while (i <= n && substr(f[i], 1, 2) == "--") i++
   if (i > n)
     fail("FROM at line " lineno " has no image reference")
+  # After the flags, exactly one image reference, optionally followed by AS
+  # and a stage name. BuildKit fails every other token count, including
+  # three tokens whose middle one is not AS, with "FROM requires either one
+  # or three arguments", so extra tokens this gate would otherwise ignore
+  # can never hide a reference from it.
+  if (n - i != 0 && !(n - i == 2 && toupper(f[i + 1]) == "AS"))
+    fail("FROM at line " lineno " (\"" logical "\") does not have exactly one image reference plus an optional AS name; BuildKit fails such a line with \"FROM requires either one or three arguments\"")
   ref = f[i]
 
   UNRESOLVED = ""
@@ -788,7 +855,10 @@ function process(logical, lineno,   n, f, instr, sub2, p, q, ref, resolved, alia
 
   lc = tolower(resolved)
   ok = 0
-  if (lc == "scratch") ok = 1
+  # scratch case-sensitively: BuildKit gives the empty base only for the
+  # lowercase spelling and rejects FROM SCRATCH as an image reference whose
+  # repository name must be lowercase.
+  if (resolved == "scratch") ok = 1
   else if (lc in ALIASES) ok = 1
   else if (substr(lc, 1, 8) == "cgr.dev/") ok = 1
   else if (mirror != "" && substr(lc, 1, length(mirror) + 1) == mirror "/") ok = 1

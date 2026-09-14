@@ -176,9 +176,43 @@ FROM --platform=$TARGETOS/$TARGETARCH cgr.dev/chainguard/static:latest
 RUN echo hi
 EOF
 
+# Oracle: a lone FROM scratch outlines with exit 0 and no "load metadata"
+# line; the lowercase spelling is the empty base and pulls nothing.
 run_case "scratch is allowed" "" ok "" <<'EOF'
 FROM scratch
 COPY hello /
+EOF
+
+# Oracle: outline fails with failed to parse stage name "SCRATCH": invalid
+# reference format: repository name (library/SCRATCH) must be lowercase.
+# Only the lowercase spelling is the empty base; any other case is an image
+# reference, so the gate matches scratch case-sensitively and this name
+# falls through to the allowlist check.
+run_case "FROM SCRATCH is rejected as an image reference" "" err "SCRATCH" <<'EOF'
+FROM SCRATCH
+COPY hello /
+EOF
+
+# Oracle: outline fails with dockerfile parse error on line 1: FROM requires
+# either one or three arguments (three tokens whose middle one is not AS
+# draw the same message). The gate used to read the first token and ignore
+# the rest; now any token count other than one reference or reference AS
+# name is rejected quoting the line.
+run_case "FROM with two extra tokens is rejected" "" err "one or three arguments" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base:latest foo bar
+EOF
+
+# Oracle: outline fails with dockerfile parse error on line 1: FROM requires
+# either one or three arguments; a trailing AS with no stage name is two
+# arguments.
+run_case "FROM followed by a bare AS is rejected" "" err "one or three arguments" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base:latest AS
+EOF
+
+# Oracle: outline resolves cgr.dev/chainguard/wolfi-base:latest with exit 0;
+# the reference plus AS plus a stage name is the allowed three-token form.
+run_case "FROM with a reference and an AS name stays allowed" "" ok "" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base:latest AS y
 EOF
 
 run_case "stage alias is allowed" "" ok "" <<'EOF'
@@ -1066,6 +1100,67 @@ run_case "non-stable syntax directive fails closed" "" err "syntax directive" <<
 FROM cgr.dev/chainguard/wolfi-base
 EOF
 
+# Oracle: only cgr.dev/chainguard/wolfi-base is resolved; the outline run
+# resolves docker.io/docker/dockerfile:1 as the frontend, the same rolling
+# tag the bare spelling names.
+run_case "rolling syntax tag with the docker.io prefix is accepted" "" ok "" <<'EOF'
+# syntax=docker.io/docker/dockerfile:1
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo hi
+EOF
+
+# The adversarial reproduction from the 2026-09-14 check, verbatim. BuildKit
+# under the pinned docker/dockerfile:1.0 frontend treats the heredoc body as
+# ordinary instructions, so the FROM alpine inside it is a real stage and
+# the real build fails at the next line (Dockerfile parse error line 5:
+# unknown instruction: EOT); the 1.0 frontend has no outline subrequest, so
+# a --call=outline run fails with unsupported frontend capability
+# moby.buildkit.frontend.subrequests. The gate exits 1 on the directive at
+# line 1, before any heredoc parsing, naming the frontend.
+run_case "pinned syntax tag 1.0 is rejected before heredoc parsing" "" err "syntax directive 'docker/dockerfile:1.0'" <<'EOF'
+# syntax=docker/dockerfile:1.0
+FROM cgr.dev/chainguard/wolfi-base:latest AS app
+RUN echo build <<EOT
+FROM docker.io/library/alpine:latest AS smuggled
+EOT
+EOF
+
+# Oracle: a real build of the same shape under 1.3 fails with dockerfile
+# parse error on line 5: unknown instruction: EOT (did you mean ENV?); 1.3
+# also predates heredocs.
+run_case "pinned syntax tag 1.3 is rejected" "" err "syntax directive 'docker/dockerfile:1.3'" <<'EOF'
+# syntax=docker/dockerfile:1.3
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo hi
+EOF
+
+# Oracle: docker/dockerfile:1.4.0 parses heredocs, but its outline run was
+# answered by a different frontend (buildx pulled docker/dockerfile:1.8.1
+# by digest to service the subrequest), so an outline pass under this pin
+# vouches for the wrong parser. The gate accepts no pinned tag.
+run_case "pinned syntax tag 1.4.0 is rejected" "" err "syntax directive 'docker/dockerfile:1.4.0'" <<'EOF'
+# syntax=docker/dockerfile:1.4.0
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo hi
+EOF
+
+# Oracle: a real build fails to resolve docker.io/docker/dockerfile:1.99
+# (not found). The gate rejects the pin without asking any registry.
+run_case "pinned syntax tag 1.99 is rejected" "" err "syntax directive 'docker/dockerfile:1.99'" <<'EOF'
+# syntax=docker/dockerfile:1.99
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo hi
+EOF
+
+# Oracle: outline fails with invalid context name Docker/Dockerfile:1:
+# invalid reference format: repository name (Dockerfile) must be lowercase.
+# The gate matches the directive value byte for byte, so a case variant
+# never passes as the rolling tag.
+run_case "uppercase syntax directive value is rejected" "" err "syntax directive 'Docker/Dockerfile:1'" <<'EOF'
+# syntax=Docker/Dockerfile:1
+FROM cgr.dev/chainguard/wolfi-base
+EOF
+
 # Oracle: docker.io/library/alpine:latest is resolved; the second
 # assignment on the ARG line reassigns BASE, matching docker build.
 run_case "second assignment on an ARG line is processed" "" err "alpine" <<'EOF'
@@ -1211,6 +1306,38 @@ else
   failcount=$((failcount + 1))
   echo "FAIL: Unicode space on a heredoc line — expected rejection, but it passed"
 fi
+
+# The following four fixtures are built with printf because their deciding
+# bytes (a lone CR, a NUL, CRLF endings) would be invisible or impossible in
+# a heredoc here. Each is fed to run_case by redirection, which keeps the
+# pass counters in this shell.
+
+# Oracle: outline fails with dockerfile parse error on line 1: FROM requires
+# either one or three arguments; BuildKit keeps the CR inside the line. The
+# gate used to split the line at the CR and check only the first FROM; now
+# a CR that is not part of a CRLF ending is rejected naming its line.
+printf 'FROM cgr.dev/chainguard/wolfi-base:latest\rFROM docker.io/library/alpine:latest\n' > "$tmp/bare-cr.bin"
+run_case "bare CR joining two FROMs is rejected" "" err "contains a CR" < "$tmp/bare-cr.bin"
+
+# Oracle: outline fails with dockerfile parse error on line 1: FROM requires
+# either one or three arguments; BuildKit keeps the NUL inside the line. The
+# gate used to let awk read the byte with implementation-defined results;
+# now any NUL is rejected naming its line.
+printf 'FROM cgr.dev/chainguard/wolfi-base:latest\000FROM docker.io/library/alpine:latest\n' > "$tmp/nul.bin"
+run_case "NUL byte in a FROM line is rejected" "" err "contains a NUL byte" < "$tmp/nul.bin"
+
+# Oracle: outline resolves cgr.dev/chainguard/wolfi-base:latest with exit 0;
+# CRLF line endings stay accepted.
+printf 'FROM cgr.dev/chainguard/wolfi-base:latest\r\nRUN echo hi\r\n' > "$tmp/crlf.bin"
+run_case "CRLF line endings are accepted" "" ok "" < "$tmp/crlf.bin"
+
+# Oracle: outline resolves cgr.dev/chainguard/wolfi-base:latest with exit 0,
+# so BuildKit reads a final CR with no LF as an ordinary line ending. Once
+# awk has split the file into records that CR cannot be told apart from a
+# CRLF ending, so the gate rejects it. A conservative rejection, stated in
+# the header.
+printf 'FROM cgr.dev/chainguard/wolfi-base:latest\r' > "$tmp/cr-eof.bin"
+run_case "CR as the final byte with no LF is rejected" "" err "contains a CR" < "$tmp/cr-eof.bin"
 
 # A Dockerfile whose bare name contains '=' must still be read: a POSIX awk
 # operand shaped like name=value is a variable assignment, not a filename, so

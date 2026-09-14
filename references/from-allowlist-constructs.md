@@ -26,6 +26,7 @@ match BuildKit it exits 1 naming the construct; those rows say so.
 - [Heredoc forms](#heredoc-forms)
 - [Escape directive and line continuation](#escape-directive-and-line-continuation)
 - [Parser directives](#parser-directives)
+- [Physical line structure](#physical-line-structure)
 - [ARG scope and overrides](#arg-scope-and-overrides)
 - [Automatic platform arguments](#automatic-platform-arguments)
 - [Variable expansion forms](#variable-expansion-forms)
@@ -91,7 +92,21 @@ the backtick.
 | `# check=...` | known key, block continues | same | check directive does not end the directive block |
 | unknown key or plain comment | ends the directive block | same | escape directive after a plain comment is inert (existing) |
 | duplicate directive | build error | exit 1 | duplicate escape directive is rejected (existing) |
-| `# syntax=` beyond stable docker/dockerfile:1 | replaces the parser | exit 1 naming the frontend | non-stable syntax directive fails closed (existing) |
+| `# syntax=` with any value other than the rolling `docker/dockerfile:1` tag (an optional `docker.io/` prefix allowed), matched byte for byte | replaces the parser with the pin's rules. Under 1.0 a heredoc body is ordinary instructions (a real build of the reproduction fails on unknown instruction EOT) and the outline subrequest does not exist; under 1.4.0 buildx answers the outline through a different frontend (docker/dockerfile:1.8.1 by digest), so an outline pass vouches for the wrong parser; 1.99 fails to pull; an uppercase spelling is an invalid reference | exit 1 naming the frontend | non-stable syntax directive fails closed (existing); rolling syntax tag with the docker.io prefix is accepted; pinned syntax tag 1.0 is rejected before heredoc parsing; pinned syntax tag 1.3 is rejected; pinned syntax tag 1.4.0 is rejected; pinned syntax tag 1.99 is rejected; uppercase syntax directive value is rejected |
+
+## Physical line structure
+
+The gate scans the raw bytes (through od, before awk reads the file) and
+rejects a NUL anywhere and a CR that is not immediately followed by LF,
+naming the line. BuildKit keeps both bytes inside the surrounding line where
+the gate's line reader would split it.
+
+| Construct | BuildKit | Gate | Fixture |
+|---|---|---|---|
+| CRLF line endings | accepted, the CR leaves with the LF | same | CRLF line endings are accepted |
+| CR not followed by LF inside a line | kept in the line; the two-FROM reproduction fails with "FROM requires either one or three arguments" | exit 1 naming the line | bare CR joining two FROMs is rejected |
+| NUL byte | kept in the line; the reproduction fails the same way | exit 1 naming the line | NUL byte in a FROM line is rejected |
+| CR as the final byte with no LF | accepted as an ordinary line ending | exit 1 naming the line; a conservative rejection, stated in the header | CR as the final byte with no LF is rejected |
 
 ## ARG scope and overrides
 
@@ -148,7 +163,8 @@ because buildx 0.37 drops `--platform` on `--call` runs.
 | reference with tag and digest | resolved as written | prefix-checked as written | digest-pinned cgr.dev reference is allowed |
 | one pair of quotes around the reference | quotes stripped | exit 1, quoted refs never match the allowlist | quoted FROM reference fails closed |
 | backslashes and quotes elsewhere in a reference | processed by the shell lexer | passed through textually; removal of quote or escape characters cannot change the host a prefix check sees, so no allowed prefix can be forged | covered by the prefix rule (no fixture) |
+| FROM token count after flags | one image reference, or reference AS name; every other count fails with "FROM requires either one or three arguments" (three tokens whose middle one is not AS draw the same message) | same, quoting the line | FROM with two extra tokens is rejected; FROM followed by a bare AS is rejected; FROM with a reference and an AS name stays allowed |
 | `AS alias` stage names | letters, digits, `_ . -`, starting with a letter; case-insensitive reuse | same, image-shaped aliases rejected | image-shaped alias with slash is rejected (existing) |
 | FROM of an earlier alias | stage reference, not a pull | same | stage alias is allowed (existing) |
-| `scratch` | no metadata load | allowed by name | scratch is allowed (existing) |
+| `scratch` | the empty base for the lowercase spelling only, no metadata load; FROM SCRATCH fails to parse as a stage name (repository name library/SCRATCH must be lowercase) | matched case-sensitively; other spellings fall through to the allowlist check and are rejected | scratch is allowed (existing); FROM SCRATCH is rejected as an image reference |
 | BuildKit source policy (`EXPERIMENTAL_BUILDKIT_SOURCE_POLICY` in the environment) | converts a reference after the log names the original | the oracle exits 1 naming the variable when it is set; the textual gate reads no environment beyond its own inputs | source policy shim case in test-check-from-oracle.sh |
