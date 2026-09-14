@@ -22,17 +22,26 @@ trap 'rm -rf "$tmp"' EXIT INT TERM
 pass=0
 failcount=0
 
-# run_case NAME MIRROR EXPECT CONTAINS [BUILDARG...]  (dockerfile on stdin)
+# run_case NAME MIRROR EXPECT CONTAINS [ARG...]  (dockerfile on stdin)
 #   EXPECT: ok  -> script must exit 0
 #           err -> script must exit non-zero and output must contain CONTAINS
-#   Each extra argument is passed as --build-arg NAME=value.
+#   An extra argument of --platform, --build-platform, or --target passes
+#   through with its following value; every other extra argument is passed
+#   as --build-arg NAME=value.
 run_case() {
   name="$1"; mirror="$2"; expect="$3"; contains="$4"; shift 4
   cat > "$tmp/Dockerfile"
-  # Fixture build-arg values contain no whitespace, so a string build with
+  # Fixture argument values contain no whitespace, so a string build with
   # unquoted expansion below is safe.
   extra=""
-  for a in "$@"; do extra="$extra --build-arg $a"; done
+  pend=0
+  for a in "$@"; do
+    if [ "$pend" -eq 1 ]; then extra="$extra $a"; pend=0; continue; fi
+    case "$a" in
+      --platform|--build-platform|--target) extra="$extra $a"; pend=1 ;;
+      *) extra="$extra --build-arg $a" ;;
+    esac
+  done
   if [ -n "$mirror" ]; then
     out=$(sh "$SCRIPT" --mirror "$mirror" $extra "$tmp/Dockerfile" 2>&1); rc=$?
   else
@@ -131,6 +140,15 @@ FROM my-corp.example.io/chainguard-remote/python:latest-dev
 RUN echo hi
 EOF
 
+# The mirror prefix travels to awk through the environment. awk -v decodes
+# backslash sequences, so a prefix holding a literal backslash-n would turn
+# into a newline and stop matching a FROM that spells the same two
+# characters. The value below must stay exactly as written on both sides.
+run_case "mirror value with a backslash sequence is not decoded" "my\ncorp.example.io/cg" ok "" <<'EOF'
+FROM my\ncorp.example.io/cg/python:latest-dev
+RUN echo hi
+EOF
+
 run_case "configured aws account ecr external mirror is allowed" "123456789012.dkr.ecr.us-west-2.amazonaws.com/chainguard" ok "" <<'EOF'
 FROM 123456789012.dkr.ecr.us-west-2.amazonaws.com/chainguard/python:latest-dev
 RUN echo hi
@@ -158,9 +176,43 @@ FROM --platform=$TARGETOS/$TARGETARCH cgr.dev/chainguard/static:latest
 RUN echo hi
 EOF
 
+# Oracle: a lone FROM scratch outlines with exit 0 and no "load metadata"
+# line; the lowercase spelling is the empty base and pulls nothing.
 run_case "scratch is allowed" "" ok "" <<'EOF'
 FROM scratch
 COPY hello /
+EOF
+
+# Oracle: outline fails with failed to parse stage name "SCRATCH": invalid
+# reference format: repository name (library/SCRATCH) must be lowercase.
+# Only the lowercase spelling is the empty base; any other case is an image
+# reference, so the gate matches scratch case-sensitively and this name
+# falls through to the allowlist check.
+run_case "FROM SCRATCH is rejected as an image reference" "" err "SCRATCH" <<'EOF'
+FROM SCRATCH
+COPY hello /
+EOF
+
+# Oracle: outline fails with dockerfile parse error on line 1: FROM requires
+# either one or three arguments (three tokens whose middle one is not AS
+# draw the same message). The gate used to read the first token and ignore
+# the rest; now any token count other than one reference or reference AS
+# name is rejected quoting the line.
+run_case "FROM with two extra tokens is rejected" "" err "one or three arguments" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base:latest foo bar
+EOF
+
+# Oracle: outline fails with dockerfile parse error on line 1: FROM requires
+# either one or three arguments; a trailing AS with no stage name is two
+# arguments.
+run_case "FROM followed by a bare AS is rejected" "" err "one or three arguments" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base:latest AS
+EOF
+
+# Oracle: outline resolves cgr.dev/chainguard/wolfi-base:latest with exit 0;
+# the reference plus AS plus a stage name is the allowed three-token form.
+run_case "FROM with a reference and an AS name stays allowed" "" ok "" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base:latest AS y
 EOF
 
 run_case "stage alias is allowed" "" ok "" <<'EOF'
@@ -329,6 +381,28 @@ FROM My-Corp.Example.io/chainguard-remote/python:latest-dev
 RUN echo hi
 EOF
 
+# Oracle: docker.io/library/alpine:3.20 is resolved; instruction keywords
+# are case-insensitive.
+run_case "lowercase from is still a FROM" "" err "alpine:3.20" <<'EOF'
+from alpine:3.20
+run echo hi
+EOF
+
+# Oracle: docker.io/library/alpine:3.20 is resolved; BuildKit strips one
+# pair of quotes around a FROM reference. The gate does not unquote
+# references, so the quoted form never matches the allowlist and fails
+# closed either way.
+run_case "quoted FROM reference fails closed" "" err "docker.io/library/alpine:3.20" <<'EOF'
+FROM "docker.io/library/alpine:3.20"
+EOF
+
+# Oracle: cgr.dev/chainguard/wolfi-base:latest@sha256:9a8d954d... is
+# resolved as written; a tag plus digest reference passes through the
+# allowlist check on its host prefix.
+run_case "digest-pinned cgr.dev reference is allowed" "" ok "" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base:latest@sha256:9a8d954d8f03a21bcf2be73d4628f0ad26d35c3275469925de63a34eebd58f13
+EOF
+
 run_case "image-shaped alias with slash is rejected" "" err "stage alias" <<'EOF'
 FROM cgr.dev/chainguard/go:latest AS docker.io/evil/img
 RUN echo hi
@@ -398,6 +472,210 @@ run_case "build-arg with no matching ARG declaration is ignored" "" err '${BASE}
 ARG BASE
 FROM ${BASE}
 RUN echo hi
+EOF
+
+# Oracle: docker.io/library/alpine:latest is resolved (real build with
+# --platform linux/amd64; buildx 0.37 drops --platform on --call runs, so
+# the platform fixtures were verified with real builds, which stop at
+# metadata for these files). BuildKit sets TARGETARCH in the global scope on
+# every build, so the ARG default expands to alpine and the FROM keeps it.
+run_case "automatic TARGETARCH reaches a global ARG default" "" err "alpine" --platform linux/amd64 <<'EOF'
+ARG BASE=${TARGETARCH:+alpine}
+FROM ${BASE:-cgr.dev/chainguard/wolfi-base}
+RUN echo hi
+EOF
+
+# Oracle: the same file resolves docker.io/library/alpine:latest on every
+# platform, because TARGETARCH is always set. Without --platform the gate
+# does not know the value BuildKit will use, so it refuses to answer.
+run_case "automatic platform argument without --platform fails closed" "" err "Pass --platform" <<'EOF'
+ARG BASE=${TARGETARCH:+alpine}
+FROM ${BASE:-cgr.dev/chainguard/wolfi-base}
+RUN echo hi
+EOF
+
+# Oracle: cgr.dev/chainguard/go:latest-dev is resolved. The variable sits
+# inside a FROM flag, which names a manifest platform, not an image, so the
+# gate skips it with or without --platform.
+run_case "BUILDPLATFORM in a FROM flag needs no --platform" "" ok "" --platform linux/amd64 <<'EOF'
+FROM --platform=$BUILDPLATFORM cgr.dev/chainguard/go:latest-dev
+RUN go build .
+EOF
+
+# Oracle: docker.io/library/alpine:v8 is resolved under --platform
+# linux/amd64. TARGETVARIANT is set to the empty string when the platform
+# has no variant, and :- treats empty as unset.
+run_case "TARGETVARIANT is empty-set on a variantless platform" "" err "alpine:v8" --platform linux/amd64 <<'EOF'
+FROM alpine:${TARGETVARIANT:-v8}
+EOF
+
+# Oracle: docker.io/library/alpine:v8 is resolved under --platform
+# linux/arm64/v8 too: the docker CLI normalizes arm64/v8 to arm64 with no
+# variant, so the :- default still applies.
+run_case "arm64/v8 normalizes to an empty TARGETVARIANT" "" err "alpine:v8" --platform linux/arm64/v8 <<'EOF'
+FROM alpine:${TARGETVARIANT:-v8}
+EOF
+
+# Oracle: docker.io/library/alpine:v7 is resolved under --platform
+# linux/arm/v7; that variant survives normalization.
+run_case "arm/v7 keeps its TARGETVARIANT" "" err "alpine:v7" --platform linux/arm/v7 <<'EOF'
+FROM alpine:${TARGETVARIANT:-v8}
+EOF
+
+# Oracle: docker.io/library/alpine:q-amd64 is resolved under --platform
+# linux/x86_64; the docker CLI normalizes the architecture alias.
+run_case "x86_64 normalizes to amd64" "" err "alpine:q-amd64" --platform linux/x86_64 <<'EOF'
+FROM alpine:q-${TARGETARCH}
+EOF
+
+# The normalization fixtures below pin containerd platforms.Normalize, rule
+# by rule. Each expected value comes from a real build of a scratch stage
+# labeling the automatic arguments, built with the fixture's --platform and
+# inspected (Docker 29.8, buildx 0.37).
+
+# Real build with --platform linux/amd64/v1 seeds TARGETVARIANT empty; the
+# v1 variant of amd64 is dropped, so the :- default applies.
+run_case "amd64/v1 normalizes to an empty TARGETVARIANT" "" err "alpine:none" --platform linux/amd64/v1 <<'EOF'
+FROM alpine:${TARGETVARIANT:-none}
+EOF
+
+# Real build with --platform linux/amd64/v2 seeds TARGETVARIANT=v2; only v1
+# is dropped for amd64.
+run_case "amd64/v2 keeps its TARGETVARIANT" "" err "alpine:v2" --platform linux/amd64/v2 <<'EOF'
+FROM alpine:${TARGETVARIANT:-none}
+EOF
+
+# Real build with --platform linux/arm64/8 seeds TARGETVARIANT empty; the
+# bare-8 spelling is dropped for arm64 like v8.
+run_case "arm64/8 normalizes to an empty TARGETVARIANT" "" err "alpine:none" --platform linux/arm64/8 <<'EOF'
+FROM alpine:${TARGETVARIANT:-none}
+EOF
+
+# Real build with --platform linux/arm seeds TARGETVARIANT=v7.
+run_case "bare arm gains the v7 variant" "" err "alpine:v7" --platform linux/arm <<'EOF'
+FROM alpine:${TARGETVARIANT:-none}
+EOF
+
+# Real builds with --platform linux/arm/5, /6, /7, /8 seed TARGETVARIANT
+# v5, v6, v7, v8; the numeric arm variants gain the v prefix.
+run_case "arm/5 normalizes to the v5 variant" "" err "alpine:v5" --platform linux/arm/5 <<'EOF'
+FROM alpine:${TARGETVARIANT:-none}
+EOF
+
+run_case "arm/6 normalizes to the v6 variant" "" err "alpine:v6" --platform linux/arm/6 <<'EOF'
+FROM alpine:${TARGETVARIANT:-none}
+EOF
+
+run_case "arm/7 normalizes to the v7 variant" "" err "alpine:v7" --platform linux/arm/7 <<'EOF'
+FROM alpine:${TARGETVARIANT:-none}
+EOF
+
+run_case "arm/8 normalizes to the v8 variant" "" err "alpine:v8" --platform linux/arm/8 <<'EOF'
+FROM alpine:${TARGETVARIANT:-none}
+EOF
+
+# Real build with --platform linux/arm/v8 seeds TARGETVARIANT=v8; only
+# arm64 drops a v8 variant, arm keeps it.
+run_case "arm/v8 keeps its TARGETVARIANT" "" err "alpine:v8" --platform linux/arm/v8 <<'EOF'
+FROM alpine:${TARGETVARIANT:-none}
+EOF
+
+# Real build with --platform linux/x86-64 seeds TARGETARCH=amd64, the same
+# as the x86_64 spelling.
+run_case "x86-64 normalizes to amd64" "" err "alpine:q-amd64" --platform linux/x86-64 <<'EOF'
+FROM alpine:q-${TARGETARCH}
+EOF
+
+# Real build with --platform linux/aarch64 seeds TARGETARCH=arm64 with an
+# empty TARGETVARIANT.
+run_case "aarch64 normalizes to arm64" "" err "alpine:q-arm64" --platform linux/aarch64 <<'EOF'
+FROM alpine:q-${TARGETARCH}
+EOF
+
+# Real build with --platform linux/armhf seeds TARGETARCH=arm and
+# TARGETVARIANT=v7.
+run_case "armhf normalizes to arm/v7" "" err "alpine:arm-v7" --platform linux/armhf <<'EOF'
+FROM alpine:${TARGETARCH}-${TARGETVARIANT:-none}
+EOF
+
+# Real build with --platform linux/armel seeds TARGETARCH=arm and
+# TARGETVARIANT=v6.
+run_case "armel normalizes to arm/v6" "" err "alpine:arm-v6" --platform linux/armel <<'EOF'
+FROM alpine:${TARGETARCH}-${TARGETVARIANT:-none}
+EOF
+
+# Real build with --platform linux/armhf/v6 seeds TARGETVARIANT=v7, not v6;
+# armhf replaces any variant it is given.
+run_case "armhf with a variant still normalizes to arm/v7" "" err "alpine:arm-v7" --platform linux/armhf/v6 <<'EOF'
+FROM alpine:${TARGETARCH}-${TARGETVARIANT:-none}
+EOF
+
+# Real build with --platform linux/i386 seeds TARGETARCH=386.
+run_case "i386 normalizes to 386" "" err "alpine:q-386" --platform linux/i386 <<'EOF'
+FROM alpine:q-${TARGETARCH}
+EOF
+
+# Real build with --platform linux/i386/v1 seeds TARGETARCH=386 with an
+# empty TARGETVARIANT; i386 drops any variant it is given.
+run_case "i386 drops any variant" "" err "alpine:386-none" --platform linux/i386/v1 <<'EOF'
+FROM alpine:${TARGETARCH}-${TARGETVARIANT:-none}
+EOF
+
+# Oracle: docker.io/library/alpine:3.20 is resolved under --platform
+# linux/amd64. A bare global redeclaration keeps the automatic value.
+run_case "bare global ARG redeclaration keeps the automatic value" "" err "alpine:3.20" --platform linux/amd64 <<'EOF'
+ARG TARGETARCH
+FROM ${TARGETARCH:+docker.io/library/alpine:3.20}
+EOF
+
+# Oracle: docker.io/library/alpine:arch-riscv64 is resolved under
+# --platform linux/amd64. A global declaration with a default replaces the
+# automatic value, unlike a bare redeclaration.
+run_case "global ARG default replaces the automatic value" "" err "alpine:arch-riscv64" --platform linux/amd64 <<'EOF'
+ARG TARGETARCH=riscv64
+FROM alpine:arch-${TARGETARCH}
+EOF
+
+# Oracle: docker.io/library/alpine:o-xyz is resolved with --build-arg
+# TARGETARCH=xyz and no ARG declaration; overrides of automatic arguments
+# apply pre-declared, unlike ordinary build args.
+run_case "build-arg overrides an automatic argument undeclared" "" err "alpine:o-xyz" --platform linux/amd64 TARGETARCH=xyz <<'EOF'
+FROM alpine:o-${TARGETARCH}
+EOF
+
+# Oracle: docker.io/library/alpine:b-amd64 is resolved on this amd64 daemon
+# under --platform linux/arm64, because docker sets BUILD* to the builder's
+# own platform. The gate matches when the caller passes --build-platform.
+run_case "BUILDARCH follows --build-platform on a cross build" "" err "alpine:b-amd64" --platform linux/arm64 --build-platform linux/amd64 <<'EOF'
+FROM alpine:b-${BUILDARCH}
+EOF
+
+# Oracle: the real build on an amd64 daemon resolves alpine:b-amd64 (see
+# above). Without --build-platform the gate defaults BUILD* to the target
+# platform, so on this cross build it checks alpine:b-arm64 instead; a
+# documented deviation, and both spellings are off the allowlist here.
+run_case "BUILDARCH defaults to the target platform without --build-platform" "" err "alpine:b-arm64" --platform linux/arm64 <<'EOF'
+FROM alpine:b-${BUILDARCH}
+EOF
+
+# Oracle: docker.io/library/alpine:s-laststage is resolved with --target
+# laststage; TARGETSTAGE carries the target stage name. Without --target,
+# BuildKit uses the final stage's name, verified separately.
+run_case "TARGETSTAGE carries the --target stage name" "" err "alpine:s-laststage" --platform linux/amd64 --target laststage <<'EOF'
+FROM alpine:s-${TARGETSTAGE} AS laststage
+EOF
+
+# Oracle: without --target BuildKit sets TARGETSTAGE to the final stage's
+# name, which the gate cannot know in one streaming pass, so it asks for
+# --target instead of guessing.
+run_case "TARGETSTAGE without --target fails closed" "" err "Pass --target" --platform linux/amd64 <<'EOF'
+FROM alpine:s-${TARGETSTAGE} AS laststage
+EOF
+
+# A multi-platform value is a usage error; the caller runs the gate once
+# per platform (exit 2, no oracle involved).
+run_case "multi-platform value is refused" "" err "one platform per run" --platform linux/amd64,linux/arm64 <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
 EOF
 
 # Oracle: the final stage resolves docker.io/library/alpine:latest. The
@@ -528,6 +806,27 @@ RUN echo hi `
 FROM alpine
 EOF
 
+# Oracle: only cgr.dev/chainguard/wolfi-base is resolved. Leading
+# whitespace before a parser directive is allowed and the directive is
+# honored.
+run_case "parser directive with leading whitespace is honored" "" ok "" <<'EOF'
+   # escape=`
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo hi `
+FROM alpine
+EOF
+
+# Oracle: only cgr.dev/chainguard/wolfi-base is resolved. check is a known
+# directive key, so it does not end the directive block and the escape
+# directive after it is honored.
+run_case "check directive does not end the directive block" "" ok "" <<'EOF'
+# check=skip=all
+# escape=`
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo hi `
+FROM alpine
+EOF
+
 # Oracle: only cgr.dev/chainguard/wolfi-base is resolved. An empty line
 # inside a continuation draws a BuildKit warning but the instruction
 # continues, so the "FROM ubuntu" text is swallowed into the RUN.
@@ -545,6 +844,16 @@ run_case "continuation joins without a separator" "" err "builder2" <<'EOF'
 FROM cgr.dev/chainguard/go:latest AS builder
 FROM builder\
 2
+EOF
+
+# Oracle: only cgr.dev/chainguard/wolfi-base is resolved. A comment line
+# inside a continuation is dropped and the continuation goes on, so the
+# FROM alpine text is swallowed into the RUN.
+run_case "comment inside a continuation does not end it" "" ok "" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo hi \
+# a comment
+FROM alpine
 EOF
 
 # Oracle: only cgr.dev/chainguard/wolfi-base is resolved. BuildKit's lexer
@@ -575,6 +884,25 @@ FROM cgr.dev/chainguard/wolfi-base
 RUN cat <<- F1
 FROM ubuntu:22.04
 F1
+EOF
+
+# Oracle: docker.io/library/ubuntu:22.04 is resolved for the second stage;
+# a bare << at the end of the line opens no heredoc, so the FROM line after
+# it is a real instruction.
+run_case "bare << at end of line is not a heredoc" "" err "ubuntu:22.04" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo <<
+FROM ubuntu:22.04
+EOF
+
+# Oracle: docker.io/library/ubuntu:22.04 is resolved for the second stage;
+# a marker whose rest contains another < (<<<F1, the shell herestring
+# spelling) is not a heredoc to BuildKit, so the FROM line after it is a
+# real instruction.
+run_case "marker with an additional < is not a heredoc" "" err "ubuntu:22.04" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN cat <<<F1
+FROM ubuntu:22.04
 EOF
 
 # Oracle: only cgr.dev/chainguard/wolfi-base is resolved; a leading file
@@ -658,6 +986,103 @@ FROM ubuntu:22.04
 $F1
 EOF
 
+# Oracle: only cgr.dev/chainguard/wolfi-base is resolved; ONBUILD RUN, COPY,
+# and ADD lines open heredocs like their plain forms, and the body is
+# content.
+run_case "ONBUILD heredoc body is content" "" ok "" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+ONBUILD RUN <<F1
+FROM ubuntu:22.04
+F1
+EOF
+
+# Oracle: only cgr.dev/chainguard/wolfi-base is resolved. After the glued
+# whitespace of a separated << the dash belongs to the delimiter, so this is
+# a heredoc named -EOF2 with no tab chomping.
+run_case "separated delimiter starting with a dash" "" ok "" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN cat << -EOF2
+FROM ubuntu:22.04
+-EOF2
+EOF
+
+# Oracle: docker.io/library/alpine:latest is resolved for the final stage.
+# The << inside the double-quoted string is plain text to BuildKit (its
+# heredoc lexer splits the line into shell words first), so no heredoc opens
+# on the first RUN, the FROM alpine line is a real instruction, and the
+# later RUN <<EOT is the only heredoc.
+run_case "heredoc marker inside double quotes is plain text" "" err "alpine" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo " <<EOT "
+FROM alpine
+RUN <<EOT
+echo hi
+EOT
+EOF
+
+# Oracle: docker.io/library/alpine:latest is resolved for the final stage,
+# the same as the double-quoted form.
+run_case "heredoc marker inside single quotes is plain text" "" err "alpine" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo ' <<EOT '
+FROM alpine
+RUN <<EOT
+echo hi
+EOT
+EOF
+
+# Oracle: only cgr.dev/chainguard/wolfi-base is resolved. A real heredoc
+# after a quoted string on the same line still opens, so the FROM in the
+# body is content.
+run_case "real heredoc after a quoted string still opens" "" ok "" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo "x" <<EOF2
+FROM ubuntu:22.04
+EOF2
+EOF
+
+# Oracle: only cgr.dev/chainguard/wolfi-base is resolved. The backslash
+# escapes the quote, so no string opens and the <<EOF2 word is a heredoc.
+run_case "escaped quote before a heredoc marker" "" ok "" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo \" <<EOF2
+FROM ubuntu:22.04
+EOF2
+EOF
+
+# Oracle: docker.io/library/alpine:latest is resolved. BuildKit's heredoc
+# lexer errors on the unbalanced quote and silently scans no heredocs on the
+# line, so the FROM alpine line is a real instruction. The gate cannot split
+# the line either and refuses the file instead.
+run_case "unbalanced quote on a heredoc-capable line fails closed" "" err "unbalanced double quote" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo "oops <<EOF2
+FROM alpine
+EOF
+
+# Oracle: only cgr.dev/chainguard/wolfi-base is resolved. BuildKit hardcodes
+# backslash as the escape character of its heredoc lexer even under
+# escape=`, so the quote is escaped and <<EOT is a heredoc whose body
+# swallows the FROM alpine line.
+run_case "heredoc lexing escapes with backslash even under escape=backtick" "" ok "" <<'EOF'
+# escape=`
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo \" <<EOT
+FROM alpine
+EOT
+EOF
+
+# Oracle: only cgr.dev/chainguard/wolfi-base is resolved. BuildKit detects
+# the heredoc (words split at the spaces the expansion carries), but an
+# expansion with whitespace shifts word boundaries this gate cannot follow,
+# so it refuses the file instead of guessing.
+run_case "expansion with whitespace on a heredoc line fails closed" "" err "not supported on a heredoc-capable instruction" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo ${A:-x y} <<EON
+FROM ubuntu:22.04
+EON
+EOF
+
 # Oracle: only cgr.dev/chainguard/wolfi-base is resolved; the stable
 # docker/dockerfile:1 frontend parses these constructs as the builtin
 # frontend does.
@@ -672,6 +1097,67 @@ EOF
 # stated in the header.
 run_case "non-stable syntax directive fails closed" "" err "syntax directive" <<'EOF'
 # syntax=docker/dockerfile:1-labs
+FROM cgr.dev/chainguard/wolfi-base
+EOF
+
+# Oracle: only cgr.dev/chainguard/wolfi-base is resolved; the outline run
+# resolves docker.io/docker/dockerfile:1 as the frontend, the same rolling
+# tag the bare spelling names.
+run_case "rolling syntax tag with the docker.io prefix is accepted" "" ok "" <<'EOF'
+# syntax=docker.io/docker/dockerfile:1
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo hi
+EOF
+
+# The adversarial reproduction from the 2026-09-14 check, verbatim. BuildKit
+# under the pinned docker/dockerfile:1.0 frontend treats the heredoc body as
+# ordinary instructions, so the FROM alpine inside it is a real stage and
+# the real build fails at the next line (Dockerfile parse error line 5:
+# unknown instruction: EOT); the 1.0 frontend has no outline subrequest, so
+# a --call=outline run fails with unsupported frontend capability
+# moby.buildkit.frontend.subrequests. The gate exits 1 on the directive at
+# line 1, before any heredoc parsing, naming the frontend.
+run_case "pinned syntax tag 1.0 is rejected before heredoc parsing" "" err "syntax directive 'docker/dockerfile:1.0'" <<'EOF'
+# syntax=docker/dockerfile:1.0
+FROM cgr.dev/chainguard/wolfi-base:latest AS app
+RUN echo build <<EOT
+FROM docker.io/library/alpine:latest AS smuggled
+EOT
+EOF
+
+# Oracle: a real build of the same shape under 1.3 fails with dockerfile
+# parse error on line 5: unknown instruction: EOT (did you mean ENV?); 1.3
+# also predates heredocs.
+run_case "pinned syntax tag 1.3 is rejected" "" err "syntax directive 'docker/dockerfile:1.3'" <<'EOF'
+# syntax=docker/dockerfile:1.3
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo hi
+EOF
+
+# Oracle: docker/dockerfile:1.4.0 parses heredocs, but its outline run was
+# answered by a different frontend (buildx pulled docker/dockerfile:1.8.1
+# by digest to service the subrequest), so an outline pass under this pin
+# vouches for the wrong parser. The gate accepts no pinned tag.
+run_case "pinned syntax tag 1.4.0 is rejected" "" err "syntax directive 'docker/dockerfile:1.4.0'" <<'EOF'
+# syntax=docker/dockerfile:1.4.0
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo hi
+EOF
+
+# Oracle: a real build fails to resolve docker.io/docker/dockerfile:1.99
+# (not found). The gate rejects the pin without asking any registry.
+run_case "pinned syntax tag 1.99 is rejected" "" err "syntax directive 'docker/dockerfile:1.99'" <<'EOF'
+# syntax=docker/dockerfile:1.99
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo hi
+EOF
+
+# Oracle: outline fails with invalid context name Docker/Dockerfile:1:
+# invalid reference format: repository name (Dockerfile) must be lowercase.
+# The gate matches the directive value byte for byte, so a case variant
+# never passes as the rolling tag.
+run_case "uppercase syntax directive value is rejected" "" err "syntax directive 'Docker/Dockerfile:1'" <<'EOF'
+# syntax=Docker/Dockerfile:1
 FROM cgr.dev/chainguard/wolfi-base
 EOF
 
@@ -762,6 +1248,15 @@ ARG BASE=${OTHER%-x}
 FROM ${BASE}
 EOF
 
+# Oracle: docker.io/library/alpine:3.20 is resolved (the colon-less -
+# modifier substitutes its default only when the variable is undeclared or
+# undefined, not when it is empty). The gate rejects the colon-less forms
+# instead of emulating them; a conservative rejection, stated in the header.
+run_case "colon-less minus modifier is rejected, not emulated" "" err "unsupported variable modifier" <<'EOF'
+ARG BASE
+FROM ${BASE-docker.io/library/alpine:3.20}
+EOF
+
 # BuildKit reads the quoted value as one assignment spanning whitespace.
 # The gate does not reassemble quoted whitespace; it refuses the line. A
 # conservative rejection, stated in the header.
@@ -777,6 +1272,72 @@ run_case "escape character in an ARG value fails closed" "" err "escape characte
 ARG OTHER=a\ BASE=alpine
 FROM cgr.dev/chainguard/wolfi-base
 EOF
+
+# Oracle: only cgr.dev/chainguard/wolfi-base is resolved. A UTF-8 byte order
+# mark before the parser directives is discarded and the escape directive
+# after it is honored, so the backtick continuation swallows the FROM alpine
+# text. The fixture is built with printf because a literal byte order mark in
+# this file would be invisible.
+printf '\357\273\277# escape=`\nFROM cgr.dev/chainguard/wolfi-base\nRUN echo hi `\nFROM alpine\n' > "$tmp/Dockerfile"
+out=$(sh "$SCRIPT" "$tmp/Dockerfile" 2>&1); rc=$?
+if [ "$rc" -eq 0 ]; then
+  pass=$((pass + 1))
+else
+  failcount=$((failcount + 1))
+  echo "FAIL: byte order mark before directives — expected pass, got exit $rc: $out"
+fi
+
+# Oracle: only cgr.dev/chainguard/wolfi-base is resolved. BuildKit splits
+# words on Unicode spaces (here a no-break space between echo and <<EON), so
+# the heredoc opens and its body swallows the FROM. The gate splits bytewise
+# and refuses the file instead of guessing. The fixture is built with printf
+# because a literal no-break space in this file would be invisible.
+printf 'FROM cgr.dev/chainguard/wolfi-base\nRUN echo\302\240<<EON\nFROM ubuntu:22.04\nEON\n' > "$tmp/Dockerfile"
+out=$(sh "$SCRIPT" "$tmp/Dockerfile" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  case "$out" in
+    *"Unicode space"*) pass=$((pass + 1)) ;;
+    *)
+      failcount=$((failcount + 1))
+      echo "FAIL: Unicode space on a heredoc line — error should name the Unicode space, got: $out"
+      ;;
+  esac
+else
+  failcount=$((failcount + 1))
+  echo "FAIL: Unicode space on a heredoc line — expected rejection, but it passed"
+fi
+
+# The following four fixtures are built with printf because their deciding
+# bytes (a lone CR, a NUL, CRLF endings) would be invisible or impossible in
+# a heredoc here. Each is fed to run_case by redirection, which keeps the
+# pass counters in this shell.
+
+# Oracle: outline fails with dockerfile parse error on line 1: FROM requires
+# either one or three arguments; BuildKit keeps the CR inside the line. The
+# gate used to split the line at the CR and check only the first FROM; now
+# a CR that is not part of a CRLF ending is rejected naming its line.
+printf 'FROM cgr.dev/chainguard/wolfi-base:latest\rFROM docker.io/library/alpine:latest\n' > "$tmp/bare-cr.bin"
+run_case "bare CR joining two FROMs is rejected" "" err "contains a CR" < "$tmp/bare-cr.bin"
+
+# Oracle: outline fails with dockerfile parse error on line 1: FROM requires
+# either one or three arguments; BuildKit keeps the NUL inside the line. The
+# gate used to let awk read the byte with implementation-defined results;
+# now any NUL is rejected naming its line.
+printf 'FROM cgr.dev/chainguard/wolfi-base:latest\000FROM docker.io/library/alpine:latest\n' > "$tmp/nul.bin"
+run_case "NUL byte in a FROM line is rejected" "" err "contains a NUL byte" < "$tmp/nul.bin"
+
+# Oracle: outline resolves cgr.dev/chainguard/wolfi-base:latest with exit 0;
+# CRLF line endings stay accepted.
+printf 'FROM cgr.dev/chainguard/wolfi-base:latest\r\nRUN echo hi\r\n' > "$tmp/crlf.bin"
+run_case "CRLF line endings are accepted" "" ok "" < "$tmp/crlf.bin"
+
+# Oracle: outline resolves cgr.dev/chainguard/wolfi-base:latest with exit 0,
+# so BuildKit reads a final CR with no LF as an ordinary line ending. Once
+# awk has split the file into records that CR cannot be told apart from a
+# CRLF ending, so the gate rejects it. A conservative rejection, stated in
+# the header.
+printf 'FROM cgr.dev/chainguard/wolfi-base:latest\r' > "$tmp/cr-eof.bin"
+run_case "CR as the final byte with no LF is rejected" "" err "contains a CR" < "$tmp/cr-eof.bin"
 
 # A Dockerfile whose bare name contains '=' must still be read: a POSIX awk
 # operand shaped like name=value is a variable assignment, not a filename, so
