@@ -140,6 +140,15 @@ FROM my-corp.example.io/chainguard-remote/python:latest-dev
 RUN echo hi
 EOF
 
+# The mirror prefix travels to awk through the environment. awk -v decodes
+# backslash sequences, so a prefix holding a literal backslash-n would turn
+# into a newline and stop matching a FROM that spells the same two
+# characters. The value below must stay exactly as written on both sides.
+run_case "mirror value with a backslash sequence is not decoded" "my\ncorp.example.io/cg" ok "" <<'EOF'
+FROM my\ncorp.example.io/cg/python:latest-dev
+RUN echo hi
+EOF
+
 run_case "configured aws account ecr external mirror is allowed" "123456789012.dkr.ecr.us-west-2.amazonaws.com/chainguard" ok "" <<'EOF'
 FROM 123456789012.dkr.ecr.us-west-2.amazonaws.com/chainguard/python:latest-dev
 RUN echo hi
@@ -483,6 +492,99 @@ EOF
 # linux/x86_64; the docker CLI normalizes the architecture alias.
 run_case "x86_64 normalizes to amd64" "" err "alpine:q-amd64" --platform linux/x86_64 <<'EOF'
 FROM alpine:q-${TARGETARCH}
+EOF
+
+# The normalization fixtures below pin containerd platforms.Normalize, rule
+# by rule. Each expected value comes from a real build of a scratch stage
+# labeling the automatic arguments, built with the fixture's --platform and
+# inspected (Docker 29.8, buildx 0.37).
+
+# Real build with --platform linux/amd64/v1 seeds TARGETVARIANT empty; the
+# v1 variant of amd64 is dropped, so the :- default applies.
+run_case "amd64/v1 normalizes to an empty TARGETVARIANT" "" err "alpine:none" --platform linux/amd64/v1 <<'EOF'
+FROM alpine:${TARGETVARIANT:-none}
+EOF
+
+# Real build with --platform linux/amd64/v2 seeds TARGETVARIANT=v2; only v1
+# is dropped for amd64.
+run_case "amd64/v2 keeps its TARGETVARIANT" "" err "alpine:v2" --platform linux/amd64/v2 <<'EOF'
+FROM alpine:${TARGETVARIANT:-none}
+EOF
+
+# Real build with --platform linux/arm64/8 seeds TARGETVARIANT empty; the
+# bare-8 spelling is dropped for arm64 like v8.
+run_case "arm64/8 normalizes to an empty TARGETVARIANT" "" err "alpine:none" --platform linux/arm64/8 <<'EOF'
+FROM alpine:${TARGETVARIANT:-none}
+EOF
+
+# Real build with --platform linux/arm seeds TARGETVARIANT=v7.
+run_case "bare arm gains the v7 variant" "" err "alpine:v7" --platform linux/arm <<'EOF'
+FROM alpine:${TARGETVARIANT:-none}
+EOF
+
+# Real builds with --platform linux/arm/5, /6, /7, /8 seed TARGETVARIANT
+# v5, v6, v7, v8; the numeric arm variants gain the v prefix.
+run_case "arm/5 normalizes to the v5 variant" "" err "alpine:v5" --platform linux/arm/5 <<'EOF'
+FROM alpine:${TARGETVARIANT:-none}
+EOF
+
+run_case "arm/6 normalizes to the v6 variant" "" err "alpine:v6" --platform linux/arm/6 <<'EOF'
+FROM alpine:${TARGETVARIANT:-none}
+EOF
+
+run_case "arm/7 normalizes to the v7 variant" "" err "alpine:v7" --platform linux/arm/7 <<'EOF'
+FROM alpine:${TARGETVARIANT:-none}
+EOF
+
+run_case "arm/8 normalizes to the v8 variant" "" err "alpine:v8" --platform linux/arm/8 <<'EOF'
+FROM alpine:${TARGETVARIANT:-none}
+EOF
+
+# Real build with --platform linux/arm/v8 seeds TARGETVARIANT=v8; only
+# arm64 drops a v8 variant, arm keeps it.
+run_case "arm/v8 keeps its TARGETVARIANT" "" err "alpine:v8" --platform linux/arm/v8 <<'EOF'
+FROM alpine:${TARGETVARIANT:-none}
+EOF
+
+# Real build with --platform linux/x86-64 seeds TARGETARCH=amd64, the same
+# as the x86_64 spelling.
+run_case "x86-64 normalizes to amd64" "" err "alpine:q-amd64" --platform linux/x86-64 <<'EOF'
+FROM alpine:q-${TARGETARCH}
+EOF
+
+# Real build with --platform linux/aarch64 seeds TARGETARCH=arm64 with an
+# empty TARGETVARIANT.
+run_case "aarch64 normalizes to arm64" "" err "alpine:q-arm64" --platform linux/aarch64 <<'EOF'
+FROM alpine:q-${TARGETARCH}
+EOF
+
+# Real build with --platform linux/armhf seeds TARGETARCH=arm and
+# TARGETVARIANT=v7.
+run_case "armhf normalizes to arm/v7" "" err "alpine:arm-v7" --platform linux/armhf <<'EOF'
+FROM alpine:${TARGETARCH}-${TARGETVARIANT:-none}
+EOF
+
+# Real build with --platform linux/armel seeds TARGETARCH=arm and
+# TARGETVARIANT=v6.
+run_case "armel normalizes to arm/v6" "" err "alpine:arm-v6" --platform linux/armel <<'EOF'
+FROM alpine:${TARGETARCH}-${TARGETVARIANT:-none}
+EOF
+
+# Real build with --platform linux/armhf/v6 seeds TARGETVARIANT=v7, not v6;
+# armhf replaces any variant it is given.
+run_case "armhf with a variant still normalizes to arm/v7" "" err "alpine:arm-v7" --platform linux/armhf/v6 <<'EOF'
+FROM alpine:${TARGETARCH}-${TARGETVARIANT:-none}
+EOF
+
+# Real build with --platform linux/i386 seeds TARGETARCH=386.
+run_case "i386 normalizes to 386" "" err "alpine:q-386" --platform linux/i386 <<'EOF'
+FROM alpine:q-${TARGETARCH}
+EOF
+
+# Real build with --platform linux/i386/v1 seeds TARGETARCH=386 with an
+# empty TARGETVARIANT; i386 drops any variant it is given.
+run_case "i386 drops any variant" "" err "alpine:386-none" --platform linux/i386/v1 <<'EOF'
+FROM alpine:${TARGETARCH}-${TARGETVARIANT:-none}
 EOF
 
 # Oracle: docker.io/library/alpine:3.20 is resolved under --platform

@@ -97,21 +97,32 @@ normalize_platform() {
       exit 2
       ;;
   esac
+  # Arch aliases and variant rules, matching containerd platforms.Normalize,
+  # which is what the docker CLI applies. Each rule is pinned by a real
+  # build in test-check-from-lines.sh (the two scripts share this function).
+  # x86_64 and x86-64 become amd64, aarch64 becomes arm64, i386 becomes 386
+  # and drops any variant, armhf becomes arm/v7 and armel arm/v6 replacing
+  # any variant; then amd64 drops a v1 variant, arm64 drops an 8 or v8
+  # variant, and arm maps no variant and 7 to v7 and 5, 6, 8 to v5, v6, v8.
+  # Every other variant passes through unchanged (amd64/v2, arm64/v9, and
+  # arm/v8 keep theirs).
   case "$NORM_ARCH" in
     x86_64|x86-64) NORM_ARCH=amd64 ;;
     aarch64) NORM_ARCH=arm64 ;;
-    i386) NORM_ARCH=386 ;;
-    armhf|armel)
-      if [ -n "$NORM_VARIANT" ]; then
-        echo "check-from-oracle.sh: --platform does not take a variant with '$NORM_ARCH'; spell the platform as $NORM_OS/arm/vN" >&2
-        exit 2
-      fi
-      if [ "$NORM_ARCH" = armhf ]; then NORM_VARIANT=v7; else NORM_VARIANT=v6; fi
-      NORM_ARCH=arm
+    i386) NORM_ARCH=386; NORM_VARIANT="" ;;
+    armhf) NORM_ARCH=arm; NORM_VARIANT=v7 ;;
+    armel) NORM_ARCH=arm; NORM_VARIANT=v6 ;;
+  esac
+  case "$NORM_ARCH" in
+    amd64) case "$NORM_VARIANT" in v1) NORM_VARIANT="" ;; esac ;;
+    arm64) case "$NORM_VARIANT" in 8|v8) NORM_VARIANT="" ;; esac ;;
+    arm)
+      case "$NORM_VARIANT" in
+        ''|7) NORM_VARIANT=v7 ;;
+        5|6|8) NORM_VARIANT="v$NORM_VARIANT" ;;
+      esac
       ;;
   esac
-  if [ "$NORM_ARCH" = arm64 ] && [ "$NORM_VARIANT" = v8 ]; then NORM_VARIANT=""; fi
-  if [ "$NORM_ARCH" = arm ] && [ -z "$NORM_VARIANT" ]; then NORM_VARIANT=v7; fi
 }
 while :; do
   case "${1-}" in

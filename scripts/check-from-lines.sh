@@ -107,9 +107,13 @@
 #     scope on every build, so a FROM (or a global ARG default) can read
 #     them with no declaration. When the gate runs with --platform it seeds
 #     the same values, normalized the way the docker CLI normalizes a
-#     platform string (x86_64 and aarch64 become amd64 and arm64, arm64/v8
-#     drops its variant, bare arm becomes arm/v7; each verified against a
-#     real build). TARGETVARIANT and the OSVERSION arguments are set to the
+#     platform string (containerd platforms.Normalize: x86_64 and aarch64
+#     become amd64 and arm64, i386 becomes 386 and drops any variant, armhf
+#     and armel become arm/v7 and arm/v6 replacing any variant, amd64 drops
+#     a v1 variant, arm64 drops an 8 or v8 variant, bare arm becomes arm/v7
+#     and the numeric arm variants 5, 6, 7, 8 gain the v prefix; each rule
+#     verified against a real build). TARGETVARIANT and the OSVERSION
+#     arguments are set to the
 #     empty string when the platform has none, which matters for the :- and
 #     :+ modifiers. A bare global redeclaration (ARG TARGETARCH) keeps the
 #     seeded value, a global declaration with a default replaces it, and a
@@ -156,10 +160,8 @@ TARGET_SET=0
 
 # normalize_platform VALUE FLAG: split VALUE into NORM_OS, NORM_ARCH,
 # NORM_VARIANT and apply the normalizations the docker CLI applies before
-# the builder sees the platform, each verified against a real build:
-# x86_64 and x86-64 become amd64, aarch64 becomes arm64, i386 becomes 386,
-# armhf and armel become arm/v7 and arm/v6, arm64 drops a v8 variant, and
-# bare arm gains v7.
+# the builder sees the platform (containerd platforms.Normalize; the rules
+# are listed at the case block below, each verified against a real build).
 normalize_platform() {
   np_val=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
   case "$np_val" in
@@ -201,21 +203,32 @@ normalize_platform() {
       exit 2
       ;;
   esac
+  # Arch aliases and variant rules, matching containerd platforms.Normalize,
+  # which is what the docker CLI applies. Each rule is pinned by a real
+  # build in test-check-from-lines.sh (the two scripts share this function).
+  # x86_64 and x86-64 become amd64, aarch64 becomes arm64, i386 becomes 386
+  # and drops any variant, armhf becomes arm/v7 and armel arm/v6 replacing
+  # any variant; then amd64 drops a v1 variant, arm64 drops an 8 or v8
+  # variant, and arm maps no variant and 7 to v7 and 5, 6, 8 to v5, v6, v8.
+  # Every other variant passes through unchanged (amd64/v2, arm64/v9, and
+  # arm/v8 keep theirs).
   case "$NORM_ARCH" in
     x86_64|x86-64) NORM_ARCH=amd64 ;;
     aarch64) NORM_ARCH=arm64 ;;
-    i386) NORM_ARCH=386 ;;
-    armhf|armel)
-      if [ -n "$NORM_VARIANT" ]; then
-        echo "check-from-lines.sh: $2 does not take a variant with '$NORM_ARCH'; spell the platform as $NORM_OS/arm/vN" >&2
-        exit 2
-      fi
-      if [ "$NORM_ARCH" = armhf ]; then NORM_VARIANT=v7; else NORM_VARIANT=v6; fi
-      NORM_ARCH=arm
+    i386) NORM_ARCH=386; NORM_VARIANT="" ;;
+    armhf) NORM_ARCH=arm; NORM_VARIANT=v7 ;;
+    armel) NORM_ARCH=arm; NORM_VARIANT=v6 ;;
+  esac
+  case "$NORM_ARCH" in
+    amd64) case "$NORM_VARIANT" in v1) NORM_VARIANT="" ;; esac ;;
+    arm64) case "$NORM_VARIANT" in 8|v8) NORM_VARIANT="" ;; esac ;;
+    arm)
+      case "$NORM_VARIANT" in
+        ''|7) NORM_VARIANT=v7 ;;
+        5|6|8) NORM_VARIANT="v$NORM_VARIANT" ;;
+      esac
       ;;
   esac
-  if [ "$NORM_ARCH" = arm64 ] && [ "$NORM_VARIANT" = v8 ]; then NORM_VARIANT=""; fi
-  if [ "$NORM_ARCH" = arm ] && [ -z "$NORM_VARIANT" ]; then NORM_VARIANT=v7; fi
 }
 
 while :; do
@@ -294,8 +307,9 @@ if [ -n "$PLATFORM" ]; then
   B_PLAT="$B_OS/$B_ARCH${B_VAR:+/$B_VAR}"
 fi
 
-# Build args travel through the environment, not -v: awk -v runs backslash
-# escape processing on the value, which would corrupt a value containing one.
+# Build args and the mirror prefix travel through the environment, not -v:
+# awk -v runs backslash escape processing on the value, which would corrupt
+# a value containing one.
 # The Dockerfile is fed on stdin, not as an operand: a bare operand shaped
 # like name=value is treated by POSIX awk as a variable assignment, so a file
 # literally named "from=allowed" would never be read and the gate would pass.
@@ -305,7 +319,7 @@ fi
 # The platform values reach awk through -v, which is safe here: they are
 # validated above to letters, digits, and [_./-], none of which awk escape
 # processing touches.
-CHECK_FROM_BUILD_ARGS="$BUILD_ARGS" LC_ALL=C awk -v mirror="$MIRROR" \
+CHECK_FROM_BUILD_ARGS="$BUILD_ARGS" CHECK_FROM_MIRROR="$MIRROR" LC_ALL=C awk \
   -v platform_set="$PLATFORM_SET" -v tplat="$T_PLAT" -v tos="$T_OS" \
   -v tarch="$T_ARCH" -v tvar="$T_VAR" -v bplat="$B_PLAT" -v bos="$B_OS" \
   -v barch="$B_ARCH" -v bvar="$B_VAR" -v target_set="$TARGET_SET" \
@@ -577,7 +591,9 @@ BEGIN {
   buf = ""; bufline = 0
   directive_mode = 1
   HD_N = 0; HD_I = 1
-  mirror = tolower(mirror)
+  # The same normalization check-from-oracle.sh applies to its mirror:
+  # lowercase, strip trailing slashes, trim spaces and tabs, in that order.
+  mirror = tolower(ENVIRON["CHECK_FROM_MIRROR"])
   sub(/\/+$/, "", mirror)
   sub(/^[ \t]+/, "", mirror); sub(/[ \t]+$/, "", mirror)
   n_ba = split(ENVIRON["CHECK_FROM_BUILD_ARGS"], ba_lines, "\n")
