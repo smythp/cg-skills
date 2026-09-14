@@ -230,13 +230,16 @@ plus the build context path. The two scripts share the option set:
 `--mirror <prefix>`, `--platform <os/arch[/variant]>`,
 `--build-platform <os/arch[/variant]>`, `--target <stage>`, repeated
 `--build-arg NAME=value`, and repeated `--build-context NAME=SOURCE`. For example:
-`timeout -k 30 660 scripts/check-from-oracle.sh --platform <p> --build-arg NAME=value Dockerfile.chainguard <context>`
-(its internal outline call is itself bounded at 600 seconds). It evaluates
-the file with BuildKit's own frontend, which loads image metadata and
-executes nothing, and checks every reference the builder actually resolves
-for the given target and platform.
+`timeout -k 30 1260 scripts/check-from-oracle.sh --platform <p> --build-arg NAME=value Dockerfile.chainguard <context>`
+(it makes two internal buildx calls, each bounded at 600 seconds). It takes
+the stage graph from BuildKit's own frontend, checks every base image in it
+against the allowlist, then resolves the file, which loads image metadata
+and executes nothing. A `COPY --from`, `RUN --mount=from`, or ADD that
+pulls an external image is an artifact source, not a base: the run prints
+it as one and the report names it, per the artifact-copy rule in
+`references/from-and-registry-rules.md`.
 
-Any reference outside the allowlist
+Any base image outside the allowlist
 fails the run — fix it, do not argue with the gate. Then confirm every stage
 that used `USER root` ends with the image's user. This is the
 machine-checkable intermediate output: paste both OK lines into your reply

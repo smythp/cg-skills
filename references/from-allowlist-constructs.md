@@ -2,16 +2,25 @@
 
 The FROM gate is two scripts. `scripts/check-from-lines.sh` reads every FROM
 line textually, reachable or not, by reimplementing the parsing rules below.
-`scripts/check-from-oracle.sh` asks BuildKit itself, by evaluating the file
-with `timeout -k 30 600 docker buildx build --call=outline,format=json
---progress=plain` and checking every reference the builder resolves for the
-given target and platform. The oracle requires positive evidence in the run
-output that the outline was performed (the load-build-definition step and
-the JSON outline result), refuses to answer when a BuildKit source policy
-is configured in the environment, and treats any line containing "load
-metadata for" as a reference whatever its bracketed step label. The oracle
-covers exactly what the build will pull; the textual check also covers
-stages the target does not reach. A migration passes only when both pass.
+`scripts/check-from-oracle.sh` asks BuildKit itself, in two bounded calls.
+`timeout -k 30 600 docker buildx build --call=targets,format=json
+--progress=plain` returns every stage with its base exactly as written,
+from BuildKit's own parse; the script expands each base with the rules
+below (global ARGs, the user's overrides, the automatic arguments as
+seeded, single-quoted defaults literal), substitutes the named build
+contexts, and requires every base in that FROM set to be on the allowlist,
+failing closed on anything it cannot expand or classify. Then
+`timeout -k 30 600 docker buildx build --call=outline,format=json
+--progress=plain` resolves the file; any line containing "load metadata
+for" is a reference whatever its bracketed step label, a load matching the
+FROM set is a base already checked, and every other load is printed as an
+external artifact source and allowed (see the artifact sources section).
+Both calls must show positive evidence they ran (the load-build-definition
+step plus their JSON result), and the script refuses to answer when a
+BuildKit source policy
+is configured in the environment. The oracle
+covers every stage the file declares, like the textual check. A migration
+passes only when both pass.
 
 Every construct below was enumerated from the Dockerfile frontend vendored
 in the Docker 29.8 daemon (BuildKit's `frontend/dockerfile` at the moby
@@ -32,6 +41,7 @@ match BuildKit it exits 1 naming the construct; those rows say so.
 - [Variable expansion forms](#variable-expansion-forms)
 - [FROM syntax](#from-syntax)
 - [Named build contexts](#named-build-contexts)
+- [Artifact sources](#artifact-sources)
 
 ## Tokenization and quoting on heredoc lines
 
@@ -176,6 +186,7 @@ redeclaration stays allowed.
 | FROM token count after flags | one image reference, or reference AS name; every other count fails with "FROM requires either one or three arguments" (three tokens whose middle one is not AS draw the same message) | same, quoting the line | FROM with two extra tokens is rejected; FROM followed by a bare AS is rejected; FROM with a reference and an AS name stays allowed |
 | `AS alias` stage names | letters, digits, `_ . -`, starting with a letter; case-insensitive reuse | same, image-shaped aliases rejected | image-shaped alias with slash is rejected (existing) |
 | FROM of an earlier alias | stage reference, not a pull | same | stage alias is allowed (existing) |
+| FROM of a later stage (forward reference) | stage reference too; BuildKit resolves stage names anywhere in the file (verified with an outline run that loads only the later stage's base) | the textual gate rejects it, a conservative sequential-alias rule; the oracle treats a base matching any stage name as a stage reference | oracle shim case: a base naming an earlier stage is an alias, not a pull |
 | `scratch` | the empty base for the lowercase spelling only, no metadata load; FROM SCRATCH fails to parse as a stage name (repository name library/SCRATCH must be lowercase) | matched case-sensitively; other spellings fall through to the allowlist check and are rejected | scratch is allowed (existing); FROM SCRATCH is rejected as an image reference |
 | BuildKit source policy (`EXPERIMENTAL_BUILDKIT_SOURCE_POLICY` in the environment) | converts a reference after the log names the original | the oracle exits 1 naming the variable when it is set; the textual gate reads no environment beyond its own inputs | source policy shim case in test-check-from-oracle.sh |
 
@@ -203,3 +214,18 @@ build, on Docker 29.8.0 with buildx v0.37.0.
 | repeated context name | the last value wins | same | repeated context name applies the last value (allowed, rejected) |
 | context name matching no FROM and no stage a FROM uses | ignored for bases (a COPY --from source may still use it, including from a local directory) | same | context whose name matches nothing is ignored; local-directory context for a copy source is ignored by the FROM gate |
 | context name that is not a valid reference | buildx refuses the invocation (invalid context name, lowercase repository rule) | exit 1 naming the context | invalid context name is refused |
+
+## Artifact sources
+
+`COPY --from=IMAGE`, `RUN --mount=from=IMAGE`, and ADD from an image pull
+an external artifact into the build without making it a base.
+`references/from-and-registry-rules.md` permits artifact copies and asks
+the report to name them, so the gate does not reject them. Only the FROM
+set meets the allowlist; the oracle prints every non-base load as an
+external artifact source for the report.
+
+| Construct | BuildKit | Gate | Fixture |
+|---|---|---|---|
+| `COPY --from=IMAGE`, `RUN --mount=from=IMAGE`, ADD from an image | a metadata load, indistinguishable from a base load by its step label (verified; both print as [internal]) | the load is matched against the FROM set from the targets call; a non-base load is printed as an external artifact source and allowed | oracle test case 7; external COPY --from artifact source is not a base; external RUN mount source is not a base; bracketed-label shim case |
+| a reference that is both a FROM base and a copy source | one load serves both | it is in the FROM set, so it is checked as a base; the artifact allowance cannot launder it | a base doubling as a copy source is still a base; oracle test case 7 |
+| an artifact source that fails to resolve | the build fails | the outline run fails, which is not a pass | covered by the unresolvable-base oracle case (same failure path) |

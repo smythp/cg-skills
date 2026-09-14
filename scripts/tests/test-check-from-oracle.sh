@@ -10,22 +10,30 @@
 #      normalizes away. The oracle rejects all three regardless of how the
 #      textual parser reads them, because it asks BuildKit itself.
 #   2. a multi-stage file whose runtime stage is cgr.dev/chainguard/static —
-#      every resolved base allowed, exit 0
+#      every base allowed, exit 0
 #   3. a file whose only external base sits on a configured mirror prefix —
 #      allowed with --mirror, rejected without
-#   4. a file whose base cannot resolve — exit 1 and an explicit
-#      not-a-pass message, never a pass
-#   5. --build-platform: the BUILD* overrides reach the frontend (the run
-#      names alpine:b-arm64, not the daemon's own architecture)
+#   4. an off-allowlist base is rejected from the stage graph without any
+#      resolution, and an allowed base that fails to resolve is an
+#      explicit not-a-pass, never a pass
+#   5. --build-platform: the BUILD* overrides reach the frontend (the
+#      failing run names the b-arm64 tag, not the daemon's own
+#      architecture)
 #   6. a named build context that overrides a Chainguard FROM to alpine —
-#      the [context NAME] labeled reference is rejected, and the same
+#      the substituted base is rejected in canonical form, and the same
 #      override pointed at another Chainguard image passes
+#   7. artifact sources: COPY --from and RUN --mount=from references are
+#      printed as external artifact sources and allowed, and a reference
+#      that is both a base and a copy source is rejected as a base
 #
 # The shim cases need no container engine: a docker shim on PATH prints
-# canned output (and a timeout shim shortens the bound), pinning the exit
-# status for empty output, unrelated output, a bracketed-label reference
-# line that must be REJECTED, an unparsable reference line, a scratch-only
-# success with evidence, runs missing either evidence marker, a nonzero
+# canned output per call (targets and outline separately, and a timeout
+# shim shortens the bound), pinning the exit
+# status for empty output, unrelated output, a bracketed-label load that
+# must classify as an artifact source, an unparsable reference line, a
+# scratch-only stage graph, an off-allowlist stage, an alias base, a JSON
+# escape in a base, targets runs that fail or lack evidence, outline runs
+# missing either evidence marker, a nonzero
 # docker exit, a timed-out run, a configured source policy, and a context
 # directory named --help, whose name must reach docker as a path after --,
 # never as an option.
@@ -177,36 +185,55 @@ else
   esac
 fi
 
-echo "--- case 4: unresolvable base is not a pass ---"
+echo "--- case 4: off-allowlist base with an unresolvable host is rejected ---"
+# The FROM set comes from the targets call, which resolves nothing, so an
+# off-allowlist base is rejected in canonical form before any resolution.
 cat > "$tmp/Dockerfile" <<'EOF'
 FROM resolv-fail.invalid/image:latest
 EOF
 out=$(sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
 if [ "$rc" -eq 0 ]; then
-  bad "unresolvable base: expected exit 1, got a pass"
+  bad "unresolvable off-allowlist base: expected exit 1, got a pass"
+else
+  case "$out" in
+    *"REJECTED resolv-fail.invalid/image:latest"*) ok ;;
+    *) bad "unresolvable off-allowlist base: should reject it by name, got: $out" ;;
+  esac
+fi
+
+echo "--- case 4b: an allowed base that fails to resolve is not a pass ---"
+# The FROM set passes (cgr.dev), so the outline runs and fails on the
+# missing image; a resolution failure is never a pass.
+cat > "$tmp/Dockerfile" <<'EOF'
+FROM cgr.dev/chainguard/no-such-image-zqxw:latest
+EOF
+out=$(sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -eq 0 ]; then
+  bad "unresolvable allowed base: expected exit 1, got a pass"
 else
   case "$out" in
     *"not a pass"*) ok ;;
-    *) bad "unresolvable base: should say it is not a pass, got: $out" ;;
+    *) bad "unresolvable allowed base: should say it is not a pass, got: $out" ;;
   esac
 fi
 
 echo "--- case 5: --build-platform override reaches the frontend ---"
 # The BUILD* overrides must reach BuildKit: on this daemon the natural
 # BUILDARCH is the daemon's own architecture, so only an applied override
-# makes the frontend resolve alpine:b-arm64. That tag does not exist, so
-# the run fails naming it (and if it ever existed, the REJECTED line would
-# name it instead); either way the ref in the output is the proof.
+# makes the frontend resolve the b-arm64 reference. The base is on the
+# allowlist, so the FROM set passes and the outline runs; the tag does not
+# exist, so the run fails naming it, and the named ref is the proof the
+# override reached the frontend.
 cat > "$tmp/Dockerfile" <<'EOF'
-FROM alpine:b-${BUILDARCH}
+FROM cgr.dev/chainguard/wolfi-base:b-${BUILDARCH}
 EOF
 out=$(sh "$SCRIPT" --platform linux/amd64 --build-platform linux/arm64 "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
 if [ "$rc" -eq 0 ]; then
   bad "build-platform override: expected a failing run, got a pass"
 else
   case "$out" in
-    *"alpine:b-arm64"*) ok ;;
-    *) bad "build-platform override: the output should name alpine:b-arm64, got: $out" ;;
+    *"b-arm64"*) ok ;;
+    *) bad "build-platform override: the output should name the b-arm64 tag, got: $out" ;;
   esac
 fi
 
@@ -225,8 +252,8 @@ if [ "$rc" -eq 0 ]; then
   bad "context override to alpine: expected rejection, got a pass"
 else
   case "$out" in
-    *"REJECTED alpine:latest"*) ok ;;
-    *) bad "context override to alpine: should reject alpine:latest, got: $out" ;;
+    *"REJECTED docker.io/library/alpine:latest"*) ok ;;
+    *) bad "context override to alpine: should reject alpine in canonical form, got: $out" ;;
   esac
 fi
 out=$(sh "$SCRIPT" --build-context cgr.dev/chainguard/wolfi-base=docker-image://cgr.dev/chainguard/static:latest \
@@ -240,6 +267,51 @@ else
   esac
 fi
 
+echo "--- case 7: artifact sources are reported, not rejected ---"
+# The pull-request reproduction. COPY --from and RUN --mount=from name
+# external artifact sources, which the registry rules permit as report
+# entries; only FROM bases meet the allowlist. A reference that is both a
+# base and a copy source is a base and is rejected.
+cat > "$tmp/Dockerfile" <<'EOF'
+FROM cgr.dev/chainguard/static:latest
+COPY --from=busybox:latest /bin/busybox /busybox
+EOF
+out=$(sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  bad "copy artifact source: expected pass, exit $rc: $out"
+else
+  case "$out" in
+    *"external artifact source docker.io/library/busybox:latest"*) ok ;;
+    *) bad "copy artifact source: should report busybox as an artifact source, got: $out" ;;
+  esac
+fi
+cat > "$tmp/Dockerfile" <<'EOF'
+FROM alpine
+COPY --from=alpine /etc/os-release /o
+EOF
+out=$(sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -eq 0 ]; then
+  bad "base doubling as copy source: expected rejection, got a pass"
+else
+  case "$out" in
+    *"REJECTED docker.io/library/alpine:latest"*) ok ;;
+    *) bad "base doubling as copy source: should reject alpine as a base, got: $out" ;;
+  esac
+fi
+cat > "$tmp/Dockerfile" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN --mount=from=alpine,target=/mnt echo hi
+EOF
+out=$(sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  bad "mount artifact source: expected pass, exit $rc: $out"
+else
+  case "$out" in
+    *"external artifact source docker.io/library/alpine:latest"*) ok ;;
+    *) bad "mount artifact source: should report alpine as an artifact source, got: $out" ;;
+  esac
+fi
+
 # ---------------------------------------------------------------------------
 # Shim cases: no container engine. A docker shim on PATH prints the canned
 # output named by SHIM_OUT, logs its arguments to SHIM_ARGS, sleeps
@@ -249,29 +321,61 @@ fi
 
 shimdir="$tmp/shim"
 mkdir -p "$shimdir"
-real_timeout=$(command -v timeout || command -v gtimeout)
+# The docker shim answers the script's two buildx calls separately: the
+# targets call gets SHIM_OUT_TARGETS and exits SHIM_RC_TARGETS, everything
+# else gets SHIM_OUT and exits SHIM_RC.
 cat > "$shimdir/docker" <<'EOF'
 #!/bin/sh
 [ -n "${SHIM_ARGS:-}" ] && printf '%s\n' "$@" >> "$SHIM_ARGS"
 [ -n "${SHIM_SLEEP:-}" ] && exec sleep "$SHIM_SLEEP"
+case " $* " in
+  *" --call=targets,format=json "*)
+    [ -n "${SHIM_OUT_TARGETS:-}" ] && cat "$SHIM_OUT_TARGETS"
+    exit "${SHIM_RC_TARGETS:-0}"
+    ;;
+esac
 [ -n "${SHIM_OUT:-}" ] && cat "$SHIM_OUT"
 exit "${SHIM_RC:-0}"
 EOF
 chmod 755 "$shimdir/docker"
-cat > "$shimdir/timeout" <<EOF
+# The timeout shim re-bounds the script's timeout call at 2 seconds so the
+# timed-out case finishes quickly. It resolves the real binary with the
+# same three tiers as the scripts (timeout, then gtimeout, then none); with
+# neither installed the shim runs the command unbounded, and the timed-out
+# case then waits out the shim sleep and fails on the empty output instead.
+# The absolute path matters: the shim itself is named timeout and sits
+# first on PATH, so exec of the bare name would loop on the shim forever.
+if command -v timeout >/dev/null 2>&1; then real_timeout=$(command -v timeout)
+elif command -v gtimeout >/dev/null 2>&1; then real_timeout=$(command -v gtimeout)
+else real_timeout=""
+fi
+if [ -n "$real_timeout" ]; then
+  cat > "$shimdir/timeout" <<EOF
 #!/bin/sh
 # check-from-oracle.sh calls: timeout -k GRACE LIMIT docker ...
 shift 3
 exec "$real_timeout" -k 2 2 "\$@"
 EOF
+else
+  cat > "$shimdir/timeout" <<'EOF'
+#!/bin/sh
+# no timeout binary on this machine; run the command unbounded
+shift 3
+exec "$@"
+EOF
+fi
 chmod 755 "$shimdir/timeout"
 
 # shim_case NAME OUTFILE RC EXPECT CONTAINS [ARG...]: run the oracle against
-# the shim with SHIM_OUT=OUTFILE and SHIM_RC=RC; EXPECT is the expected exit
+# the shim with SHIM_OUT=OUTFILE and SHIM_RC=RC for the outline call; the
+# targets call answers with $sc_targets (out-targets-good unless a case
+# sets it) and exits ${sc_targets_rc:-0}. EXPECT is the expected exit
 # (0 or 1) and CONTAINS a string the output must hold.
 shim_case() {
   sc_name="$1"; sc_out="$2"; sc_rc="$3"; sc_expect="$4"; sc_contains="$5"; shift 5
-  out=$(SHIM_OUT="$sc_out" SHIM_RC="$sc_rc" PATH="$shimdir:$PATH" \
+  out=$(SHIM_OUT="$sc_out" SHIM_RC="$sc_rc" \
+        SHIM_OUT_TARGETS="${sc_targets:-$tmp/out-targets-good}" \
+        SHIM_RC_TARGETS="${sc_targets_rc:-0}" PATH="$shimdir:$PATH" \
         sh "$SCRIPT" "$@" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
   if [ "$rc" -ne "$sc_expect" ]; then
     bad "$sc_name: expected exit $sc_expect, got $rc: $out"
@@ -288,8 +392,9 @@ FROM cgr.dev/chainguard/wolfi-base
 EOF
 
 # Canned outputs, shaped like real buildx 0.37 plain-progress runs with the
-# outline JSON result on stdout (verified against real runs; the JSON
-# "sources" object prints for every file, named target stage or not).
+# JSON result on stdout (verified against real runs; the JSON prints for
+# every file, named target stage or not; inside each target "name" comes
+# before "base").
 cat > "$tmp/out-good" <<'EOF'
 #0 building with "default" instance using docker driver
 
@@ -300,6 +405,87 @@ cat > "$tmp/out-good" <<'EOF'
 #2 [internal] load metadata for cgr.dev/chainguard/wolfi-base:latest
 #2 DONE 0.1s
 {
+  "sources": [
+    "RlJPTQo="
+  ]
+}
+EOF
+
+cat > "$tmp/out-targets-good" <<'EOF'
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 84B done
+#1 DONE 0.0s
+{
+  "targets": [
+    {
+      "default": true,
+      "base": "cgr.dev/chainguard/wolfi-base",
+      "location": {
+        "ranges": [
+          {
+            "start": {
+              "line": 1
+            },
+            "end": {
+              "line": 1
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "sources": [
+    "RlJPTQo="
+  ]
+}
+EOF
+
+sed 's/"base": "cgr.dev\/chainguard\/wolfi-base"/"base": "alpine"/' \
+  "$tmp/out-targets-good" > "$tmp/out-targets-alpine"
+
+sed 's/"base": "cgr.dev\/chainguard\/wolfi-base"/"base": "scratch"/' \
+  "$tmp/out-targets-good" > "$tmp/out-targets-scratch"
+
+# A base value carrying a JSON escape (as buildx would print for a base
+# containing a quote); the script must refuse to decode it.
+cat > "$tmp/out-targets-escape" <<'EOF'
+#1 [internal] load build definition from Dockerfile
+#1 DONE 0.0s
+{
+  "targets": [
+    {
+      "default": true,
+      "base": "alp\"ine",
+      "location": {}
+    }
+  ],
+  "sources": [
+    "RlJPTQo="
+  ]
+}
+EOF
+
+# A named builder stage plus an unnamed default stage based on it; the
+# pairing of each "name" with the following "base" and the alias
+# classification of the second base both matter here.
+cat > "$tmp/out-targets-multi" <<'EOF'
+#1 [internal] load build definition from Dockerfile
+#1 DONE 0.0s
+{
+  "targets": [
+    {
+      "name": "builder",
+      "base": "cgr.dev/chainguard/wolfi-base",
+      "location": {}
+    },
+    {
+      "default": true,
+      "base": "builder",
+      "location": {}
+    }
+  ],
   "sources": [
     "RlJPTQo="
   ]
@@ -330,19 +516,38 @@ sed 's/^#2 DONE.*/#4 [internal] load metadata for two tokens/' \
 : > "$tmp/out-empty"
 
 echo "--- shim cases ---"
-shim_case "empty output" "$tmp/out-empty" 0 1 "no evidence"
-shim_case "unrelated output" "$tmp/out-unrelated" 0 1 "no evidence"
-shim_case "bracketed-label reference is rejected" "$tmp/out-mixed" 0 1 \
-  "REJECTED docker.io/library/alpine:latest"
+shim_case "empty outline output" "$tmp/out-empty" 0 1 "no evidence"
+shim_case "unrelated outline output" "$tmp/out-unrelated" 0 1 "no evidence"
+# The [linux/amd64 internal] label must parse like any other; the load is
+# not in the FROM set, so it is an artifact source, printed and allowed.
+shim_case "bracketed-label load is classified as an artifact source" "$tmp/out-mixed" 0 0 \
+  "external artifact source docker.io/library/alpine:latest"
 shim_case "allowed reference passes" "$tmp/out-good" 0 0 \
   "allowed  cgr.dev/chainguard/wolfi-base:latest"
-shim_case "scratch-only success with evidence passes" "$tmp/out-scratch" 0 0 \
-  "resolve no external base images"
 shim_case "missing load-build-definition step fails" "$tmp/out-nodef" 0 1 "no evidence"
 shim_case "missing outline JSON result fails" "$tmp/out-nojson" 0 1 "no evidence"
 shim_case "unparsable reference line fails naming it" "$tmp/out-unparsable" 0 1 \
   "load metadata for two tokens"
 shim_case "nonzero docker exit fails" "$tmp/out-good" 3 1 "outline run failed (exit 3)"
+# An off-allowlist base in the stage graph is rejected in canonical form
+# before the outline ever runs.
+sc_targets="$tmp/out-targets-alpine"
+shim_case "off-allowlist stage in the targets output is rejected" "$tmp/out-good" 0 1 \
+  "REJECTED docker.io/library/alpine:latest"
+sc_targets="$tmp/out-targets-scratch"
+shim_case "scratch-only stage graph with evidence passes" "$tmp/out-scratch" 0 0 \
+  "resolve no external base images"
+sc_targets="$tmp/out-targets-multi"
+shim_case "a base naming an earlier stage is an alias, not a pull" "$tmp/out-good" 0 0 \
+  "allowed  cgr.dev/chainguard/wolfi-base:latest"
+sc_targets="$tmp/out-targets-escape"
+shim_case "JSON escape in a base fails closed" "$tmp/out-good" 0 1 "JSON escape"
+sc_targets="$tmp/out-unrelated"
+shim_case "targets output without evidence fails" "$tmp/out-good" 0 1 "no evidence"
+sc_targets=""
+sc_targets_rc=3
+shim_case "nonzero targets exit fails" "$tmp/out-good" 0 1 "targets run failed (exit 3)"
+sc_targets_rc=""
 
 echo "--- shim case: timed-out run ---"
 out=$(SHIM_SLEEP=10 PATH="$shimdir:$PATH" sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?

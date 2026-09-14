@@ -839,6 +839,29 @@ run_case "invalid context name is refused" "" err "not a valid image reference" 
 FROM cgr.dev/chainguard/wolfi-base
 EOF
 
+# --- artifact sources ------------------------------------------------------
+# COPY --from and RUN --mount=from name external artifact sources, which
+# the registry rules permit as report entries; only FROM lines meet the
+# allowlist. The oracle prints each one for the report; this gate reads
+# FROM lines only. Oracle: the run passes with the artifact source printed.
+run_case "external COPY --from artifact source is not a base" "" ok "" <<'EOF'
+FROM cgr.dev/chainguard/static:latest
+COPY --from=busybox:latest /bin/busybox /busybox
+EOF
+
+run_case "external RUN mount source is not a base" "" ok "" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN --mount=from=alpine,target=/mnt echo hi
+EOF
+
+# Oracle: docker.io/library/alpine:latest is rejected as a base; a
+# reference that is both a FROM base and a COPY source is a base, so the
+# artifact allowance cannot launder it.
+run_case "a base doubling as a copy source is still a base" "" err "alpine" <<'EOF'
+FROM alpine
+COPY --from=alpine /etc/os-release /o
+EOF
+
 # Oracle: the final stage resolves docker.io/library/alpine:latest. The
 # FROM inside the heredoc body is file content, so it registers no stage
 # alias, and the later "FROM alpine" is an external image.

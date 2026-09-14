@@ -355,3 +355,6 @@ image reference could launder a forbidden registry through the check.
 copies, not base images, and the FROM gate does not cover them. Leave them
 as they are unless the user asks to migrate them too, and name them in the
 report so the user knows an upstream artifact source remains.
+`scripts/check-from-oracle.sh` prints each one as an external artifact
+source, which is the list the report names; the same applies to
+`RUN --mount=from=<image>` and to ADD pulling an image.
