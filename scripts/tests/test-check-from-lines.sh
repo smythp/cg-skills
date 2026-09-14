@@ -22,17 +22,26 @@ trap 'rm -rf "$tmp"' EXIT INT TERM
 pass=0
 failcount=0
 
-# run_case NAME MIRROR EXPECT CONTAINS [BUILDARG...]  (dockerfile on stdin)
+# run_case NAME MIRROR EXPECT CONTAINS [ARG...]  (dockerfile on stdin)
 #   EXPECT: ok  -> script must exit 0
 #           err -> script must exit non-zero and output must contain CONTAINS
-#   Each extra argument is passed as --build-arg NAME=value.
+#   An extra argument of --platform, --build-platform, or --target passes
+#   through with its following value; every other extra argument is passed
+#   as --build-arg NAME=value.
 run_case() {
   name="$1"; mirror="$2"; expect="$3"; contains="$4"; shift 4
   cat > "$tmp/Dockerfile"
-  # Fixture build-arg values contain no whitespace, so a string build with
+  # Fixture argument values contain no whitespace, so a string build with
   # unquoted expansion below is safe.
   extra=""
-  for a in "$@"; do extra="$extra --build-arg $a"; done
+  pend=0
+  for a in "$@"; do
+    if [ "$pend" -eq 1 ]; then extra="$extra $a"; pend=0; continue; fi
+    case "$a" in
+      --platform|--build-platform|--target) extra="$extra $a"; pend=1 ;;
+      *) extra="$extra --build-arg $a" ;;
+    esac
+  done
   if [ -n "$mirror" ]; then
     out=$(sh "$SCRIPT" --mirror "$mirror" $extra "$tmp/Dockerfile" 2>&1); rc=$?
   else
@@ -398,6 +407,117 @@ run_case "build-arg with no matching ARG declaration is ignored" "" err '${BASE}
 ARG BASE
 FROM ${BASE}
 RUN echo hi
+EOF
+
+# Oracle: docker.io/library/alpine:latest is resolved (real build with
+# --platform linux/amd64; buildx 0.37 drops --platform on --call runs, so
+# the platform fixtures were verified with real builds, which stop at
+# metadata for these files). BuildKit sets TARGETARCH in the global scope on
+# every build, so the ARG default expands to alpine and the FROM keeps it.
+run_case "automatic TARGETARCH reaches a global ARG default" "" err "alpine" --platform linux/amd64 <<'EOF'
+ARG BASE=${TARGETARCH:+alpine}
+FROM ${BASE:-cgr.dev/chainguard/wolfi-base}
+RUN echo hi
+EOF
+
+# Oracle: the same file resolves docker.io/library/alpine:latest on every
+# platform, because TARGETARCH is always set. Without --platform the gate
+# does not know the value BuildKit will use, so it refuses to answer.
+run_case "automatic platform argument without --platform fails closed" "" err "Pass --platform" <<'EOF'
+ARG BASE=${TARGETARCH:+alpine}
+FROM ${BASE:-cgr.dev/chainguard/wolfi-base}
+RUN echo hi
+EOF
+
+# Oracle: cgr.dev/chainguard/go:latest-dev is resolved. The variable sits
+# inside a FROM flag, which names a manifest platform, not an image, so the
+# gate skips it with or without --platform.
+run_case "BUILDPLATFORM in a FROM flag needs no --platform" "" ok "" --platform linux/amd64 <<'EOF'
+FROM --platform=$BUILDPLATFORM cgr.dev/chainguard/go:latest-dev
+RUN go build .
+EOF
+
+# Oracle: docker.io/library/alpine:v8 is resolved under --platform
+# linux/amd64. TARGETVARIANT is set to the empty string when the platform
+# has no variant, and :- treats empty as unset.
+run_case "TARGETVARIANT is empty-set on a variantless platform" "" err "alpine:v8" --platform linux/amd64 <<'EOF'
+FROM alpine:${TARGETVARIANT:-v8}
+EOF
+
+# Oracle: docker.io/library/alpine:v8 is resolved under --platform
+# linux/arm64/v8 too: the docker CLI normalizes arm64/v8 to arm64 with no
+# variant, so the :- default still applies.
+run_case "arm64/v8 normalizes to an empty TARGETVARIANT" "" err "alpine:v8" --platform linux/arm64/v8 <<'EOF'
+FROM alpine:${TARGETVARIANT:-v8}
+EOF
+
+# Oracle: docker.io/library/alpine:v7 is resolved under --platform
+# linux/arm/v7; that variant survives normalization.
+run_case "arm/v7 keeps its TARGETVARIANT" "" err "alpine:v7" --platform linux/arm/v7 <<'EOF'
+FROM alpine:${TARGETVARIANT:-v8}
+EOF
+
+# Oracle: docker.io/library/alpine:q-amd64 is resolved under --platform
+# linux/x86_64; the docker CLI normalizes the architecture alias.
+run_case "x86_64 normalizes to amd64" "" err "alpine:q-amd64" --platform linux/x86_64 <<'EOF'
+FROM alpine:q-${TARGETARCH}
+EOF
+
+# Oracle: docker.io/library/alpine:3.20 is resolved under --platform
+# linux/amd64. A bare global redeclaration keeps the automatic value.
+run_case "bare global ARG redeclaration keeps the automatic value" "" err "alpine:3.20" --platform linux/amd64 <<'EOF'
+ARG TARGETARCH
+FROM ${TARGETARCH:+docker.io/library/alpine:3.20}
+EOF
+
+# Oracle: docker.io/library/alpine:arch-riscv64 is resolved under
+# --platform linux/amd64. A global declaration with a default replaces the
+# automatic value, unlike a bare redeclaration.
+run_case "global ARG default replaces the automatic value" "" err "alpine:arch-riscv64" --platform linux/amd64 <<'EOF'
+ARG TARGETARCH=riscv64
+FROM alpine:arch-${TARGETARCH}
+EOF
+
+# Oracle: docker.io/library/alpine:o-xyz is resolved with --build-arg
+# TARGETARCH=xyz and no ARG declaration; overrides of automatic arguments
+# apply pre-declared, unlike ordinary build args.
+run_case "build-arg overrides an automatic argument undeclared" "" err "alpine:o-xyz" --platform linux/amd64 TARGETARCH=xyz <<'EOF'
+FROM alpine:o-${TARGETARCH}
+EOF
+
+# Oracle: docker.io/library/alpine:b-amd64 is resolved on this amd64 daemon
+# under --platform linux/arm64, because docker sets BUILD* to the builder's
+# own platform. The gate matches when the caller passes --build-platform.
+run_case "BUILDARCH follows --build-platform on a cross build" "" err "alpine:b-amd64" --platform linux/arm64 --build-platform linux/amd64 <<'EOF'
+FROM alpine:b-${BUILDARCH}
+EOF
+
+# Oracle: the real build on an amd64 daemon resolves alpine:b-amd64 (see
+# above). Without --build-platform the gate defaults BUILD* to the target
+# platform, so on this cross build it checks alpine:b-arm64 instead; a
+# documented deviation, and both spellings are off the allowlist here.
+run_case "BUILDARCH defaults to the target platform without --build-platform" "" err "alpine:b-arm64" --platform linux/arm64 <<'EOF'
+FROM alpine:b-${BUILDARCH}
+EOF
+
+# Oracle: docker.io/library/alpine:s-laststage is resolved with --target
+# laststage; TARGETSTAGE carries the target stage name. Without --target,
+# BuildKit uses the final stage's name, verified separately.
+run_case "TARGETSTAGE carries the --target stage name" "" err "alpine:s-laststage" --platform linux/amd64 --target laststage <<'EOF'
+FROM alpine:s-${TARGETSTAGE} AS laststage
+EOF
+
+# Oracle: without --target BuildKit sets TARGETSTAGE to the final stage's
+# name, which the gate cannot know in one streaming pass, so it asks for
+# --target instead of guessing.
+run_case "TARGETSTAGE without --target fails closed" "" err "Pass --target" --platform linux/amd64 <<'EOF'
+FROM alpine:s-${TARGETSTAGE} AS laststage
+EOF
+
+# A multi-platform value is a usage error; the caller runs the gate once
+# per platform (exit 2, no oracle involved).
+run_case "multi-platform value is refused" "" err "one platform per run" --platform linux/amd64,linux/arm64 <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
 EOF
 
 # Oracle: the final stage resolves docker.io/library/alpine:latest. The

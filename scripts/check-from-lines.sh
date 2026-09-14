@@ -3,13 +3,34 @@
 # allowlist: cgr.dev/* (exact host boundary), the configured external mirror
 # prefix (on a / boundary), scratch, and previously declared stage aliases.
 #
-# Usage: check-from-lines.sh [--mirror PREFIX] [--build-arg NAME=value ...] DOCKERFILE
+# Usage: check-from-lines.sh [--mirror PREFIX] [--platform OS/ARCH[/VARIANT]]
+#                            [--build-platform OS/ARCH[/VARIANT]] [--target NAME]
+#                            [--build-arg NAME=value ...] DOCKERFILE
 #   --mirror PREFIX       external pull-through mirror, e.g. my-corp.example.io/cg
+#   --platform P          the platform of the captured build invocation, or
+#                         the daemon's default when the invocation names
+#                         none. Seeds the automatic platform arguments
+#                         (TARGETPLATFORM, TARGETOS, TARGETARCH,
+#                         TARGETVARIANT, TARGETOSVERSION, BUILDPLATFORM,
+#                         BUILDOS, BUILDARCH, BUILDVARIANT, BUILDOSVERSION)
+#                         the way BuildKit does. One platform per run; a
+#                         multi-platform build is gated once per platform.
+#   --build-platform P    the platform of the machine running the build.
+#                         Without it the BUILD* arguments default to the
+#                         target platform, which matches every same-platform
+#                         build; a build that crosses platforms should pass
+#                         the daemon's platform here, because docker sets
+#                         BUILD* to the builder's own platform.
+#   --target NAME         the build target from the captured invocation.
+#                         Seeds TARGETSTAGE, which BuildKit sets to the
+#                         target stage's name (or the final stage's).
 #   --build-arg NAME=value  a build arg from the captured build invocation;
 #                         repeatable. docker build honors these over the
 #                         Dockerfile's ARG defaults, so the gate must apply
 #                         the same overrides or it checks a different file
-#                         than the one being built.
+#                         than the one being built. Overrides of the
+#                         automatic arguments above apply even with no ARG
+#                         declaration, as in docker build.
 #
 # Exit codes: 0 = all FROMs allowed; 1 = a FROM (or stage alias, or ARG
 # expansion, or a construct this gate refuses to guess about) is not allowed,
@@ -80,6 +101,24 @@
 #     colon-less - and + forms) is rejected with exit 1 naming the
 #     expression, never expanded to an empty string.
 #   - FROM flags such as --platform=... are skipped to reach the image ref.
+#   - Automatic platform arguments: BuildKit seeds TARGETPLATFORM, TARGETOS,
+#     TARGETARCH, TARGETVARIANT, TARGETOSVERSION, TARGETSTAGE, BUILDPLATFORM,
+#     BUILDOS, BUILDARCH, BUILDVARIANT, and BUILDOSVERSION in the global
+#     scope on every build, so a FROM (or a global ARG default) can read
+#     them with no declaration. When the gate runs with --platform it seeds
+#     the same values, normalized the way the docker CLI normalizes a
+#     platform string (x86_64 and aarch64 become amd64 and arm64, arm64/v8
+#     drops its variant, bare arm becomes arm/v7; each verified against a
+#     real build). TARGETVARIANT and the OSVERSION arguments are set to the
+#     empty string when the platform has none, which matters for the :- and
+#     :+ modifiers. A bare global redeclaration (ARG TARGETARCH) keeps the
+#     seeded value, a global declaration with a default replaces it, and a
+#     --build-arg override beats both, with or without a declaration, all
+#     matching BuildKit. When --platform was not given and FROM resolution
+#     reads one of these names, the gate exits 1 naming it and asking for
+#     --platform (or --target, for TARGETSTAGE), because BuildKit resolves
+#     a value the gate does not know. A file that never reads them behaves
+#     as before.
 #   - Unresolved variables in a FROM ref are rejected: FROM $UNSET could
 #     resolve to anything at build time, so it cannot pass a static gate.
 #   - A stage alias must match ^[a-zA-Z][a-zA-Z0-9_.-]*$ (Docker stage-name
@@ -93,10 +132,13 @@
 # quoted or escaped whitespace in ARG values, ambiguous heredoc markers,
 # unbalanced quotes and restricted ${...} forms and Unicode spaces on
 # heredoc-capable lines, and non-stable '# syntax=' frontends are all
-# rejected rather than emulated; and a single-quoted ARG
+# rejected rather than emulated; a single-quoted ARG
 # default is expanded like a double-quoted one, where BuildKit keeps it
 # literal (a literal $ never survives into a valid image ref, so this cannot
-# admit a ref the builder resolves elsewhere).
+# admit a ref the builder resolves elsewhere); and with --platform but no
+# --build-platform the BUILD* arguments take the target platform's values,
+# which matches every same-platform build but differs on a cross-platform
+# one until the caller passes --build-platform.
 #
 # Dependencies: sh, awk (POSIX). No network, no writes.
 
@@ -107,11 +149,101 @@ NL='
 
 MIRROR=""
 BUILD_ARGS=""
+PLATFORM=""
+BUILD_PLATFORM=""
+TARGET_STAGE=""
+TARGET_SET=0
+
+# normalize_platform VALUE FLAG: split VALUE into NORM_OS, NORM_ARCH,
+# NORM_VARIANT and apply the normalizations the docker CLI applies before
+# the builder sees the platform, each verified against a real build:
+# x86_64 and x86-64 become amd64, aarch64 becomes arm64, i386 becomes 386,
+# armhf and armel become arm/v7 and arm/v6, arm64 drops a v8 variant, and
+# bare arm gains v7.
+normalize_platform() {
+  np_val=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$np_val" in
+    *,*)
+      echo "check-from-lines.sh: $2 takes one platform per run (got '$1'); a multi-platform build is gated once per platform" >&2
+      exit 2
+      ;;
+  esac
+  case "$np_val" in
+    */*) : ;;
+    *)
+      echo "check-from-lines.sh: $2 must look like OS/ARCH or OS/ARCH/VARIANT, got '$1'" >&2
+      exit 2
+      ;;
+  esac
+  NORM_OS=${np_val%%/*}
+  np_rest=${np_val#*/}
+  case "$np_rest" in
+    */*) NORM_ARCH=${np_rest%%/*}; NORM_VARIANT=${np_rest#*/} ;;
+    *)   NORM_ARCH=$np_rest;       NORM_VARIANT="" ;;
+  esac
+  if [ -z "$NORM_OS" ] || [ -z "$NORM_ARCH" ]; then
+    echo "check-from-lines.sh: $2 must look like OS/ARCH or OS/ARCH/VARIANT, got '$1'" >&2
+    exit 2
+  fi
+  case "$np_rest" in
+    */*)
+      case "$NORM_VARIANT" in
+        ''|*/*)
+          echo "check-from-lines.sh: $2 must look like OS/ARCH or OS/ARCH/VARIANT, got '$1'" >&2
+          exit 2
+          ;;
+      esac
+      ;;
+  esac
+  case "${NORM_OS}${NORM_ARCH}${NORM_VARIANT}" in
+    *[!a-z0-9_.-]*)
+      echo "check-from-lines.sh: $2 must look like OS/ARCH or OS/ARCH/VARIANT, got '$1'" >&2
+      exit 2
+      ;;
+  esac
+  case "$NORM_ARCH" in
+    x86_64|x86-64) NORM_ARCH=amd64 ;;
+    aarch64) NORM_ARCH=arm64 ;;
+    i386) NORM_ARCH=386 ;;
+    armhf|armel)
+      if [ -n "$NORM_VARIANT" ]; then
+        echo "check-from-lines.sh: $2 does not take a variant with '$NORM_ARCH'; spell the platform as $NORM_OS/arm/vN" >&2
+        exit 2
+      fi
+      if [ "$NORM_ARCH" = armhf ]; then NORM_VARIANT=v7; else NORM_VARIANT=v6; fi
+      NORM_ARCH=arm
+      ;;
+  esac
+  if [ "$NORM_ARCH" = arm64 ] && [ "$NORM_VARIANT" = v8 ]; then NORM_VARIANT=""; fi
+  if [ "$NORM_ARCH" = arm ] && [ -z "$NORM_VARIANT" ]; then NORM_VARIANT=v7; fi
+}
+
 while :; do
   case "${1-}" in
     --mirror)
       MIRROR="${2-}"
       [ -n "$MIRROR" ] || { echo "check-from-lines.sh: --mirror needs a value" >&2; exit 2; }
+      shift 2
+      ;;
+    --platform)
+      PLATFORM="${2-}"
+      [ -n "$PLATFORM" ] || { echo "check-from-lines.sh: --platform needs a value" >&2; exit 2; }
+      shift 2
+      ;;
+    --build-platform)
+      BUILD_PLATFORM="${2-}"
+      [ -n "$BUILD_PLATFORM" ] || { echo "check-from-lines.sh: --build-platform needs a value" >&2; exit 2; }
+      shift 2
+      ;;
+    --target)
+      TARGET_STAGE="${2-}"
+      case "$TARGET_STAGE" in
+        ''|*[!A-Za-z0-9_.-]*)
+          echo "check-from-lines.sh: --target needs a stage name (letters, digits, _ . -)" >&2
+          exit 2
+          ;;
+      esac
+      TARGET_SET=1
       shift 2
       ;;
     --build-arg)
@@ -133,8 +265,33 @@ done
 
 DOCKERFILE="${1-}"
 if [ -z "$DOCKERFILE" ] || [ ! -f "$DOCKERFILE" ]; then
-  echo "usage: check-from-lines.sh [--mirror PREFIX] [--build-arg NAME=value ...] DOCKERFILE" >&2
+  echo "usage: check-from-lines.sh [--mirror PREFIX] [--platform OS/ARCH[/VARIANT]] [--build-platform OS/ARCH[/VARIANT]] [--target NAME] [--build-arg NAME=value ...] DOCKERFILE" >&2
   exit 2
+fi
+
+if [ -n "$BUILD_PLATFORM" ] && [ -z "$PLATFORM" ]; then
+  echo "check-from-lines.sh: --build-platform needs --platform as well" >&2
+  exit 2
+fi
+
+# Resolve the automatic platform argument values BuildKit would seed. The
+# BUILD* values default to the target platform; a cross-platform build
+# passes --build-platform (see the usage note).
+PLATFORM_SET=0
+T_PLAT=""; T_OS=""; T_ARCH=""; T_VAR=""
+B_PLAT=""; B_OS=""; B_ARCH=""; B_VAR=""
+if [ -n "$PLATFORM" ]; then
+  PLATFORM_SET=1
+  normalize_platform "$PLATFORM" --platform
+  T_OS=$NORM_OS; T_ARCH=$NORM_ARCH; T_VAR=$NORM_VARIANT
+  T_PLAT="$T_OS/$T_ARCH${T_VAR:+/$T_VAR}"
+  if [ -n "$BUILD_PLATFORM" ]; then
+    normalize_platform "$BUILD_PLATFORM" --build-platform
+    B_OS=$NORM_OS; B_ARCH=$NORM_ARCH; B_VAR=$NORM_VARIANT
+  else
+    B_OS=$T_OS; B_ARCH=$T_ARCH; B_VAR=$T_VAR
+  fi
+  B_PLAT="$B_OS/$B_ARCH${B_VAR:+/$B_VAR}"
 fi
 
 # Build args travel through the environment, not -v: awk -v runs backslash
@@ -145,7 +302,14 @@ fi
 # LC_ALL=C keeps awk bytewise: in a UTF-8 locale, gawk builds sprintf("%c")
 # strings and indexes substrings by character, which would break the BOM
 # comparison and the Unicode-space detection.
-CHECK_FROM_BUILD_ARGS="$BUILD_ARGS" LC_ALL=C awk -v mirror="$MIRROR" '
+# The platform values reach awk through -v, which is safe here: they are
+# validated above to letters, digits, and [_./-], none of which awk escape
+# processing touches.
+CHECK_FROM_BUILD_ARGS="$BUILD_ARGS" LC_ALL=C awk -v mirror="$MIRROR" \
+  -v platform_set="$PLATFORM_SET" -v tplat="$T_PLAT" -v tos="$T_OS" \
+  -v tarch="$T_ARCH" -v tvar="$T_VAR" -v bplat="$B_PLAT" -v bos="$B_OS" \
+  -v barch="$B_ARCH" -v bvar="$B_VAR" -v target_set="$TARGET_SET" \
+  -v target_stage="$TARGET_STAGE" '
 # rtrim_c trims only what BuildKit ignores before its continuation check
 # (\r from CRLF, then spaces and tabs); ltrim matches BuildKit trimming
 # any leading whitespace before the comment and blank-line checks.
@@ -154,10 +318,22 @@ function ltrim(s)   { sub(WSL, "", s); return s }
 
 function fail(msg) { print "check-from-lines: " msg; EXITCODE = 1; exit 1 }
 
+# BuildKit sets the automatic platform arguments on every build, so a FROM
+# resolution that reads one is checkable only when the gate knows the
+# platform (or, for TARGETSTAGE, the build target). A name that was seeded,
+# declared with a default, or overridden is in ARGS and needs no check.
+function autofail(name, lineno) {
+  if (name in ARGS || !(name in AUTO)) return
+  if (name == "TARGETSTAGE")
+    fail("line " lineno " reads the automatic argument TARGETSTAGE, which BuildKit sets to the target stage name on every build. Pass --target so the gate resolves the same value the build does")
+  fail("line " lineno " reads the automatic platform argument " name ", which BuildKit sets on every build. Pass --platform (and --build-platform when the build platform differs from the target) so the gate resolves the same file the builder does")
+}
+
 # Resolve one variable name. In "from" mode an unknown name is collected in
 # UNRESOLVED instead of guessed at; in "default" mode it expands to the empty
 # string, matching the builder.
-function lookup(name, mode) {
+function lookup(name, mode, lineno) {
+  autofail(name, lineno)
   if (name in ARGS) return ARGS[name]
   if (mode == "from") UNRESOLVED = UNRESOLVED " " name
   return ""
@@ -182,7 +358,7 @@ function expand_str(s, mode, lineno,   out, j, k, name, c, mod, word, isset) {
       c = substr(s, 1, 1)
       if (c == "}") {
         s = substr(s, 2)
-        out = out lookup(name, mode)
+        out = out lookup(name, mode, lineno)
       } else if (c == ":") {
         mod = substr(s, 2, 1)
         if (mod != "-" && mod != "+")
@@ -194,6 +370,7 @@ function expand_str(s, mode, lineno,   out, j, k, name, c, mod, word, isset) {
         s = substr(s, k + 1)
         if (word ~ /[${}"]/ || index(word, SQ) > 0 || index(word, ESC) > 0)
           fail("unsupported nested expansion in \"${" name ":" mod word "}\" at line " lineno)
+        autofail(name, lineno)
         isset = (name in ARGS && ARGS[name] != "")
         if (mod == "-") out = out (isset ? ARGS[name] : word)
         else            out = out (isset ? word : "")
@@ -205,7 +382,7 @@ function expand_str(s, mode, lineno,   out, j, k, name, c, mod, word, isset) {
     } else if (match(s, /^[A-Za-z_][A-Za-z0-9_]*/)) {
       name = substr(s, RSTART, RLENGTH)
       s = substr(s, RLENGTH + 1)
-      out = out lookup(name, mode)
+      out = out lookup(name, mode, lineno)
     } else {
       out = out "$"
     }
@@ -409,6 +586,28 @@ BEGIN {
     p = index(ba_lines[b], "=")
     if (p > 1) OVERRIDE[substr(ba_lines[b], 1, p - 1)] = substr(ba_lines[b], p + 1)
   }
+  # Seed the automatic platform arguments the way BuildKit does: all of them
+  # when the platform is known (the OSVERSION pair and a missing variant are
+  # set to the empty string, which the :- and :+ modifiers treat as unset),
+  # TARGETSTAGE when the target is known, and a --build-arg override on any
+  # of these names regardless, declaration or not, matching docker build.
+  n_auto = split("TARGETPLATFORM TARGETOS TARGETARCH TARGETVARIANT TARGETOSVERSION TARGETSTAGE BUILDPLATFORM BUILDOS BUILDARCH BUILDVARIANT BUILDOSVERSION", auto_names, " ")
+  for (b = 1; b <= n_auto; b++) AUTO[auto_names[b]] = 1
+  if (platform_set) {
+    ARGS["TARGETPLATFORM"] = tplat
+    ARGS["TARGETOS"] = tos
+    ARGS["TARGETARCH"] = tarch
+    ARGS["TARGETVARIANT"] = tvar
+    ARGS["TARGETOSVERSION"] = ""
+    ARGS["BUILDPLATFORM"] = bplat
+    ARGS["BUILDOS"] = bos
+    ARGS["BUILDARCH"] = barch
+    ARGS["BUILDVARIANT"] = bvar
+    ARGS["BUILDOSVERSION"] = ""
+  }
+  if (target_set) ARGS["TARGETSTAGE"] = target_stage
+  for (b = 1; b <= n_auto; b++)
+    if (auto_names[b] in OVERRIDE) ARGS[auto_names[b]] = OVERRIDE[auto_names[b]]
 }
 
 {
