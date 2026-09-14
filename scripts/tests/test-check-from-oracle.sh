@@ -597,6 +597,26 @@ else
   bad "--help context: docker should get -- then the absolute context path, got: $(cat "$argslog")"
 fi
 
+echo "--- case 8: a base identical to its own stage name is a pull, not a stage reference ---"
+cat > "$tmp/Dockerfile" <<'EOF'
+FROM alpine AS alpine
+EOF
+out=$(sh "$SCRIPT" --platform linux/amd64 "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -eq 0 ]; then
+  bad "self-named stage: FROM alpine AS alpine pulls alpine and must be rejected, got a pass"
+else
+  case "$out" in
+    *"REJECTED docker.io/library/alpine"*) ok ;;
+    *) bad "self-named stage: should reject alpine, got: $out" ;;
+  esac
+fi
+cat > "$tmp/Dockerfile" <<'EOF'
+FROM cgr.dev/chainguard/static:latest AS alpine
+FROM alpine
+EOF
+out=$(sh "$SCRIPT" --platform linux/amd64 "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -eq 0 ]; then ok; else bad "a base naming a sibling stage is a stage reference and must pass, got exit $rc: $out"; fi
+
 echo ""
 echo "test-check-from-oracle: $pass passed, $failcount failed"
 [ "$failcount" -eq 0 ]

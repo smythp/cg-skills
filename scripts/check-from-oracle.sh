@@ -633,7 +633,6 @@ BEGIN {
     p = index(stage_lines[b], "\t")
     SN[b] = substr(stage_lines[b], 1, p - 1)
     SB[b] = substr(stage_lines[b], p + 1)
-    if (SN[b] != "") SLOWER[tolower(SN[b])] = 1
   }
 }
 
@@ -741,7 +740,15 @@ END {
         handled = 1
       }
     }
-    if (!handled && (tolower(resolved) in SLOWER)) continue
+    # A base is a stage reference only when some other stage bears that
+    # name. A stage cannot be its own base, so FROM alpine AS alpine pulls
+    # the image and must meet the allowlist like any other base.
+    if (!handled) {
+      isstage = 0
+      for (oth = 1; oth <= NSTAGE; oth++)
+        if (oth != i && SN[oth] != "" && tolower(SN[oth]) == tolower(resolved)) { isstage = 1; break }
+      if (isstage) continue
+    }
     outbuf = outbuf resolved "\t" norm_ref(resolved) "\n"
   }
   printf "%s", outbuf
