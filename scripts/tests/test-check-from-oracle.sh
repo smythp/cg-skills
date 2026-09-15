@@ -33,6 +33,8 @@
 #  11. a VT-prefixed escape directive is honored by the scan as BuildKit
 #      honors it, so the continuation it enables cannot split the scan
 #      from the frontend
+#  12. a forward stage reference is a stage reference, not a pull; the
+#      FROM set holds only the later stage's base
 #
 # The shim cases need no container engine: a docker shim on PATH prints
 # canned output per call (targets and outline separately, and a timeout
@@ -44,7 +46,11 @@
 # scratch-only stage graph, an off-allowlist stage, an alias base, a JSON
 # escape in a base, targets runs that fail or lack evidence, outline runs
 # missing either evidence marker, a nonzero
-# docker exit, a timed-out run, a configured source policy, a pinned
+# docker exit, a timed-out run (asserting the timeout status 124, skipped
+# with a reason when no timer is installed), the BUILD* and TARGET*
+# overrides asserted on the captured buildx argument list, a [context
+# NAME] load line matched against the FROM set, a configured source
+# policy, a pinned
 # syntax directive rejected before any docker call, and a context
 # directory named --help, whose name must reach docker as a path after --,
 # never as an option.
@@ -135,23 +141,31 @@ for plat in linux/amd64 linux/arm64; do
   fi
 done
 
-echo "--- case 1e: single-quoted ARG default stays literal in the frontend ---"
-# BuildKit keeps the single-quoted default literal (verified by this very
-# run), so X is set and non-empty, B becomes the wolfi-base reference, and
-# the outline resolves cgr.dev/chainguard/wolfi-base:latest. A frontend
-# that expanded inside single quotes would resolve alpine and fail the run.
+echo "--- case 1e: single-quoted ARG default stays literal in the scan ---"
+# BuildKit keeps the single-quoted default literal, so X is set and
+# non-empty, B becomes the alpine reference, and the outline of this file
+# resolves docker.io/library/alpine:latest (pinned by an outline run). The
+# scan keeps the same literal, so alpine enters the FROM set and the
+# FROM-set check rejects it by name before the outline runs; a scan that
+# expanded inside the single quotes would empty X, resolve wolfi-base, and
+# pass. The second assertion pins that the rejection comes from the
+# FROM-set check, not from an artifact classification of the alpine load.
 cat > "$tmp/Dockerfile" <<'EOF'
 ARG X='${UNSET}'
-ARG B=${X:+cgr.dev/chainguard/wolfi-base}
-FROM ${B:-docker.io/library/alpine}
+ARG B=${X:+docker.io/library/alpine}
+FROM ${B:-cgr.dev/chainguard/wolfi-base}
 EOF
 out=$(sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
-if [ "$rc" -ne 0 ]; then
-  bad "single-quoted literal default: expected pass, exit $rc: $out"
+if [ "$rc" -eq 0 ]; then
+  bad "single-quoted literal default: expected rejection, got a pass"
 else
   case "$out" in
-    *"allowed  cgr.dev/chainguard/wolfi-base:latest"*) ok ;;
-    *) bad "single-quoted literal default: should allow wolfi-base, got: $out" ;;
+    *"REJECTED docker.io/library/alpine:latest"*) ok ;;
+    *) bad "single-quoted literal default: the FROM-set check should reject alpine by name, got: $out" ;;
+  esac
+  case "$out" in
+    *"external artifact source"*) bad "single-quoted literal default: alpine must be a rejected base, not an artifact source, got: $out" ;;
+    *) ok ;;
   esac
 fi
 
@@ -233,8 +247,12 @@ echo "--- case 5: --build-platform override reaches the frontend ---"
 # BUILDARCH is the daemon's own architecture, so only an applied override
 # makes the frontend resolve the b-arm64 reference. The base is on the
 # allowlist, so the FROM set passes and the outline runs; the tag does not
-# exist, so the run fails naming it, and the named ref is the proof the
-# override reached the frontend.
+# exist, so the run fails naming it. The assertion requires b-arm64 on an
+# indented "  | " line, which only the relayed buildx output carries, so
+# the FROM-set messages the script prints first (which also spell b-arm64)
+# cannot satisfy it; a frontend resolving the daemon's own architecture
+# would fail on b-amd64 instead and the case would catch it. The shim case
+# below asserts the same overrides on the captured buildx argument list.
 cat > "$tmp/Dockerfile" <<'EOF'
 FROM cgr.dev/chainguard/wolfi-base:b-${BUILDARCH}
 EOF
@@ -242,17 +260,23 @@ out=$(sh "$SCRIPT" --platform linux/amd64 --build-platform linux/arm64 "$tmp/Doc
 if [ "$rc" -eq 0 ]; then
   bad "build-platform override: expected a failing run, got a pass"
 else
-  case "$out" in
-    *"b-arm64"*) ok ;;
-    *) bad "build-platform override: the output should name the b-arm64 tag, got: $out" ;;
-  esac
+  if printf '%s\n' "$out" | grep -q '^  | .*b-arm64'; then
+    ok
+  else
+    bad "build-platform override: the relayed buildx output should name the b-arm64 tag, got: $out"
+  fi
 fi
 
 echo "--- case 6: named build context override ---"
 # The pull-request reproduction. The override makes the Chainguard FROM
-# resolve to alpine; the progress line has the [context NAME] label and the
-# label-agnostic parsing must reject its reference. The same override
-# pointed at another Chainguard image must pass.
+# resolve to alpine, and the rejecting mechanism is the FROM-set
+# substitution: the scan replaces the base with the context source, alpine
+# enters the FROM set, and the FROM-set check rejects it before the
+# outline runs, so no [context NAME] progress line is parsed on this
+# branch. The same override pointed at another Chainguard image passes,
+# and there the outline does print the substituted load under the
+# [context NAME] label; the shim case below pins that label parsing with
+# canned outline output.
 cat > "$tmp/Dockerfile" <<'EOF'
 FROM cgr.dev/chainguard/wolfi-base
 RUN echo hi
@@ -649,15 +673,86 @@ sc_targets_rc=3
 shim_case "nonzero targets exit fails" "$tmp/out-good" 0 1 "targets run failed (exit 3)"
 sc_targets_rc=""
 
-echo "--- shim case: timed-out run ---"
-out=$(SHIM_SLEEP=10 PATH="$shimdir:$PATH" sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
-if [ "$rc" -ne 1 ]; then
-  bad "timed-out run: expected exit 1, got $rc: $out"
+echo "--- shim case: --build-platform reaches buildx as BUILD* overrides ---"
+# Case 5's mechanism, asserted on the captured argument list: whatever the
+# script prints before the buildx calls, the frontend sees only what is on
+# the invocation, so each BUILD* override must appear there as a
+# --build-arg value, and the TARGET* pack from --platform with it.
+bplog="$tmp/bplog"
+: > "$bplog"
+out=$(SHIM_OUT="$tmp/out-good" SHIM_OUT_TARGETS="$tmp/out-targets-good" SHIM_ARGS="$bplog" \
+      PATH="$shimdir:$PATH" sh "$SCRIPT" --platform linux/amd64 --build-platform linux/arm64 \
+      "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  bad "build-platform args: expected pass, exit $rc: $out"
+else
+  ok
+fi
+if grep -qx -- '--build-arg' "$bplog"; then ok; else bad "build-platform args: no --build-arg reached buildx"; fi
+for want in BUILDPLATFORM=linux/arm64 BUILDOS=linux BUILDARCH=arm64 BUILDVARIANT= BUILDOSVERSION= TARGETPLATFORM=linux/amd64; do
+  if grep -qxF -- "$want" "$bplog"; then
+    ok
+  else
+    bad "build-platform args: buildx did not receive $want; the log holds: $(tr '\n' ' ' < "$bplog")"
+  fi
+done
+
+echo "--- shim case: a [context NAME] load line reaching the outline is matched as a base ---"
+# An outline whose only load carries the [context NAME] label, shaped as a
+# real run prints it for an overridden base. The same context substitutes
+# the reference into the FROM set, so the labeled load must parse and
+# match the set, not fail as unparsable and not report as an artifact.
+cat > "$tmp/out-ctxlabel" <<'EOF'
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 84B done
+#1 DONE 0.0s
+
+#2 [context cgr.dev/chainguard/wolfi-base] load metadata for cgr.dev/chainguard/static:latest
+#2 DONE 0.1s
+{
+  "sources": [
+    "RlJPTQo="
+  ]
+}
+EOF
+out=$(SHIM_OUT="$tmp/out-ctxlabel" SHIM_OUT_TARGETS="$tmp/out-targets-good" \
+      PATH="$shimdir:$PATH" sh "$SCRIPT" \
+      --build-context cgr.dev/chainguard/wolfi-base=docker-image://cgr.dev/chainguard/static:latest \
+      "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  bad "context-label load: expected pass, exit $rc: $out"
 else
   case "$out" in
-    *"not a pass"*) ok ;;
-    *) bad "timed-out run: should say it is not a pass, got: $out" ;;
+    *"allowed  cgr.dev/chainguard/static:latest"*)
+      case "$out" in
+        *"external artifact source"*) bad "context-label load: the substituted load must match the FROM set, not report as an artifact, got: $out" ;;
+        *) ok ;;
+      esac
+      ;;
+    *) bad "context-label load: should allow the substituted static base, got: $out" ;;
   esac
+fi
+
+echo "--- shim case: timed-out run ---"
+# Requires a real timer: the assertion is the timeout exit status 124 from
+# the bounded targets call, not a generic failure. Without one the shim
+# runs the command unbounded, the case would wait out the shim sleep and
+# fail on the empty output instead, which proves nothing about the bound,
+# so it is skipped with the reason printed.
+if [ -z "$real_timeout" ]; then
+  echo "SKIP: timed-out run (neither timeout nor gtimeout is installed, so the bound cannot fire and the timeout status cannot be observed)"
+else
+  out=$(SHIM_SLEEP=10 PATH="$shimdir:$PATH" sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+  if [ "$rc" -ne 1 ]; then
+    bad "timed-out run: expected exit 1, got $rc: $out"
+  else
+    case "$out" in
+      *"targets run failed (exit 124)"*) ok ;;
+      *) bad "timed-out run: should carry the timeout status 124 from the bounded targets call, got: $out" ;;
+    esac
+  fi
 fi
 
 echo "--- shim case: source policy in the environment ---"
@@ -766,6 +861,27 @@ else
   case "$out" in
     *"REJECTED docker.io/library/alpine"*) ok ;;
     *) bad "VT-prefixed escape directive: should reject alpine from the FROM set, got: $out" ;;
+  esac
+fi
+
+echo "--- case 12: a forward stage reference is a stage reference, not a pull ---"
+# Pinned by this very run: the outline loads only the later stage's base,
+# cgr.dev/chainguard/wolfi-base, so a base naming a stage declared after
+# its referencing stage resolves to that stage. The targets JSON lists the
+# named stage after the stage whose base references it, and the FROM set
+# must hold only wolfi-base; a set that treated helper as a pull would
+# reject it and fail this case.
+cat > "$tmp/Dockerfile" <<'EOF'
+FROM helper
+FROM cgr.dev/chainguard/wolfi-base AS helper
+EOF
+out=$(sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  bad "forward stage reference: expected pass, exit $rc: $out"
+else
+  case "$out" in
+    *"allowed  cgr.dev/chainguard/wolfi-base:latest"*) ok ;;
+    *) bad "forward stage reference: should allow only the wolfi-base base, got: $out" ;;
   esac
 fi
 

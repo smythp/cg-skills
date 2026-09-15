@@ -235,6 +235,17 @@ RUN go build .
 FROM Builder
 EOF
 
+# Oracle: only cgr.dev/chainguard/wolfi-base:latest is resolved; BuildKit
+# resolves stage names anywhere in the file, so FROM helper is a reference
+# to the later stage, not a pull. This gate reads the file top to bottom
+# and trusts only aliases already declared, so it rejects the forward
+# reference, a conservative deviation recorded in the constructs table;
+# the oracle accepts the file (its test case 12).
+run_case "forward stage reference fails closed" "" err "helper" <<'EOF'
+FROM helper
+FROM cgr.dev/chainguard/wolfi-base AS helper
+EOF
+
 run_case "deprecated ghcr.io/chainguard-images mirror is rejected" "" err "ghcr.io/chainguard-images/python:latest-dev" <<'EOF'
 FROM ghcr.io/chainguard-images/python:latest-dev
 RUN echo hi
