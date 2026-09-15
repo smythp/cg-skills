@@ -48,12 +48,16 @@
 # missing either evidence marker, a nonzero
 # docker exit, a timed-out run (asserting the timeout status 124, skipped
 # with a reason when no timer is installed), the BUILD* and TARGET*
-# overrides asserted on the captured buildx argument list, a [context
-# NAME] load line matched against the FROM set, a configured source
-# policy, a pinned
-# syntax directive rejected before any docker call, and a context
+# overrides asserted pair by pair on both captured buildx invocations, a
+# [context NAME] load line matched against the FROM set, a configured
+# source policy, a pinned
+# syntax directive rejected before any docker call, a context
 # directory named --help, whose name must reach docker as a path after --,
-# never as an option.
+# never as an option, a base written as artifact-capable rejected as a
+# FROM-set member, copy and mount sources naming a stage left out of the
+# artifact-capable count while an image source stays in it, and the
+# single-quoted default rejected from the FROM set with no outline
+# invocation on the args log.
 
 set -u
 
@@ -148,8 +152,12 @@ echo "--- case 1e: single-quoted ARG default stays literal in the scan ---"
 # scan keeps the same literal, so alpine enters the FROM set and the
 # FROM-set check rejects it by name before the outline runs; a scan that
 # expanded inside the single quotes would empty X, resolve wolfi-base, and
-# pass. The second assertion pins that the rejection comes from the
-# FROM-set check, not from an artifact classification of the alpine load.
+# reach the outline, whose unexpanded-base fallback prints the same
+# REJECTED alpine line. The FROM-set summary tells the two paths apart:
+# only the FROM-set check prints it, so it is asserted here, and the shim
+# companion below asserts on the args log that the outline call never
+# reaches docker. The artifact assertion pins that the rejection is not an
+# artifact classification of the alpine load.
 cat > "$tmp/Dockerfile" <<'EOF'
 ARG X='${UNSET}'
 ARG B=${X:+docker.io/library/alpine}
@@ -162,6 +170,10 @@ else
   case "$out" in
     *"REJECTED docker.io/library/alpine:latest"*) ok ;;
     *) bad "single-quoted literal default: the FROM-set check should reject alpine by name, got: $out" ;;
+  esac
+  case "$out" in
+    *"the file's FROM set contains at least one base image off the allowlist"*) ok ;;
+    *) bad "single-quoted literal default: the rejection must carry the FROM-set summary, not the fallback text, got: $out" ;;
   esac
   case "$out" in
     *"external artifact source"*) bad "single-quoted literal default: alpine must be a rejected base, not an artifact source, got: $out" ;;
@@ -344,6 +356,25 @@ else
   case "$out" in
     *"external artifact source docker.io/library/alpine:latest"*) ok ;;
     *) bad "mount artifact source: should report alpine as an artifact source, got: $out" ;;
+  esac
+fi
+# BuildKit lowercases mount option keys before matching them (a real
+# cacheonly build accepts FROM=, Type=, and From= spellings, and the FROM=
+# bind mount serves the image content), so the artifact-capable count must
+# read the key case-insensitively. The outline of this file resolves
+# alpine; a count that missed the uppercase key would leave it at zero and
+# reject the load as an unexpanded base, failing this passing file.
+cat > "$tmp/Dockerfile" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN --mount=type=bind,FROM=alpine,target=/mnt echo hi
+EOF
+out=$(sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  bad "uppercase mount key: expected pass, exit $rc: $out"
+else
+  case "$out" in
+    *"external artifact source docker.io/library/alpine:latest"*) ok ;;
+    *) bad "uppercase mount key: should report alpine as an artifact source, got: $out" ;;
   esac
 fi
 
@@ -673,27 +704,51 @@ sc_targets_rc=3
 shim_case "nonzero targets exit fails" "$tmp/out-good" 0 1 "targets run failed (exit 3)"
 sc_targets_rc=""
 
-echo "--- shim case: --build-platform reaches buildx as BUILD* overrides ---"
+echo "--- shim case: the platform and target overrides reach both buildx calls ---"
 # Case 5's mechanism, asserted on the captured argument list: whatever the
 # script prints before the buildx calls, the frontend sees only what is on
-# the invocation, so each BUILD* override must appear there as a
-# --build-arg value, and the TARGET* pack from --platform with it.
+# the invocation, so every TARGET* and BUILD* override must appear as a
+# --build-arg pair on the targets call and again on the outline call, with
+# the values the normalization rules produce for the platforms passed here
+# (x86_64 becomes amd64 and drops the v1 variant, aarch64 becomes arm64
+# and drops the 8 variant). TARGETSTAGE travels as the --target flag,
+# which BuildKit sets it from, so the flag and its stage name are asserted
+# on both calls the same way. The args log holds one argument per line for
+# every invocation; the awk below cuts the section between one --call
+# value and the next invocation's leading buildx, and each assertion
+# requires the value on the line directly after its flag.
 bplog="$tmp/bplog"
 : > "$bplog"
 out=$(SHIM_OUT="$tmp/out-good" SHIM_OUT_TARGETS="$tmp/out-targets-good" SHIM_ARGS="$bplog" \
-      PATH="$shimdir:$PATH" sh "$SCRIPT" --platform linux/amd64 --build-platform linux/arm64 \
-      "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+      PATH="$shimdir:$PATH" sh "$SCRIPT" --platform linux/x86_64/v1 --build-platform linux/aarch64/8 \
+      --target final "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
 if [ "$rc" -ne 0 ]; then
-  bad "build-platform args: expected pass, exit $rc: $out"
+  bad "platform overrides: expected pass, exit $rc: $out"
 else
   ok
 fi
-if grep -qx -- '--build-arg' "$bplog"; then ok; else bad "build-platform args: no --build-arg reached buildx"; fi
-for want in BUILDPLATFORM=linux/arm64 BUILDOS=linux BUILDARCH=arm64 BUILDVARIANT= BUILDOSVERSION= TARGETPLATFORM=linux/amd64; do
-  if grep -qxF -- "$want" "$bplog"; then
+for call in targets outline; do
+  callargs=$(awk -v want="--call=$call,format=json" '
+    $0 == "buildx" { insec = 0 }
+    insec { print }
+    $0 == want { insec = 1 }
+  ' "$bplog")
+  if [ -n "$callargs" ]; then ok; else bad "platform overrides: no $call call reached docker"; fi
+  for want in TARGETPLATFORM=linux/amd64 TARGETOS=linux TARGETARCH=amd64 \
+              TARGETVARIANT= TARGETOSVERSION= BUILDPLATFORM=linux/arm64 \
+              BUILDOS=linux BUILDARCH=arm64 BUILDVARIANT= BUILDOSVERSION=; do
+    if printf '%s\n' "$callargs" | awk -v v="$want" \
+         'prev == "--build-arg" && $0 == v { found = 1 } { prev = $0 } END { exit !found }'; then
+      ok
+    else
+      bad "platform overrides: the $call call did not receive --build-arg $want; it got: $(printf '%s' "$callargs" | tr '\n' ' ')"
+    fi
+  done
+  if printf '%s\n' "$callargs" | awk \
+       'prev == "--target" && $0 == "final" { found = 1 } { prev = $0 } END { exit !found }'; then
     ok
   else
-    bad "build-platform args: buildx did not receive $want; the log holds: $(tr '\n' ' ' < "$bplog")"
+    bad "platform overrides: the $call call did not receive --target final; it got: $(printf '%s' "$callargs" | tr '\n' ' ')"
   fi
 done
 
@@ -820,6 +875,156 @@ if grep -qx -- '--' "$argslog" && grep -qxF -- "$tmp/--help" "$argslog"; then
   ok
 else
   bad "--help context: docker should get -- then the absolute context path, got: $(cat "$argslog")"
+fi
+
+echo "--- shim case: a base written as artifact-capable is a member, not the count ---"
+# The count line the scan hands the reader begins with a TAB, which no
+# reference can, so a base spelled exactly artifact-capable stays a
+# FROM-set member and meets the allowlist like any other. Before the TAB
+# sentinel it matched the count line's literal prefix: the member skipped
+# the allowlist, the reference overwrote the count, test(1) printed an
+# Illegal number error, and the run exited 0 with the base laundered as an
+# artifact source.
+cat > "$tmp/Dockerfile" <<'EOF'
+FROM artifact-capable
+EOF
+sed 's/"base": "cgr.dev\/chainguard\/wolfi-base"/"base": "artifact-capable"/' \
+  "$tmp/out-targets-good" > "$tmp/out-targets-artcap"
+out=$(SHIM_OUT="$tmp/out-good" SHIM_OUT_TARGETS="$tmp/out-targets-artcap" \
+      PATH="$shimdir:$PATH" sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 1 ]; then
+  bad "artifact-capable base: expected exit 1, got $rc: $out"
+else
+  case "$out" in
+    *"REJECTED docker.io/library/artifact-capable:latest"*) ok ;;
+    *) bad "artifact-capable base: should reject it in canonical form, got: $out" ;;
+  esac
+  case "$out" in
+    *"Illegal number"*) bad "artifact-capable base: the count reader read the member as the count: $out" ;;
+    *) ok ;;
+  esac
+fi
+
+echo "--- shim case: a copy or mount source naming a stage is not artifact-capable ---"
+# A stage cannot pull an image, so a --from or mount from source naming a
+# declared stage leaves the count at zero and the canned off-set alpine
+# load is an unexpanded base, exit 1; before the stage exclusion the same
+# files counted the stage reference, and the load passed as an artifact
+# source. The spellings cover the COPY flag, the case-insensitive stage
+# name, the numeric stage index, the mount key, and the uppercase mount
+# key BuildKit lowercases before matching.
+for src_line in 'COPY --from=builder /etc/os-release /o' \
+                'COPY --from=BUILDER /etc/os-release /o' \
+                'COPY --from=0 /etc/os-release /o' \
+                'RUN --mount=type=bind,from=builder,target=/mnt echo hi' \
+                'RUN --mount=type=bind,FROM=builder,target=/mnt echo hi'; do
+  cat > "$tmp/Dockerfile" <<EOF
+FROM cgr.dev/chainguard/wolfi-base AS builder
+FROM builder
+$src_line
+EOF
+  out=$(SHIM_OUT="$tmp/out-mixed" SHIM_OUT_TARGETS="$tmp/out-targets-multi" \
+        PATH="$shimdir:$PATH" sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+  if [ "$rc" -ne 1 ]; then
+    bad "stage source ($src_line): expected exit 1, got $rc: $out"
+  else
+    case "$out" in
+      *"unexpanded base"*) ok ;;
+      *) bad "stage source ($src_line): the off-set load should be an unexpanded base, got: $out" ;;
+    esac
+  fi
+done
+# The stage match applies after the same ARG expansion the FROM set uses:
+# a global ARG naming the stage resolves to it, so the count stays zero.
+cat > "$tmp/Dockerfile" <<'EOF'
+ARG HELPER=builder
+FROM cgr.dev/chainguard/wolfi-base AS builder
+FROM builder
+COPY --from=${HELPER} /etc/os-release /o
+EOF
+out=$(SHIM_OUT="$tmp/out-mixed" SHIM_OUT_TARGETS="$tmp/out-targets-multi" \
+      PATH="$shimdir:$PATH" sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 1 ]; then
+  bad "expanded stage source: expected exit 1, got $rc: $out"
+else
+  case "$out" in
+    *"unexpanded base"*) ok ;;
+    *) bad "expanded stage source: the off-set load should be an unexpanded base, got: $out" ;;
+  esac
+fi
+# The same file copying from an image reference keeps the count above
+# zero, so its off-set load stays on the artifact-report path.
+cat > "$tmp/Dockerfile" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base AS builder
+FROM builder
+COPY --from=busybox:latest /bin/busybox /b
+EOF
+sed 's/^#2 DONE.*/#3 [linux\/amd64 internal] load metadata for docker.io\/library\/busybox:latest/' \
+  "$tmp/out-good" > "$tmp/out-mixed-busybox"
+out=$(SHIM_OUT="$tmp/out-mixed-busybox" SHIM_OUT_TARGETS="$tmp/out-targets-multi" \
+      PATH="$shimdir:$PATH" sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  bad "image copy source: expected pass, exit $rc: $out"
+else
+  case "$out" in
+    *"external artifact source docker.io/library/busybox:latest"*) ok ;;
+    *) bad "image copy source: should report busybox as an artifact source, got: $out" ;;
+  esac
+fi
+
+echo "--- shim case: the single-quoted default rejects from the FROM set with no outline call ---"
+# Case 1e's discriminating half. With the base as written in the canned
+# targets output, the scan must keep the single-quoted default literal,
+# reject alpine from the FROM set, and never reach the outline; a scan
+# that expanded inside the single quotes would pass the FROM set and
+# invoke the outline call. The args log shows every docker invocation, so
+# it must hold the targets call and no outline call.
+cat > "$tmp/Dockerfile" <<'EOF'
+ARG X='${UNSET}'
+ARG B=${X:+docker.io/library/alpine}
+FROM ${B:-cgr.dev/chainguard/wolfi-base}
+EOF
+cat > "$tmp/out-targets-quoted" <<'EOF'
+#1 [internal] load build definition from Dockerfile
+#1 DONE 0.0s
+{
+  "targets": [
+    {
+      "default": true,
+      "base": "${B:-cgr.dev/chainguard/wolfi-base}",
+      "location": {}
+    }
+  ],
+  "sources": [
+    "RlJPTQo="
+  ]
+}
+EOF
+quotedlog="$tmp/quotedlog"
+: > "$quotedlog"
+out=$(SHIM_OUT="$tmp/out-good" SHIM_OUT_TARGETS="$tmp/out-targets-quoted" SHIM_ARGS="$quotedlog" \
+      PATH="$shimdir:$PATH" sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 1 ]; then
+  bad "quoted-default shim: expected exit 1, got $rc: $out"
+else
+  case "$out" in
+    *"REJECTED docker.io/library/alpine:latest"*) ok ;;
+    *) bad "quoted-default shim: should reject alpine by name, got: $out" ;;
+  esac
+  case "$out" in
+    *"the file's FROM set contains at least one base image off the allowlist"*) ok ;;
+    *) bad "quoted-default shim: should print the FROM-set failure summary, got: $out" ;;
+  esac
+fi
+if grep -qx -- '--call=targets,format=json' "$quotedlog"; then
+  ok
+else
+  bad "quoted-default shim: the targets call never reached docker: $(cat "$quotedlog")"
+fi
+if grep -qx -- '--call=outline,format=json' "$quotedlog"; then
+  bad "quoted-default shim: the outline call reached docker although the FROM set already failed: $(cat "$quotedlog")"
+else
+  ok
 fi
 
 echo "--- case 8: a base identical to its own stage name is a pull, not a stage reference ---"

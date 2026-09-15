@@ -27,9 +27,12 @@
 # base. The artifact report has a guard: a load outside the FROM set is
 # reported as an artifact source only when the file contains at least one
 # instruction that can pull an image other than FROM (a COPY --from= or a
-# RUN --mount= with a from= source, counted on the joined logical lines).
-# With none present, such a load can only be a base the scan expanded
-# differently than the frontend did, and the run exits 1 naming it. That
+# RUN --mount= with a from= source, counted on the joined logical lines;
+# a source that names a declared stage does not count, because a stage
+# cannot pull an image, and mount keys match case-insensitively as
+# BuildKit matches them). With none present, such a load can only be a
+# base the scan expanded differently than the frontend did, and the run
+# exits 1 naming it. That
 # guard is the fallback for any divergence between the scan and the
 # frontend: whatever the scan misreads, the extra load fails the gate
 # instead of passing as an artifact source.
@@ -545,23 +548,27 @@ FROM_SET=$(CHECK_FROM_STAGES="$stages" CHECK_FROM_BUILD_ARGS="$USER_ARGS" \
   -v target_stage="$TARGET_STAGE" '
 function fail(msg) { print msg; EXITCODE = 1; exit 1 }
 
-function autofail(name, where) {
+function autofail(name, mode, where) {
   if (name in ARGS || !(name in AUTO)) return
+  if (mode == "count") { COUNT_UNCERTAIN = 1; return }
   if (name == "TARGETSTAGE")
     fail(where " reads the automatic argument TARGETSTAGE, which BuildKit sets to the target stage name on every build. Pass --target so the gate resolves the same value the build does")
   fail(where " reads the automatic platform argument " name ", which BuildKit sets on every build. Pass --platform (and --build-platform when the build platform differs from the target) so the gate resolves the same file the builder does")
 }
 
 function lookup(name, mode, where) {
-  autofail(name, where)
+  autofail(name, mode, where)
   if (name in ARGS) return ARGS[name]
   if (mode == "from") UNRESOLVED = UNRESOLVED " " name
+  if (mode == "count") COUNT_UNCERTAIN = 1
   return ""
 }
 
 # Expand $NAME, ${NAME}, ${NAME:-default}, ${NAME:+alt} in s, exactly as
 # check-from-lines.sh does; any other modifier is rejected naming the
-# expression.
+# expression. In mode "count" nothing is rejected: a form this expander
+# cannot resolve sets COUNT_UNCERTAIN and returns instead, and the caller
+# counts the source rather than failing a file the frontend may accept.
 function expand_str(s, mode, where,   out, j, k, name, c, mod, word, isset) {
   out = ""
   while (length(s) > 0) {
@@ -571,8 +578,10 @@ function expand_str(s, mode, where,   out, j, k, name, c, mod, word, isset) {
     s = substr(s, j + 1)
     if (substr(s, 1, 1) == "{") {
       s = substr(s, 2)
-      if (!match(s, /^[A-Za-z_][A-Za-z0-9_]*/))
+      if (!match(s, /^[A-Za-z_][A-Za-z0-9_]*/)) {
+        if (mode == "count") { COUNT_UNCERTAIN = 1; return "" }
         fail("bad substitution \"${" s "\" at " where)
+      }
       name = substr(s, RSTART, RLENGTH)
       s = substr(s, RLENGTH + 1)
       c = substr(s, 1, 1)
@@ -581,22 +590,30 @@ function expand_str(s, mode, where,   out, j, k, name, c, mod, word, isset) {
         out = out lookup(name, mode, where)
       } else if (c == ":") {
         mod = substr(s, 2, 1)
-        if (mod != "-" && mod != "+")
+        if (mod != "-" && mod != "+") {
+          if (mode == "count") { COUNT_UNCERTAIN = 1; return "" }
           fail("unsupported modifier in \"${" name ":" mod "...}\" at " where ": only ${NAME}, ${NAME:-default} and ${NAME:+alt} are supported")
+        }
         k = index(s, "}")
-        if (k == 0)
+        if (k == 0) {
+          if (mode == "count") { COUNT_UNCERTAIN = 1; return "" }
           fail("missing } in \"${" name s "\" at " where)
+        }
         word = substr(s, 3, k - 3)
         s = substr(s, k + 1)
-        if (word ~ /[${}"]/ || index(word, SQ) > 0 || index(word, ESC) > 0)
+        if (word ~ /[${}"]/ || index(word, SQ) > 0 || index(word, ESC) > 0) {
+          if (mode == "count") { COUNT_UNCERTAIN = 1; return "" }
           fail("unsupported nested expansion in \"${" name ":" mod word "}\" at " where)
-        autofail(name, where)
+        }
+        autofail(name, mode, where)
         isset = (name in ARGS && ARGS[name] != "")
         if (mod == "-") out = out (isset ? ARGS[name] : word)
         else            out = out (isset ? word : "")
       } else if (c == "") {
+        if (mode == "count") { COUNT_UNCERTAIN = 1; return "" }
         fail("missing } in \"${" name "\" at " where)
       } else {
+        if (mode == "count") { COUNT_UNCERTAIN = 1; return "" }
         fail("unsupported variable modifier in \"${" name c "...}\" at " where ": only ${NAME}, ${NAME:-default} and ${NAME:+alt} are supported")
       }
     } else if (match(s, /^[A-Za-z_][A-Za-z0-9_]*/)) {
@@ -752,28 +769,68 @@ BEGIN {
   process_global(logical, bufline)
 }
 
-function process_global(logical, lineno,   n, f, instr, ai, t, p, name, val, q, inner, litq, fi) {
+# art_source(v, lineno): decide whether a COPY --from= or RUN --mount from=
+# source can pull an image, and count it in ART when it can. A source
+# naming a declared stage is a stage reference, never a pull, so it does
+# not count: the raw value is expanded with the same global ARG table the
+# FROM set uses, then matched against the stage graph by AS name
+# (case-insensitively, as BuildKit matches stage names) and by in-range
+# numeric stage index. A value this expander cannot resolve (an escape
+# character, an unresolved variable, a form beyond ${NAME}, ${NAME:-word}
+# and ${NAME:+word}) counts rather than fails, because overstating the
+# count only leaves an off-set load on the artifact-report path, while
+# failing would reject files the frontend accepts. A named context cannot
+# change the classification: a context matching the AS name of a stage
+# replaces the base of that stage while the stage stays a stage, and a
+# context matching anything else replaces a source that already counts.
+function art_source(v, lineno,   ev, oth) {
+  if (index(v, ESC) > 0) { ART++; return }
+  COUNT_UNCERTAIN = 0
+  ev = expand_str(v, "count", "line " lineno)
+  if (COUNT_UNCERTAIN) { ART++; return }
+  if (ev ~ /^[0-9]+$/ && ev + 0 < NSTAGE) return
+  for (oth = 1; oth <= NSTAGE; oth++)
+    if (SN[oth] != "" && tolower(SN[oth]) == tolower(ev)) return
+  ART++
+}
+
+function process_global(logical, lineno,   n, f, instr, ai, t, p, name, val, q, inner, litq, fi, nmo, mo, mi, meq) {
   sub("^" WS, "", logical)
   n = split(logical, f, WS)
   if (n == 0) return
   instr = toupper(f[1])
   # Count the instructions that can pull an image other than FROM, on the
   # joined logical lines across the whole file: a COPY with a --from= flag
-  # and a RUN with a --mount= flag whose value carries a from= source. The
-  # count feeds the unexpanded-base fallback below the outline run; when
-  # it is zero, a resolved load outside the FROM set can only be a base
-  # this scan expanded differently than the frontend. The count reads
-  # heredoc bodies as instructions (this scan does not track heredocs), so
-  # a file can overstate it, which only leaves such a load on the
-  # artifact-report path it is on today, never rejects a good file.
+  # and a RUN with a --mount= flag whose value carries a from= source,
+  # except when the source names a declared stage (art_source above holds
+  # the rules). The count feeds the unexpanded-base fallback below the
+  # outline run; when it is zero, a resolved load outside the FROM set can
+  # only be a base this scan expanded differently than the frontend. The
+  # count reads heredoc bodies as instructions (this scan does not track
+  # heredocs), so a file can overstate it, which only leaves such a load
+  # on the artifact-report path it is on today, never rejects a good file.
+  # Mount option keys match case-insensitively because BuildKit lowercases
+  # them before matching: a real cacheonly build on this daemon (Docker
+  # 29.8, buildx 0.37) accepts --mount=type=bind,FROM=alpine:3.19,
+  # target=/mnt and serves the image content into the mount, and the Type=
+  # and From= spellings build the same, while an unknown key fails the
+  # build naming it.
   if (instr == "COPY") {
     for (fi = 2; fi <= n && substr(f[fi], 1, 2) == "--"; fi++)
-      if (substr(f[fi], 1, 7) == "--from=") ART++
+      if (substr(f[fi], 1, 7) == "--from=") art_source(substr(f[fi], 8), lineno)
     return
   }
   if (instr == "RUN") {
-    for (fi = 2; fi <= n && substr(f[fi], 1, 2) == "--"; fi++)
-      if (substr(f[fi], 1, 8) == "--mount=" && index(f[fi], "from=") > 0) ART++
+    for (fi = 2; fi <= n && substr(f[fi], 1, 2) == "--"; fi++) {
+      if (substr(f[fi], 1, 8) != "--mount=") continue
+      nmo = split(substr(f[fi], 9), mo, ",")
+      for (mi = 1; mi <= nmo; mi++) {
+        meq = index(mo[mi], "=")
+        if (meq == 0) continue
+        if (tolower(substr(mo[mi], 1, meq - 1)) != "from") continue
+        art_source(substr(mo[mi], meq + 1), lineno)
+      }
+    }
     return
   }
   if (instr == "FROM") { done = 1; return }
@@ -870,9 +927,11 @@ END {
     }
     outbuf = outbuf resolved "\t" norm_ref(resolved) "\n"
   }
-  # The artifact-capable count travels on the first output line; the
-  # FROM-set members follow, one per line.
-  printf "artifact-capable\t%d\n", ART
+  # The artifact-capable count travels on the first output line, which
+  # begins with a TAB so no FROM-set member can imitate it: a member line
+  # begins with its reference, and no reference the builder accepts begins
+  # with a TAB. The FROM-set members follow, one per line.
+  printf "\tartifact-capable\t%d\n", ART
   printf "%s", outbuf
 }
 ' < "$DOCKERFILE")
@@ -887,18 +946,21 @@ TAB=$(printf '\t')
 # Every member of the FROM set must be on the allowlist; a rejected member
 # fails the gate before the outline runs. The member prints in canonical
 # form when it has one, matching what the build's load lines show. The
-# scan's first line carries the count of artifact-capable instructions for
-# the unexpanded-base fallback below.
+# scan's count line carries the number of artifact-capable instructions
+# for the unexpanded-base fallback below; it is the only line beginning
+# with a TAB, so a base written as artifact-capable stays a member and
+# meets the allowlist like any other. A count that is missing or not a
+# number fails the run below, never passes it.
 fromset_match="$NL"
 fail=0
-ART_CAPABLE=0
+ART_CAPABLE=""
 old_ifs=$IFS
 IFS=$NL
 for line in $FROM_SET; do
   [ -n "$line" ] || continue
   case "$line" in
-    "artifact-capable$TAB"*)
-      ART_CAPABLE=${line#*"$TAB"}
+    "$TAB"artifact-capable"$TAB"*)
+      ART_CAPABLE=${line##*"$TAB"}
       continue
       ;;
   esac
@@ -931,6 +993,15 @@ if [ "$fail" -ne 0 ]; then
   echo "check-from-oracle: the file's FROM set contains at least one base image off the allowlist"
   exit 1
 fi
+
+# Fail closed on a count the scan did not report as a number; the fallback
+# below compares it arithmetically, and an unreadable count must never
+# widen the artifact path or pass the gate.
+case "$ART_CAPABLE" in
+  ''|*[!0-9]*)
+    not_a_pass "the FROM-set scan reported no numeric artifact-capable count (got '$ART_CAPABLE'), so the unexpanded-base fallback cannot be trusted"
+    ;;
+esac
 
 # --- resolution and artifact sources, from the outline run ------------------
 out=$(bounded docker buildx build --call=outline,format=json --progress=plain "$@" \
