@@ -196,8 +196,11 @@ redeclaration stays allowed.
 Both scripts take a repeatable `--build-context NAME=SOURCE`, and step 9
 passes every named context from the captured invocation to both. BuildKit
 matches a context name against the expanded FROM reference and against
-stage names after docker reference normalization on both sides, so a gate
-run without the contexts checks a different base than the build resolves.
+stage names after docker reference normalization on both sides, and it
+applies a name matching a stage's AS name at the stage's definition,
+replacing that stage's base even when no FROM references the name, so a
+gate run without the contexts checks a different base than the build
+resolves.
 The oracle passes each context through to buildx unchanged; the overridden
 load prints as `#N [context NAME] load metadata for REF`, which the
 label-agnostic parsing reads like any other reference. Every rule below
@@ -207,13 +210,13 @@ build, on Docker 29.8.0 with buildx v0.37.0.
 | Construct | BuildKit | Gate | Fixture |
 |---|---|---|---|
 | context name matching a FROM reference | the docker-image:// source replaces the base; other source kinds (local directory, git, oci-layout, target) build the base from that source | docker-image://REF puts REF through the allowlist in place of the FROM; any other source kind for a FROM name exits 1 as unsupported for a base | build context overriding a Chainguard FROM to alpine is rejected; build context overriding a FROM to another Chainguard image is allowed; local-directory context for a FROM name is rejected; oracle test case 6 |
-| matching normalization | reference normalization on both sides: a bare name gains docker.io/library/ and :latest, index.docker.io maps to docker.io, the host compares case-insensitively | same rules in norm_ref, shared by both scripts | context name with a tag matches an untagged FROM; fully qualified context name matches a short FROM; index.docker.io context name matches a short FROM; context name with a different tag does not match |
+| matching normalization | reference normalization on both sides: a bare name gains docker.io/library/ and :latest, index.docker.io maps to docker.io only in that exact lowercase spelling, the host keeps its case from splitDockerDomain and compares byte-exact, and a dotless first component that is not all-lowercase is a domain (Foo/bar is domain Foo, path bar) | same rules in norm_ref, shared by both scripts | context name with a tag matches an untagged FROM; fully qualified context name matches a short FROM; index.docker.io context name matches a short FROM; context name with a different tag does not match; uppercase-host context name does not match a lowercase FROM; lowercase-host context name matches the FROM the uppercase one missed; uppercase index.docker.io context name does not map or match; dotless uppercase first component is a domain and matches its context; lowercased context does not match an uppercase-domain FROM; oracle test case 10 |
 | matching against the expanded reference | the context match sees the FROM after ARG expansion | same | context matching happens after ARG expansion |
-| context name matching a stage name | the context beats the stage wherever it is referenced | same, checked at each FROM | context overriding a stage alias to alpine is rejected; context overriding a stage alias to a Chainguard image is allowed |
-| context named scratch | `FROM scratch` stays the empty base; a named context cannot override scratch | same | scratch cannot be overridden by a context |
+| context name matching a stage name | applied at the stage's definition: the stage's base is replaced even when no FROM references the name, with reference normalization on the name, and the stage-name match beats a context matching the base reference; at a FROM, the context beats the stage wherever it is referenced | same, checked at each AS name and at each FROM | stage-name context overriding a Chainguard stage to alpine is rejected; stage-name context overriding a stage to a Chainguard image is allowed; normalized stage-name context still overrides the stage; local-directory context for a stage name is rejected; context overriding a stage alias to alpine is rejected; context overriding a stage alias to a Chainguard image is allowed; oracle test case 9 |
+| context named scratch | `FROM scratch` stays the empty base; a named context cannot override scratch by the base name, but a context matching the stage's AS name replaces even a scratch base (pinned by a real cacheonly build) | same | scratch cannot be overridden by a context; stage-name context replaces a scratch base |
 | digest-pinned FROM | matches a context only on the exact digest string; the bare name does not match | same | context with the exact digest string overrides the FROM; bare context name does not match a digest-pinned FROM |
 | repeated context name | the last value wins | same | repeated context name applies the last value (allowed, rejected) |
-| context name matching no FROM and no stage a FROM uses | ignored for bases (a COPY --from source may still use it, including from a local directory) | same | context whose name matches nothing is ignored; local-directory context for a copy source is ignored by the FROM gate |
+| context name matching no FROM and no stage name | ignored for bases (a COPY --from source may still use it, including from a local directory) | same | context whose name matches nothing is ignored; local-directory context for a copy source is ignored by the FROM gate |
 | context name that is not a valid reference | buildx refuses the invocation (invalid context name, lowercase repository rule) | exit 1 naming the context | invalid context name is refused |
 
 ## Artifact sources

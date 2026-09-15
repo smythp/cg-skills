@@ -36,16 +36,20 @@
 #                         invocation; repeatable, last value per name wins,
 #                         as in buildx. BuildKit replaces a FROM whose
 #                         reference or stage name matches NAME (after
-#                         reference normalization on both sides), so a gate
+#                         reference normalization on both sides), and it
+#                         applies a NAME matching a stage's AS name at the
+#                         stage's definition, replacing that stage's base
+#                         even when no FROM references the name, so a gate
 #                         run without these checks a different base than
 #                         the one being built. A docker-image:// source
-#                         replaces the FROM reference for the check; any
-#                         other source kind matching a FROM is rejected,
+#                         replaces the FROM reference (or the overridden
+#                         stage's base) for the check; any other source
+#                         kind matching a FROM or a stage name is rejected,
 #                         because a base taken from a directory, git
 #                         repository, oci layout, or another target cannot
 #                         be checked against a registry allowlist. A NAME
-#                         matching no FROM and no stage used by a FROM is
-#                         ignored, as BuildKit ignores it for bases.
+#                         matching no FROM and no stage name is ignored,
+#                         as BuildKit ignores it for bases.
 #
 # Exit codes: 0 = all FROMs allowed; 1 = a FROM (or stage alias, or ARG
 # expansion, or a construct this gate refuses to guess about) is not allowed,
@@ -177,14 +181,20 @@
 #   - Named build contexts: BuildKit matches each --build-context name
 #     against the expanded FROM reference and against stage names, after
 #     docker reference normalization on both sides (a bare name gains
-#     docker.io/library/ and :latest, index.docker.io maps to docker.io, a
-#     digest reference matches only the exact digest string), and the
-#     match beats a stage of the same name while scratch cannot be
-#     overridden at all; each rule pinned by an outline run or a real
-#     build. The gate applies the same matching at each FROM. A matching
-#     docker-image://REF source puts REF through the allowlist in place of
-#     the FROM; a matching source of any other kind is rejected as
-#     unsupported for a base; a name that matches nothing is ignored.
+#     docker.io/library/ and :latest, index.docker.io maps to docker.io in
+#     that exact lowercase spelling only, the registry host compares
+#     byte-exact with its case preserved, a digest reference matches only
+#     the exact digest string). A name matching a stage's AS name applies
+#     at the stage's definition, replacing that stage's base even when no
+#     FROM references the name, and it beats a context matching the base
+#     reference and a scratch base alike; at a FROM, a context beats a
+#     stage of the same name, while FROM scratch itself cannot be
+#     overridden by a context named scratch; each rule pinned by an
+#     outline run or a real build. The gate applies the same matching at
+#     each FROM and at each AS name. A matching docker-image://REF source
+#     puts REF through the allowlist in place of the FROM (or of the
+#     overridden stage's base); a matching source of any other kind is
+#     rejected as unsupported; a name that matches nothing is ignored.
 #   - A stage alias must match ^[a-zA-Z][a-zA-Z0-9_.-]*$ (Docker stage-name
 #     rules) so an image-shaped alias cannot become a trusted name for later
 #     FROMs. Aliases compare case-insensitively.
@@ -203,8 +213,8 @@
 # a default for an automatic argument name is rejected even though BuildKit
 # accepts the file (the automatic arguments bullet above says why); a
 # --build-context whose source is not docker-image:// is rejected when its
-# name matches a FROM, where BuildKit would build the base from that
-# source; and with --platform but no
+# name matches a FROM or a stage name, where BuildKit would build the base
+# from that source; and with --platform but no
 # --build-platform the BUILD* arguments take the target platform's values,
 # which matches every same-platform build but differs on a cross-platform
 # one until the caller passes --build-platform.
@@ -515,14 +525,20 @@ function expand_str(s, mode, lineno,   out, j, k, name, c, mod, word, isset) {
 # reference normalization does before BuildKit matches it against a named
 # build context, each rule pinned by an outline run (the named-contexts
 # fixtures record the runs). The part before the first / is a registry
-# host only when it contains a dot or a colon or is exactly localhost;
-# index.docker.io maps to docker.io; a docker.io path without a slash
-# gains library/; a reference with neither tag nor digest gains :latest;
-# the host compares case-insensitively; a digest part is kept verbatim.
-# Returns the empty string for a value docker refuses (an uppercase
-# repository, whitespace, empty parts, a colon inside the path). BuildKit
-# fails any build whose FROM needs such a value and buildx refuses such a
-# context name, so an empty result never silently matches.
+# host only when it contains a dot or a colon, is exactly localhost, or
+# is not all-lowercase (splitDockerDomain treats a dotless first
+# component with an uppercase letter as a domain: Foo/bar is domain Foo,
+# path bar, pinned by an outline run where a byte-identical context
+# matches it); the host keeps its case and compares byte-exact (a
+# DOCKER.io context does not match a docker.io FROM, also pinned);
+# index.docker.io maps to docker.io only in that exact lowercase
+# spelling; a docker.io path without a slash gains library/; a reference
+# with neither tag nor digest gains :latest; a digest part is kept
+# verbatim. Returns the empty string for a value docker refuses (an
+# uppercase repository, whitespace, empty parts, a colon inside the
+# path). BuildKit fails any build whose FROM needs such a value and
+# buildx refuses such a context name, so an empty result never silently
+# matches.
 function norm_ref(r,   host, rest, dig, tag, slash, last, colon, dpos) {
   if (r == "") return ""
   if (r ~ /[ \t\r]/ || index(r, VT) > 0 || index(r, FF) > 0) return ""
@@ -537,10 +553,9 @@ function norm_ref(r,   host, rest, dig, tag, slash, last, colon, dpos) {
   if (slash == 0) { host = "docker.io"; rest = r }
   else {
     host = substr(r, 1, slash - 1)
-    if (host ~ /[.:]/ || host == "localhost") rest = substr(r, slash + 1)
+    if (host ~ /[.:]/ || host == "localhost" || host != tolower(host)) rest = substr(r, slash + 1)
     else { host = "docker.io"; rest = r }
   }
-  host = tolower(host)
   if (host == "index.docker.io") host = "docker.io"
   if (host == "" || rest == "") return ""
   tag = ""
@@ -891,7 +906,7 @@ END {
   exit EXITCODE + 0
 }
 
-function process(logical, lineno,   n, f, instr, sub2, p, q, ref, resolved, alias, lc, i, ai, t, name, val, inner, litq, cnorm, csrc, checked, lc2, LEXW, ln) {
+function process(logical, lineno,   n, f, instr, sub2, p, q, ref, resolved, alias, lc, i, ai, t, name, val, inner, litq, cnorm, anorm, csrc, checked, lc2, LEXW, ln) {
   n = split(logical, f, WS)
   if (n == 0) return
   instr = toupper(f[1])
@@ -988,6 +1003,32 @@ function process(logical, lineno,   n, f, instr, sub2, p, q, ref, resolved, alia
     if (alias !~ /^[a-zA-Z][a-zA-Z0-9_.-]*$/)
       fail("FROM stage alias \"" alias "\" at line " lineno " is not allowed: aliases must match ^[a-zA-Z][a-zA-Z0-9_.-]*$ (Docker stage-name rules)")
     alias = tolower(alias)
+  }
+
+  # A context whose name matches the AS name of this stage applies at the
+  # stage definition, replacing the base of the stage even when no FROM
+  # references the name, with reference normalization on the name (a docker.io/library/
+  # spelling matches a bare stage name) and case-insensitively on the
+  # alias, and it beats a context matching the base reference and a
+  # scratch base alike; each rule pinned by an outline run (the scratch
+  # replacement by a real cacheonly build too). The base as written is
+  # never pulled, so the context source stands in for it entirely.
+  if (alias != "" && N_CTX > 0) {
+    anorm = norm_ref(alias)
+    if (anorm != "" && (anorm in CTX)) {
+      csrc = CTX[anorm]
+      if (substr(csrc, 1, 15) != "docker-image://")
+        fail("the stage \"" alias "\" at line " lineno " is overridden by a --build-context whose source (" csrc ") is not a docker-image:// reference. BuildKit builds the stage from that source in place of its base, and a base taken from a local directory, a git repository, an oci layout, or another build target cannot be checked against the allowlist, so a named context of that kind is unsupported for a stage name")
+      checked = substr(csrc, 16)
+      lc2 = tolower(checked)
+      ok = 0
+      if (substr(lc2, 1, 8) == "cgr.dev/") ok = 1
+      else if (mirror != "" && substr(lc2, 1, length(mirror) + 1) == mirror "/") ok = 1
+      if (!ok)
+        fail("the stage \"" alias "\" at line " lineno " (base \"" resolved "\") is overridden by --build-context to \"" checked "\", which is not allowed: base images must come from cgr.dev/* or the configured external mirror")
+      ALIASES[alias] = 1
+      return
+    }
   }
 
   lc = tolower(resolved)

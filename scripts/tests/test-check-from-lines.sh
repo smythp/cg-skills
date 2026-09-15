@@ -839,6 +839,94 @@ run_case "invalid context name is refused" "" err "not a valid image reference" 
 FROM cgr.dev/chainguard/wolfi-base
 EOF
 
+# Oracle: with --build-context builder=docker-image://alpine:latest the
+# outline loads only alpine:latest under [context builder]; wolfi-base is
+# never touched. BuildKit applies a context whose name matches a stage's
+# AS name at the stage's definition, replacing the stage's base even when
+# no FROM references the name.
+run_case "stage-name context overriding a Chainguard stage to alpine is rejected" "" err "overridden by --build-context" --build-context builder=docker-image://alpine:latest <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base AS builder
+RUN echo hi
+EOF
+
+# Oracle: the same override pointed at cgr.dev/chainguard/static:latest
+# loads only static under [context builder]; the substituted base is on
+# the allowlist.
+run_case "stage-name context overriding a stage to a Chainguard image is allowed" "" ok "" --build-context builder=docker-image://cgr.dev/chainguard/static:latest <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base AS builder
+RUN echo hi
+EOF
+
+# Oracle: the context name docker.io/library/builder also loads alpine
+# under [context builder]; reference normalization applies to the name
+# before it is matched against the stage name.
+run_case "normalized stage-name context still overrides the stage" "" err "overridden by --build-context" --build-context docker.io/library/builder=docker-image://alpine:latest <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base AS builder
+RUN echo hi
+EOF
+
+# Oracle: with --build-context builder=./ctxdir the outline loads no
+# metadata at all for the stage; its base comes from the directory, which
+# no registry allowlist can vouch for.
+run_case "local-directory context for a stage name is rejected" "" err "unsupported for a stage name" --build-context builder=./ctxdir <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base AS builder
+RUN echo hi
+EOF
+
+# Real build (cacheonly): FROM scratch AS builder with --build-context
+# builder=docker-image://alpine:latest resolves docker.io/library/alpine;
+# the stage-name match replaces even a scratch base, unlike a context
+# named scratch matching FROM scratch, which stays the empty base.
+run_case "stage-name context replaces a scratch base" "" err "overridden by --build-context" --build-context builder=docker-image://alpine:latest <<'EOF'
+FROM scratch AS builder
+EOF
+
+# Oracle: with --build-context DOCKER.io/library/alpine=docker-image://
+# cgr.dev/chainguard/static:latest the outline loads
+# docker.io/library/alpine:latest under [internal]; the context is
+# accepted by buildx but matches nothing, because splitDockerDomain keeps
+# the domain case and the two hosts compare byte-exact. alpine stays the
+# base and stays rejected.
+run_case "uppercase-host context name does not match a lowercase FROM" "" err "alpine" --build-context DOCKER.io/library/alpine=docker-image://cgr.dev/chainguard/static:latest <<'EOF'
+FROM alpine
+RUN echo hi
+EOF
+
+# Oracle: the all-lowercase spelling of the same context loads static
+# under [context alpine]; together with the case above this pins the
+# byte-exact host comparison.
+run_case "lowercase-host context name matches the FROM the uppercase one missed" "" ok "" --build-context docker.io/library/alpine=docker-image://cgr.dev/chainguard/static:latest <<'EOF'
+FROM alpine
+RUN echo hi
+EOF
+
+# Oracle: with --build-context INDEX.docker.io/library/alpine=... the
+# outline loads docker.io/library/alpine:latest under [internal]; the
+# index.docker.io to docker.io mapping applies only to the exact lowercase
+# spelling, so this name matches nothing and alpine stays rejected.
+run_case "uppercase index.docker.io context name does not map or match" "" err "alpine" --build-context INDEX.docker.io/library/alpine=docker-image://cgr.dev/chainguard/static:latest <<'EOF'
+FROM alpine
+RUN echo hi
+EOF
+
+# Oracle: FROM Foo/bar with the byte-identical context Foo/bar loads only
+# static under [context Foo/bar]; splitDockerDomain treats a dotless
+# first component that is not all-lowercase as a domain (domain Foo, path
+# bar), so the reference is valid and the context matches it.
+run_case "dotless uppercase first component is a domain and matches its context" "" ok "" --build-context Foo/bar=docker-image://cgr.dev/chainguard/static:latest <<'EOF'
+FROM Foo/bar
+RUN echo hi
+EOF
+
+# Oracle: with the lowercased context foo/bar the outline loads
+# Foo/bar:latest under [internal] and fails resolving the host Foo; the
+# two spellings are different references, so nothing matches and Foo/bar
+# is checked as written, off the allowlist.
+run_case "lowercased context does not match an uppercase-domain FROM" "" err "Foo/bar" --build-context foo/bar=docker-image://cgr.dev/chainguard/static:latest <<'EOF'
+FROM Foo/bar
+RUN echo hi
+EOF
+
 # --- artifact sources ------------------------------------------------------
 # COPY --from and RUN --mount=from name external artifact sources, which
 # the registry rules permit as report entries; only FROM lines meet the

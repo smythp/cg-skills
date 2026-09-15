@@ -25,6 +25,11 @@
 #   7. artifact sources: COPY --from and RUN --mount=from references are
 #      printed as external artifact sources and allowed, and a reference
 #      that is both a base and a copy source is rejected as a base
+#   9. a named context matching a stage's AS name replaces that stage's
+#      base at the definition, so the substituted reference is what meets
+#      the allowlist, with reference normalization on the context name
+#  10. context names keep their registry host case and compare byte-exact,
+#      so an uppercase-host spelling matches nothing
 #
 # The shim cases need no container engine: a docker shim on PATH prints
 # canned output per call (targets and outline separately, and a timeout
@@ -309,6 +314,82 @@ else
   case "$out" in
     *"external artifact source docker.io/library/alpine:latest"*) ok ;;
     *) bad "mount artifact source: should report alpine as an artifact source, got: $out" ;;
+  esac
+fi
+
+echo "--- case 9: named context at the stage definition ---"
+# BuildKit applies a context whose name matches a stage's AS name at the
+# stage's definition, replacing the stage's base even when no FROM
+# references the name (outline: only alpine:latest loads, under [context
+# builder], and wolfi-base is never touched). The substituted base enters
+# the FROM set and is rejected there in canonical form; pointed at another
+# Chainguard image it passes, with the [context builder] load matching the
+# set. Reference normalization applies to the context name, so the
+# docker.io/library/builder spelling overrides the same stage.
+cat > "$tmp/Dockerfile" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base AS builder
+RUN echo hi
+EOF
+out=$(sh "$SCRIPT" --build-context builder=docker-image://alpine:latest \
+      "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -eq 0 ]; then
+  bad "stage-name context to alpine: expected rejection, got a pass"
+else
+  case "$out" in
+    *"REJECTED docker.io/library/alpine:latest"*) ok ;;
+    *) bad "stage-name context to alpine: should reject alpine in canonical form, got: $out" ;;
+  esac
+fi
+out=$(sh "$SCRIPT" --build-context builder=docker-image://cgr.dev/chainguard/static:latest \
+      "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  bad "stage-name context to static: expected pass, exit $rc: $out"
+else
+  case "$out" in
+    *"allowed  cgr.dev/chainguard/static:latest"*) ok ;;
+    *) bad "stage-name context to static: should allow static, got: $out" ;;
+  esac
+fi
+out=$(sh "$SCRIPT" --build-context docker.io/library/builder=docker-image://alpine:latest \
+      "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -eq 0 ]; then
+  bad "normalized stage-name context: expected rejection, got a pass"
+else
+  case "$out" in
+    *"REJECTED docker.io/library/alpine:latest"*) ok ;;
+    *) bad "normalized stage-name context: should reject alpine, got: $out" ;;
+  esac
+fi
+
+echo "--- case 10: registry host case in context matching ---"
+# BuildKit keeps the domain case from splitDockerDomain and compares hosts
+# byte-exact: the DOCKER.io spelling is accepted by buildx but matches
+# nothing (outline: docker.io/library/alpine:latest loads under
+# [internal]), so alpine stays the base and is rejected; the all-lowercase
+# spelling matches and substitutes static (outline: static loads under
+# [context alpine]).
+cat > "$tmp/Dockerfile" <<'EOF'
+FROM alpine
+RUN echo hi
+EOF
+out=$(sh "$SCRIPT" --build-context DOCKER.io/library/alpine=docker-image://cgr.dev/chainguard/static:latest \
+      "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -eq 0 ]; then
+  bad "uppercase-host context: expected rejection, got a pass"
+else
+  case "$out" in
+    *"REJECTED docker.io/library/alpine:latest"*) ok ;;
+    *) bad "uppercase-host context: should reject alpine, got: $out" ;;
+  esac
+fi
+out=$(sh "$SCRIPT" --build-context docker.io/library/alpine=docker-image://cgr.dev/chainguard/static:latest \
+      "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  bad "lowercase-host context: expected pass, exit $rc: $out"
+else
+  case "$out" in
+    *"allowed  cgr.dev/chainguard/static:latest"*) ok ;;
+    *) bad "lowercase-host context: should allow static, got: $out" ;;
   esac
 fi
 

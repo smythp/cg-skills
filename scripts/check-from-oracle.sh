@@ -41,9 +41,12 @@
 # Named build contexts from the captured invocation pass through to buildx
 # unchanged, and the FROM set applies them the way BuildKit does: a context
 # name matches the expanded base or a stage name after docker reference
-# normalization on both sides, a docker-image://REF source replaces the
-# base with REF for the check, and any other source kind matching a base
-# exits 1, because a base built from a directory, git repository, oci
+# normalization on both sides (the registry host compares byte-exact with
+# its case preserved), a name matching a stage's AS name applies at the
+# stage's definition and replaces that stage's base even when no FROM
+# references the name, a docker-image://REF source replaces the base with
+# REF for the check, and any other source kind matching a base or a stage
+# name exits 1, because a base built from a directory, git repository, oci
 # layout, or another target cannot be checked against a registry
 # allowlist. A context that matches no base is left to the artifact rule.
 # The progress line for an overridden name has the form
@@ -469,7 +472,9 @@ fi
 # (canonical fills in docker.io/library/ and :latest for the load matching
 # below, and is empty for a ref that does not normalize); a base naming a
 # stage (forward references included) and scratch are stage references,
-# not pulls, and print nothing.
+# not pulls, and print nothing. A context whose name matches a stage's AS
+# name replaces that stage's base before any of this, so the substituted
+# reference is what enters the FROM set.
 FROM_SET=$(CHECK_FROM_STAGES="$stages" CHECK_FROM_BUILD_ARGS="$USER_ARGS" \
   CHECK_FROM_BUILD_CONTEXTS="$BUILD_CONTEXTS" LC_ALL=C awk \
   -v platform_set="$PLATFORM_SET" -v tplat="$T_PLAT" -v tos="$T_OS" \
@@ -545,7 +550,11 @@ function expand_str(s, mode, where,   out, j, k, name, c, mod, word, isset) {
 
 # norm_ref(r): the same docker reference normalization as
 # check-from-lines.sh (the two scripts share this function); the
-# named-contexts fixtures pin each rule.
+# named-contexts fixtures pin each rule. The part before the first / is a
+# registry host when it contains a dot or a colon, is exactly localhost,
+# or is not all-lowercase (splitDockerDomain); the host keeps its case and
+# compares byte-exact, and index.docker.io maps to docker.io only in that
+# exact lowercase spelling.
 function norm_ref(r,   host, rest, dig, tag, slash, last, colon, dpos) {
   if (r == "") return ""
   if (r ~ /[ \t\r]/ || index(r, VT) > 0 || index(r, FF) > 0) return ""
@@ -560,10 +569,9 @@ function norm_ref(r,   host, rest, dig, tag, slash, last, colon, dpos) {
   if (slash == 0) { host = "docker.io"; rest = r }
   else {
     host = substr(r, 1, slash - 1)
-    if (host ~ /[.:]/ || host == "localhost") rest = substr(r, slash + 1)
+    if (host ~ /[.:]/ || host == "localhost" || host != tolower(host)) rest = substr(r, slash + 1)
     else { host = "docker.io"; rest = r }
   }
-  host = tolower(host)
   if (host == "index.docker.io") host = "docker.io"
   if (host == "" || rest == "") return ""
   tag = ""
@@ -721,6 +729,28 @@ END {
     base = SB[i]
     where = "the base \"" base "\" of stage " i
     if (SN[i] != "") where = where " (" SN[i] ")"
+    # A context whose name matches the AS name of this stage applies at
+    # the stage definition, replacing the base of the stage even when no FROM
+    # references the name, with reference normalization on the name and
+    # case-insensitively on the stage name, beating a context matching the
+    # base reference and a scratch base alike (each rule pinned by an
+    # outline run; the scratch replacement by a real cacheonly build). The
+    # base as written is never pulled, so the context source enters the
+    # FROM set in its place, before any expansion of the written base, and
+    # the outline load for it matches the set.
+    if (N_CTX > 0 && SN[i] != "") {
+      an = norm_ref(tolower(SN[i]))
+      if (an != "" && (an in CTX)) {
+        csrc = CTX[an]
+        if (substr(csrc, 1, 15) != "docker-image://")
+          fail("the stage " SN[i] " is overridden by a --build-context whose source (" csrc ") is not a docker-image:// reference; BuildKit builds the stage from that source in place of its base, and a base taken from a local directory, a git repository, an oci layout, or another build target cannot be checked against the allowlist, so a named context of that kind is unsupported for a stage name")
+        resolved = substr(csrc, 16)
+        if (resolved == "")
+          fail("the stage " SN[i] " is overridden by a --build-context with an empty docker-image:// reference")
+        outbuf = outbuf resolved "\t" norm_ref(resolved) "\n"
+        continue
+      }
+    }
     UNRESOLVED = ""
     resolved = expand_str(base, "from", where)
     if (UNRESOLVED != "")
