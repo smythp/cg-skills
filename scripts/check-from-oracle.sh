@@ -24,7 +24,15 @@
 # them; each one is printed as an external artifact source and allowed. A
 # reference that is both a FROM base and an artifact source is in the FROM
 # set, so it is checked as a base; the artifact allowance cannot launder a
-# base.
+# base. The artifact report has a guard: a load outside the FROM set is
+# reported as an artifact source only when the file contains at least one
+# instruction that can pull an image other than FROM (a COPY --from= or a
+# RUN --mount= with a from= source, counted on the joined logical lines).
+# With none present, such a load can only be a base the scan expanded
+# differently than the frontend did, and the run exits 1 naming it. That
+# guard is the fallback for any divergence between the scan and the
+# frontend: whatever the scan misreads, the extra load fails the gate
+# instead of passing as an artifact source.
 #
 # This gate covers every stage the file declares, like the textual gate.
 # The migration gate is both scripts: this one asks the builder for the
@@ -94,6 +102,10 @@
 # ARG TARGETARCH stays allowed. So the scan can trust its own line
 # splitting, a NUL byte anywhere in the file and a CR that is not part of
 # a CRLF ending are rejected first, as check-from-lines.sh rejects them.
+# The scan reads the parser directives the way check-from-lines.sh does,
+# VT and FF normalized to spaces inside a directive line, and it accepts
+# only the rolling docker/dockerfile:1 syntax tag, failing the run on any
+# other frontend before either buildx call.
 #
 # For the expansion, TARGETSTAGE is seeded from --target when given and a
 # base that reads it without one exits 1 asking for --target, and without
@@ -123,7 +135,11 @@
 #       lacked its evidence, or printed a load-metadata line this script
 #       cannot parse, or a source policy is configured in the environment,
 #       or the file declares a default for an automatic argument name, or
-#       it contains a NUL byte or a bare CR; none of these is a pass
+#       it contains a NUL byte or a bare CR, or its syntax directive
+#       selects a frontend other than the rolling docker/dockerfile:1 tag
+#       (rejected before either buildx call, as check-from-lines.sh
+#       rejects it), or a resolved load sits outside the FROM set in a
+#       file with no artifact-capable instruction; none of these is a pass
 #   2 — usage error
 #
 # Dependencies: sh, awk, od, grep, sed, sort, tr, docker with buildx
@@ -333,6 +349,52 @@ if [ -n "$BAD_BYTE" ]; then
     NUL*) not_a_pass "line ${BAD_BYTE#* } of $DOCKERFILE contains a NUL byte; this script cannot scan such a file the way BuildKit reads it" ;;
     *)    not_a_pass "line ${BAD_BYTE#* } of $DOCKERFILE contains a CR that is not part of a CRLF line ending; this script cannot scan such a file the way BuildKit reads it (CRLF endings are accepted)" ;;
   esac
+fi
+
+# The expansion scan implements the rolling docker/dockerfile:1 frontend's
+# parsing rules, so a syntax directive naming any other frontend is
+# rejected here, before either buildx call, exactly as check-from-lines.sh
+# rejects it. A pinned tag parses by the pin's rules, not the rolling
+# frontend's, and buildx can answer a --call subrequest for a pinned
+# frontend through a different, subrequest-capable frontend, so neither
+# call below could vouch for what the pinned frontend builds. The walk
+# mirrors the directive block of the main scan: consecutive directive
+# lines from the top of the file, a BOM and leading whitespace allowed,
+# VT and FF normalized to spaces before the match, the block ended by the
+# first line that is not a known directive.
+SYN_MSG=$(LC_ALL=C awk '
+BEGIN {
+  SQ = sprintf("%c", 39)
+  BOM = sprintf("%c%c%c", 239, 187, 191)
+  WS  = sprintf("[ \t\r%c%c]+", 11, 12)
+  CTRL_WS = sprintf("[%c%c\r]", 11, 12)
+}
+{
+  raw = $0
+  if (NR == 1 && substr(raw, 1, 3) == BOM) raw = substr(raw, 4)
+  line = raw
+  sub(/\r$/, "", line); sub(/[ \t]+$/, "", line)
+  trimmed = line
+  sub("^" WS, "", trimmed)
+  dline = trimmed
+  gsub(CTRL_WS, " ", dline)
+  if (dline !~ /^#[ \t]*[A-Za-z][A-Za-z0-9]*[ \t]*=[ \t]*[^ \t]/) exit 0
+  dkey = dline
+  sub(/^#[ \t]*/, "", dkey)
+  dval = dkey
+  sub(/[ \t]*=.*$/, "", dkey)
+  dkey = tolower(dkey)
+  sub(/^[A-Za-z][A-Za-z0-9]*[ \t]*=[ \t]*/, "", dval)
+  sub(/[ \t]+$/, "", dval)
+  if (dkey != "escape" && dkey != "syntax" && dkey != "check") exit 0
+  if (dkey == "syntax" && dval != "docker/dockerfile:1" && dval != "docker.io/docker/dockerfile:1") {
+    print "syntax directive " SQ dval SQ " at line " NR " selects a frontend whose parsing rules this script cannot verify; only the rolling docker/dockerfile:1 tag (an optional docker.io/ prefix allowed) is supported"
+    exit 1
+  }
+}
+' < "$DOCKERFILE"); syn_rc=$?
+if [ "$syn_rc" -ne 0 ]; then
+  not_a_pass "$SYN_MSG"
 fi
 
 # 10-minute bound on each buildx call. TIMEOUT_BIN is timeout if present,
@@ -597,6 +659,7 @@ BEGIN {
   FF = sprintf("%c", 12)
   BOM = sprintf("%c%c%c", 239, 187, 191)
   WS  = sprintf("[ \t\r%c%c]+", 11, 12)
+  CTRL_WS = sprintf("[%c%c\r]", 11, 12)
   ESC = "\\"
   directive_mode = 1
   buf = ""; bufline = 0
@@ -645,7 +708,6 @@ BEGIN {
 }
 
 {
-  if (done) next
   raw = $0
   if (NR == 1 && substr(raw, 1, 3) == BOM) raw = substr(raw, 4)
   line = raw
@@ -653,8 +715,15 @@ BEGIN {
   trimmed = line
   sub("^" WS, "", trimmed)
   if (directive_mode) {
-    if (trimmed ~ /^#[ \t]*[A-Za-z][A-Za-z0-9]*[ \t]*=[ \t]*[^ \t]/) {
-      dkey = trimmed
+    # Directive lines normalize VT and FF to spaces before the match,
+    # exactly as check-from-lines.sh does: BuildKit treats both as
+    # whitespace inside a directive line, so an escape directive whose key
+    # is prefixed with a VT byte is still honored (pinned by an outline
+    # run that resolves through the backtick continuation it enables).
+    dline = trimmed
+    gsub(CTRL_WS, " ", dline)
+    if (dline ~ /^#[ \t]*[A-Za-z][A-Za-z0-9]*[ \t]*=[ \t]*[^ \t]/) {
+      dkey = dline
       sub(/^#[ \t]*/, "", dkey)
       dval = dkey
       sub(/[ \t]*=.*$/, "", dkey)
@@ -683,12 +752,32 @@ BEGIN {
   process_global(logical, bufline)
 }
 
-function process_global(logical, lineno,   n, f, instr, ai, t, p, name, val, q, inner, litq) {
+function process_global(logical, lineno,   n, f, instr, ai, t, p, name, val, q, inner, litq, fi) {
   sub("^" WS, "", logical)
   n = split(logical, f, WS)
   if (n == 0) return
   instr = toupper(f[1])
+  # Count the instructions that can pull an image other than FROM, on the
+  # joined logical lines across the whole file: a COPY with a --from= flag
+  # and a RUN with a --mount= flag whose value carries a from= source. The
+  # count feeds the unexpanded-base fallback below the outline run; when
+  # it is zero, a resolved load outside the FROM set can only be a base
+  # this scan expanded differently than the frontend. The count reads
+  # heredoc bodies as instructions (this scan does not track heredocs), so
+  # a file can overstate it, which only leaves such a load on the
+  # artifact-report path it is on today, never rejects a good file.
+  if (instr == "COPY") {
+    for (fi = 2; fi <= n && substr(f[fi], 1, 2) == "--"; fi++)
+      if (substr(f[fi], 1, 7) == "--from=") ART++
+    return
+  }
+  if (instr == "RUN") {
+    for (fi = 2; fi <= n && substr(f[fi], 1, 2) == "--"; fi++)
+      if (substr(f[fi], 1, 8) == "--mount=" && index(f[fi], "from=") > 0) ART++
+    return
+  }
   if (instr == "FROM") { done = 1; return }
+  if (done) return
   if (instr != "ARG") return
   for (ai = 2; ai <= n; ai++) {
     t = f[ai]
@@ -722,7 +811,7 @@ function process_global(logical, lineno,   n, f, instr, ai, t, p, name, val, q, 
 
 END {
   if (EXITCODE) exit EXITCODE
-  if (buf != "" && !done) process_global(buf, bufline)
+  if (buf != "") process_global(buf, bufline)
   if (EXITCODE) exit EXITCODE
   outbuf = ""
   for (i = 1; i <= NSTAGE; i++) {
@@ -781,6 +870,9 @@ END {
     }
     outbuf = outbuf resolved "\t" norm_ref(resolved) "\n"
   }
+  # The artifact-capable count travels on the first output line; the
+  # FROM-set members follow, one per line.
+  printf "artifact-capable\t%d\n", ART
   printf "%s", outbuf
 }
 ' < "$DOCKERFILE")
@@ -794,13 +886,22 @@ TAB=$(printf '\t')
 
 # Every member of the FROM set must be on the allowlist; a rejected member
 # fails the gate before the outline runs. The member prints in canonical
-# form when it has one, matching what the build's load lines show.
+# form when it has one, matching what the build's load lines show. The
+# scan's first line carries the count of artifact-capable instructions for
+# the unexpanded-base fallback below.
 fromset_match="$NL"
 fail=0
+ART_CAPABLE=0
 old_ifs=$IFS
 IFS=$NL
 for line in $FROM_SET; do
   [ -n "$line" ] || continue
+  case "$line" in
+    "artifact-capable$TAB"*)
+      ART_CAPABLE=${line#*"$TAB"}
+      continue
+      ;;
+  esac
   member=${line%%"$TAB"*}
   canon=${line#*"$TAB"}
   disp=$member
@@ -876,10 +977,24 @@ if [ -n "$meta" ]; then
     | sort -u)
 fi
 
+# The unexpanded-base fallback: a load outside the FROM set is an artifact
+# source only when the file has at least one instruction that can pull an
+# image other than FROM. When it has none, such a load can only be a base
+# this script's scan expanded differently than the frontend did, so the
+# run fails naming it. This is the fallback for any divergence between the
+# scan and the frontend: whatever the scan misreads, the extra load
+# surfaces here instead of passing as an artifact source.
 for ref in $refs; do
   case "$fromset_match" in
     *"$NL$ref$NL"*) : ;;
-    *) echo "check-from-oracle: external artifact source $ref (allowed; a COPY --from, RUN mount, or ADD pulls it, not a FROM; name it in the report)" ;;
+    *)
+      if [ "$ART_CAPABLE" -eq 0 ]; then
+        echo "check-from-oracle: REJECTED $ref — the build resolves it, it is not in the FROM set, and the file has no COPY --from= and no RUN --mount= with a from= source that could pull an artifact, so it is an unexpanded base: this script's scan and the frontend disagree about the file"
+        echo "check-from-oracle: this is not a pass; the FROM gate fails."
+        exit 1
+      fi
+      echo "check-from-oracle: external artifact source $ref (allowed; a COPY --from, RUN mount, or ADD pulls it, not a FROM; name it in the report)"
+      ;;
   esac
 done
 

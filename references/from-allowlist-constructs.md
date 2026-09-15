@@ -14,7 +14,13 @@ failing closed on anything it cannot expand or classify. Then
 --progress=plain` resolves the file; any line containing "load metadata
 for" is a reference whatever its bracketed step label, a load matching the
 FROM set is a base already checked, and every other load is printed as an
-external artifact source and allowed (see the artifact sources section).
+external artifact source and allowed (see the artifact sources section),
+unless the file has no instruction that can pull an image other than FROM,
+in which case such a load is an unexpanded base and fails the run, the
+fallback for any divergence between the oracle's scan and the frontend.
+The scan reads parser directives as the textual gate does (VT and FF
+normalized to spaces) and rejects a syntax directive naming any frontend
+other than the rolling tag before either buildx call.
 Both calls must show positive evidence they ran (the load-build-definition
 step plus their JSON result), and the script refuses to answer when a
 BuildKit source policy
@@ -103,7 +109,8 @@ the backtick.
 | `# check=...` | known key, block continues | same | check directive does not end the directive block |
 | unknown key or plain comment | ends the directive block | same | escape directive after a plain comment is inert (existing) |
 | duplicate directive | build error | exit 1 | duplicate escape directive is rejected (existing) |
-| `# syntax=` with any value other than the rolling `docker/dockerfile:1` tag (an optional `docker.io/` prefix allowed), matched byte for byte | replaces the parser with the pin's rules. Under 1.0 a heredoc body is ordinary instructions (a real build of the reproduction fails on unknown instruction EOT) and the outline subrequest does not exist; under 1.4.0 buildx answers the outline through a different frontend (docker/dockerfile:1.8.1 by digest), so an outline pass vouches for the wrong parser; 1.99 fails to pull; an uppercase spelling is an invalid reference | exit 1 naming the frontend | non-stable syntax directive fails closed (existing); rolling syntax tag with the docker.io prefix is accepted; pinned syntax tag 1.0 is rejected before heredoc parsing; pinned syntax tag 1.3 is rejected; pinned syntax tag 1.4.0 is rejected; pinned syntax tag 1.99 is rejected; uppercase syntax directive value is rejected |
+| `# syntax=` with any value other than the rolling `docker/dockerfile:1` tag (an optional `docker.io/` prefix allowed), matched byte for byte | replaces the parser with the pin's rules. Under 1.0 a heredoc body is ordinary instructions (a real build of the reproduction fails on unknown instruction EOT) and the outline subrequest does not exist; under 1.4.0 buildx answers the outline through a different frontend (docker/dockerfile:1.8.1 by digest), so an outline pass vouches for the wrong parser; 1.99 fails to pull; an uppercase spelling is an invalid reference | exit 1 naming the frontend, in both scripts; the oracle rejects it before either buildx call | non-stable syntax directive fails closed (existing); rolling syntax tag with the docker.io prefix is accepted; pinned syntax tag 1.0 is rejected before heredoc parsing; pinned syntax tag 1.3 is rejected; pinned syntax tag 1.4.0 is rejected; pinned syntax tag 1.99 is rejected; uppercase syntax directive value is rejected; oracle shim case: pinned syntax directive fails before either buildx call |
+| VT or FF inside a parser directive line | treated as whitespace, the directive is honored | same, both scripts normalize them to spaces before the match | oracle test case 11 (a VT-prefixed escape directive resolves alpine through the continuation it enables) |
 
 ## Physical line structure
 
@@ -226,10 +233,13 @@ an external artifact into the build without making it a base.
 `references/from-and-registry-rules.md` permits artifact copies and asks
 the report to name them, so the gate does not reject them. Only the FROM
 set meets the allowlist; the oracle prints every non-base load as an
-external artifact source for the report.
+external artifact source for the report, but only when the file contains
+at least one instruction that can pull an image other than FROM. With
+none present, an off-set load is an unexpanded base and fails the run.
 
 | Construct | BuildKit | Gate | Fixture |
 |---|---|---|---|
 | `COPY --from=IMAGE`, `RUN --mount=from=IMAGE`, ADD from an image | a metadata load, indistinguishable from a base load by its step label (verified; both print as [internal]) | the load is matched against the FROM set from the targets call; a non-base load is printed as an external artifact source and allowed | oracle test case 7; external COPY --from artifact source is not a base; external RUN mount source is not a base; bracketed-label shim case |
 | a reference that is both a FROM base and a copy source | one load serves both | it is in the FROM set, so it is checked as a base; the artifact allowance cannot launder it | a base doubling as a copy source is still a base; oracle test case 7 |
+| a load outside the FROM set in a file with no COPY --from= and no RUN --mount= carrying a from= source | only a FROM can have pulled it, so it is a base the scan expanded differently than the frontend | exit 1 naming the load; the fallback for any divergence between the oracle's scan and the frontend | oracle shim case: off-set load with no artifact-capable instruction is an unexpanded base; the bracketed-label shim case is the artifact-report pair |
 | an artifact source that fails to resolve | the build fails | the outline run fails, which is not a pass | covered by the unresolvable-base oracle case (same failure path) |

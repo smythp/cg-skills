@@ -30,16 +30,22 @@
 #      the allowlist, with reference normalization on the context name
 #  10. context names keep their registry host case and compare byte-exact,
 #      so an uppercase-host spelling matches nothing
+#  11. a VT-prefixed escape directive is honored by the scan as BuildKit
+#      honors it, so the continuation it enables cannot split the scan
+#      from the frontend
 #
 # The shim cases need no container engine: a docker shim on PATH prints
 # canned output per call (targets and outline separately, and a timeout
 # shim shortens the bound), pinning the exit
 # status for empty output, unrelated output, a bracketed-label load that
-# must classify as an artifact source, an unparsable reference line, a
+# must classify as an artifact source, an off-set load in a file with no
+# artifact-capable instruction, which is an unexpanded base and fails, an
+# unparsable reference line, a
 # scratch-only stage graph, an off-allowlist stage, an alias base, a JSON
 # escape in a base, targets runs that fail or lack evidence, outline runs
 # missing either evidence marker, a nonzero
-# docker exit, a timed-out run, a configured source policy, and a context
+# docker exit, a timed-out run, a configured source policy, a pinned
+# syntax directive rejected before any docker call, and a context
 # directory named --help, whose name must reach docker as a path after --,
 # never as an option.
 
@@ -600,9 +606,22 @@ echo "--- shim cases ---"
 shim_case "empty outline output" "$tmp/out-empty" 0 1 "no evidence"
 shim_case "unrelated outline output" "$tmp/out-unrelated" 0 1 "no evidence"
 # The [linux/amd64 internal] label must parse like any other; the load is
-# not in the FROM set, so it is an artifact source, printed and allowed.
+# not in the FROM set and the file carries a COPY --from, so it is an
+# artifact source, printed and allowed. The same outline output against a
+# file with no artifact-capable instruction is the unexpanded-base pair
+# below: the off-set load can only be a base the scan missed, so the run
+# fails naming it instead of reporting an artifact.
+cat > "$tmp/Dockerfile" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+COPY --from=alpine /etc/os-release /o
+EOF
 shim_case "bracketed-label load is classified as an artifact source" "$tmp/out-mixed" 0 0 \
   "external artifact source docker.io/library/alpine:latest"
+cat > "$tmp/Dockerfile" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+EOF
+shim_case "off-set load with no artifact-capable instruction is an unexpanded base" "$tmp/out-mixed" 0 1 \
+  "unexpanded base"
 shim_case "allowed reference passes" "$tmp/out-good" 0 0 \
   "allowed  cgr.dev/chainguard/wolfi-base:latest"
 shim_case "missing load-build-definition step fails" "$tmp/out-nodef" 0 1 "no evidence"
@@ -653,6 +672,36 @@ else
   esac
 fi
 
+echo "--- shim case: pinned syntax directive fails before either buildx call ---"
+# The scan implements the rolling frontend's rules only, so a pinned
+# frontend is rejected exactly as check-from-lines.sh rejects it, naming
+# the frontend, and before either buildx call; the empty args log proves
+# docker was never invoked.
+cat > "$tmp/Dockerfile" <<'EOF'
+# syntax=docker/dockerfile:1.6
+FROM cgr.dev/chainguard/wolfi-base
+EOF
+synlog="$tmp/synlog"
+: > "$synlog"
+out=$(SHIM_ARGS="$synlog" PATH="$shimdir:$PATH" \
+      sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 1 ]; then
+  bad "pinned syntax: expected exit 1, got $rc: $out"
+else
+  case "$out" in
+    *"syntax directive 'docker/dockerfile:1.6'"*) ok ;;
+    *) bad "pinned syntax: should name the frontend, got: $out" ;;
+  esac
+fi
+if [ -s "$synlog" ]; then
+  bad "pinned syntax: docker was invoked before the rejection: $(cat "$synlog")"
+else
+  ok
+fi
+cat > "$tmp/Dockerfile" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+EOF
+
 echo "--- shim case: context directory named --help ---"
 mkdir -p "$tmp/--help"
 argslog="$tmp/argslog"
@@ -697,6 +746,28 @@ FROM alpine
 EOF
 out=$(sh "$SCRIPT" --platform linux/amd64 "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
 if [ "$rc" -eq 0 ]; then ok; else bad "a base naming a sibling stage is a stage reference and must pass, got exit $rc: $out"; fi
+
+echo "--- case 11: VT-prefixed escape directive reaches the scan ---"
+# The review reproduction, built with printf because the deciding VT byte
+# would be invisible here. BuildKit treats VT as whitespace inside a
+# directive line, so the escape directive is honored, the backtick
+# continues the first ARG line and swallows the FROM ignored text, the
+# second ARG reassigns A, and the build resolves docker.io/library/alpine
+# (pinned by an outline run of this exact file). A scan that missed the
+# directive kept A at the Chainguard value, passed the FROM set, and
+# reported the alpine load as an artifact source. The scan now normalizes
+# VT and FF in directive lines as check-from-lines.sh does, resolves
+# alpine into the FROM set, and rejects it.
+printf '#\013escape=`\nARG A=cgr.dev/chainguard/static `\nFROM ignored\nARG A=docker.io/library/alpine\nFROM $A\n' > "$tmp/Dockerfile"
+out=$(sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -eq 0 ]; then
+  bad "VT-prefixed escape directive: expected rejection, got a pass"
+else
+  case "$out" in
+    *"REJECTED docker.io/library/alpine"*) ok ;;
+    *) bad "VT-prefixed escape directive: should reject alpine from the FROM set, got: $out" ;;
+  esac
+fi
 
 echo ""
 echo "test-check-from-oracle: $pass passed, $failcount failed"
