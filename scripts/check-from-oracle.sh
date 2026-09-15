@@ -29,8 +29,9 @@
 # instruction that can pull an image other than FROM (a COPY --from= or a
 # RUN --mount= with a from= source, counted on the joined logical lines;
 # a source that names a declared stage does not count, because a stage
-# cannot pull an image, and mount keys match case-insensitively as
-# BuildKit matches them). With none present, such a load can only be a
+# cannot pull an image, mount keys match case-insensitively as BuildKit
+# matches them, and quotes in a mount value are read the way BuildKit's
+# flag parsing reads them). With none present, such a load can only be a
 # base the scan expanded differently than the frontend did, and the run
 # exits 1 naming it. That
 # guard is the fallback for any divergence between the scan and the
@@ -670,12 +671,30 @@ function norm_ref(r,   host, rest, dig, tag, slash, last, colon, dpos) {
   return host "/" rest dig
 }
 
+# member_line(resolved, where): serialize one FROM-set member as
+# "ref<TAB>canonical" for the reader below. A member whose expanded form
+# is empty or contains whitespace is rejected here, naming the base and
+# its stage, instead of being serialized: BuildKit refuses an empty base
+# (base name should not be blank, pinned by a real build), no reference
+# the builder accepts contains whitespace, and the reader parses one
+# member per line with a TAB between the fields, which such a member
+# would break. The numeric check on the count line stays as the backstop,
+# but a malformed member never reaches it.
+function member_line(resolved, where) {
+  if (resolved == "")
+    fail(where " expands to an empty reference, which BuildKit refuses (base name should not be blank), so there is no base to check against the allowlist")
+  if (resolved ~ /[ \t\r]/ || index(resolved, VT) > 0 || index(resolved, FF) > 0)
+    fail(where " expands to a reference containing whitespace, which no reference the builder accepts contains, so the FROM set cannot be serialized or checked with certainty")
+  return resolved "\t" norm_ref(resolved) "\n"
+}
+
 BEGIN {
   SQ = sprintf("%c", 39)
   VT = sprintf("%c", 11)
   FF = sprintf("%c", 12)
   BOM = sprintf("%c%c%c", 239, 187, 191)
   WS  = sprintf("[ \t\r%c%c]+", 11, 12)
+  NWS = sprintf("[^ \t\r%c%c]+", 11, 12)
   CTRL_WS = sprintf("[%c%c\r]", 11, 12)
   ESC = "\\"
   directive_mode = 1
@@ -775,7 +794,11 @@ BEGIN {
 # not count: the raw value is expanded with the same global ARG table the
 # FROM set uses, then matched against the stage graph by AS name
 # (case-insensitively, as BuildKit matches stage names) and by in-range
-# numeric stage index. A value this expander cannot resolve (an escape
+# numeric stage index. BuildKit reads the index with strconv.Atoi, so an
+# optional leading plus sign is part of it (a real cacheonly build copies
+# from stage 0 with --from=+0), while a negative or out-of-range index
+# fails the build as an invalid stage index, so such a value stays
+# counted. A value this expander cannot resolve (an escape
 # character, an unresolved variable, a form beyond ${NAME}, ${NAME:-word}
 # and ${NAME:+word}) counts rather than fails, because overstating the
 # count only leaves an off-set load on the artifact-report path, while
@@ -783,18 +806,76 @@ BEGIN {
 # change the classification: a context matching the AS name of a stage
 # replaces the base of that stage while the stage stays a stage, and a
 # context matching anything else replaces a source that already counts.
-function art_source(v, lineno,   ev, oth) {
+function art_source(v, lineno,   ev, evn, oth) {
   if (index(v, ESC) > 0) { ART++; return }
   COUNT_UNCERTAIN = 0
   ev = expand_str(v, "count", "line " lineno)
   if (COUNT_UNCERTAIN) { ART++; return }
-  if (ev ~ /^[0-9]+$/ && ev + 0 < NSTAGE) return
+  evn = ev
+  sub(/^[+]/, "", evn)
+  if (evn ~ /^[0-9]+$/ && evn + 0 < NSTAGE) return
   for (oth = 1; oth <= NSTAGE; oth++)
     if (SN[oth] != "" && tolower(SN[oth]) == tolower(ev)) return
   ART++
 }
 
-function process_global(logical, lineno,   n, f, instr, ai, t, p, name, val, q, inner, litq, fi, nmo, mo, mi, meq) {
+# run_flags(s, lineno): walk the flag region of a RUN the way the BuildKit
+# flag extraction walks it, each rule pinned by a real cacheonly build on
+# this daemon (Docker 29.8, buildx 0.37). A single or double quote opens a
+# quoted span whose whitespace stays inside the flag word, the quote
+# characters themselves are dropped before the value is split, and a quote
+# still open at the end of the line swallows the rest of the line into the
+# word, which the build accepts, honoring a from= source inside the
+# swallowed span and never reaching a --mount written after it. The flag
+# region ends at the first word that does not begin with --, which starts
+# the command. Each --mount= word hands its value to mount_value.
+function run_flags(s, lineno,   L, i, c, q, word) {
+  sub("^" WS, "", s)
+  sub("^" NWS, "", s)
+  for (;;) {
+    sub("^" WS, "", s)
+    if (substr(s, 1, 2) != "--") return
+    word = ""
+    q = ""
+    L = length(s)
+    for (i = 1; i <= L; i++) {
+      c = substr(s, i, 1)
+      if (q != "") {
+        if (c == q) q = ""
+        else word = word c
+      } else if (c == "\"" || c == SQ) q = c
+      else if (c == " " || c == "\t" || c == "\r" || c == VT || c == FF) break
+      else word = word c
+    }
+    s = substr(s, i + 1)
+    if (substr(word, 1, 8) == "--mount=") mount_value(substr(word, 9), lineno)
+  }
+}
+
+# mount_value(v, lineno): split one --mount value (quotes already dropped
+# by run_flags) into key=value options the way BuildKit splits it, pinned
+# by real cacheonly builds. A comma splits fields even when the file wrote
+# it between quotes ("from=REF,target=/mnt" mounts REF at /mnt), each
+# field splits at its first = with the key lowercased and compared whole
+# (a key holding a leading space fails the build naming the key), and a
+# field without = is a bare option such as readonly, which cannot pull. A
+# backslash or the escape character anywhere in the value makes the split
+# uncertain, because the BuildKit flag extraction consumes escape characters
+# this scan does not model, so the mount counts as artifact-capable
+# instead, which can only overstate the count and leave an off-set load on
+# the artifact-report path, never reject a file the frontend accepts.
+function mount_value(v, lineno,   nmo, mo, mi, meq) {
+  if (index(v, "\\") > 0 || index(v, ESC) > 0) { ART++; return }
+  nmo = split(v, mo, ",")
+  for (mi = 1; mi <= nmo; mi++) {
+    meq = index(mo[mi], "=")
+    if (meq == 0) continue
+    if (tolower(substr(mo[mi], 1, meq - 1)) != "from") continue
+    art_source(substr(mo[mi], meq + 1), lineno)
+  }
+}
+
+function process_global(logical, lineno,   n, f, instr, ai, t, p, name, val, q, inner, litq, fi) {
   sub("^" WS, "", logical)
   n = split(logical, f, WS)
   if (n == 0) return
@@ -814,23 +895,16 @@ function process_global(logical, lineno,   n, f, instr, ai, t, p, name, val, q, 
   # 29.8, buildx 0.37) accepts --mount=type=bind,FROM=alpine:3.19,
   # target=/mnt and serves the image content into the mount, and the Type=
   # and From= spellings build the same, while an unknown key fails the
-  # build naming it.
+  # build naming it. The RUN flags are walked on the raw logical line by
+  # run_flags above, not on the whitespace-split fields, because a quoted
+  # span in a mount value keeps its whitespace inside the flag word.
   if (instr == "COPY") {
     for (fi = 2; fi <= n && substr(f[fi], 1, 2) == "--"; fi++)
       if (substr(f[fi], 1, 7) == "--from=") art_source(substr(f[fi], 8), lineno)
     return
   }
   if (instr == "RUN") {
-    for (fi = 2; fi <= n && substr(f[fi], 1, 2) == "--"; fi++) {
-      if (substr(f[fi], 1, 8) != "--mount=") continue
-      nmo = split(substr(f[fi], 9), mo, ",")
-      for (mi = 1; mi <= nmo; mi++) {
-        meq = index(mo[mi], "=")
-        if (meq == 0) continue
-        if (tolower(substr(mo[mi], 1, meq - 1)) != "from") continue
-        art_source(substr(mo[mi], meq + 1), lineno)
-      }
-    }
+    run_flags(logical, lineno)
     return
   }
   if (instr == "FROM") { done = 1; return }
@@ -893,7 +967,7 @@ END {
         resolved = substr(csrc, 16)
         if (resolved == "")
           fail("the stage " SN[i] " is overridden by a --build-context with an empty docker-image:// reference")
-        outbuf = outbuf resolved "\t" norm_ref(resolved) "\n"
+        outbuf = outbuf member_line(resolved, where)
         continue
       }
     }
@@ -901,7 +975,6 @@ END {
     resolved = expand_str(base, "from", where)
     if (UNRESOLVED != "")
       fail(where " has unresolved ARG variable(s):" UNRESOLVED ", so the FROM set cannot be expanded")
-    if (resolved == "") resolved = base
     if (resolved == "scratch") continue
     handled = 0
     if (N_CTX > 0) {
@@ -925,7 +998,7 @@ END {
         if (oth != i && SN[oth] != "" && tolower(SN[oth]) == tolower(resolved)) { isstage = 1; break }
       if (isstage) continue
     }
-    outbuf = outbuf resolved "\t" norm_ref(resolved) "\n"
+    outbuf = outbuf member_line(resolved, where)
   }
   # The artifact-capable count travels on the first output line, which
   # begins with a TAB so no FROM-set member can imitate it: a member line

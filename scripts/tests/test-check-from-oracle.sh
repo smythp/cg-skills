@@ -23,8 +23,11 @@
 #      the substituted base is rejected in canonical form, and the same
 #      override pointed at another Chainguard image passes
 #   7. artifact sources: COPY --from and RUN --mount=from references are
-#      printed as external artifact sources and allowed, and a reference
-#      that is both a base and a copy source is rejected as a base
+#      printed as external artifact sources and allowed, a reference
+#      that is both a base and a copy source is rejected as a base, and a
+#      from= source written through the quotes BuildKit drops (a quoted
+#      from= field, a quoted target holding a space before the from= key)
+#      is still found, so both quoted-mount files pass
 #   9. a named context matching a stage's AS name replaces that stage's
 #      base at the definition, so the substituted reference is what meets
 #      the allowlist, with reference normalization on the context name
@@ -55,7 +58,11 @@
 # directory named --help, whose name must reach docker as a path after --,
 # never as an option, a base written as artifact-capable rejected as a
 # FROM-set member, copy and mount sources naming a stage left out of the
-# artifact-capable count while an image source stays in it, and the
+# artifact-capable count while an image source stays in it, plus-signed
+# stage indices left out of the count while a negative index stays in it,
+# a quoted mount without from= counting nothing while an unterminated
+# quote swallows the line and its from= counts, a base expanding to
+# whitespace or to nothing refused by name before serialization, and the
 # single-quoted default rejected from the FROM set with no outline
 # invocation on the args log.
 
@@ -375,6 +382,42 @@ else
   case "$out" in
     *"external artifact source docker.io/library/alpine:latest"*) ok ;;
     *) bad "uppercase mount key: should report alpine as an artifact source, got: $out" ;;
+  esac
+fi
+# BuildKit reads quotes in a mount value before the comma split, each rule
+# pinned by a real cacheonly build on this daemon: a single or double quote
+# opens a span whose whitespace stays inside the flag word, the quote
+# characters are dropped, and the key=value split runs on the unquoted
+# text, so the quoted from= field below loads busybox and serves it into
+# the mount, and the quoted target holding a space before the from= key
+# builds the same way. The scan must find both from= sources; a scan that
+# read the first key with its quote attached counted nothing, left the
+# count at zero, and rejected the busybox load as an unexpanded base,
+# failing two files BuildKit accepts.
+cat > "$tmp/Dockerfile" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN --mount=type=bind,"from=docker.io/library/busybox:latest",target=/mnt ls /mnt
+EOF
+out=$(sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  bad "quoted mount from: expected pass, exit $rc: $out"
+else
+  case "$out" in
+    *"external artifact source docker.io/library/busybox:latest"*) ok ;;
+    *) bad "quoted mount from: should report busybox as an artifact source, got: $out" ;;
+  esac
+fi
+cat > "$tmp/Dockerfile" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN --mount=type=bind,"target=/m nt",from=docker.io/library/busybox:latest ls "/m nt"
+EOF
+out=$(sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  bad "quoted mount target with space: expected pass, exit $rc: $out"
+else
+  case "$out" in
+    *"external artifact source docker.io/library/busybox:latest"*) ok ;;
+    *) bad "quoted mount target with space: should report busybox as an artifact source, got: $out" ;;
   esac
 fi
 
@@ -911,13 +954,19 @@ echo "--- shim case: a copy or mount source naming a stage is not artifact-capab
 # load is an unexpanded base, exit 1; before the stage exclusion the same
 # files counted the stage reference, and the load passed as an artifact
 # source. The spellings cover the COPY flag, the case-insensitive stage
-# name, the numeric stage index, the mount key, and the uppercase mount
-# key BuildKit lowercases before matching.
+# name, the numeric stage index, the plus-signed index BuildKit reads with
+# strconv.Atoi (a real cacheonly build copies from stage 0 with --from=+0),
+# the mount key, the uppercase mount key BuildKit lowercases before
+# matching, and a double-quoted from= field whose quotes the flag parsing
+# drops.
 for src_line in 'COPY --from=builder /etc/os-release /o' \
                 'COPY --from=BUILDER /etc/os-release /o' \
                 'COPY --from=0 /etc/os-release /o' \
+                'COPY --from=+0 /etc/os-release /o' \
+                'COPY --from=+1 /etc/os-release /o' \
                 'RUN --mount=type=bind,from=builder,target=/mnt echo hi' \
-                'RUN --mount=type=bind,FROM=builder,target=/mnt echo hi'; do
+                'RUN --mount=type=bind,FROM=builder,target=/mnt echo hi' \
+                'RUN --mount=type=bind,"from=builder",target=/mnt echo hi'; do
   cat > "$tmp/Dockerfile" <<EOF
 FROM cgr.dev/chainguard/wolfi-base AS builder
 FROM builder
@@ -969,6 +1018,93 @@ else
   case "$out" in
     *"external artifact source docker.io/library/busybox:latest"*) ok ;;
     *) bad "image copy source: should report busybox as an artifact source, got: $out" ;;
+  esac
+fi
+# A negative index is never a stage to BuildKit (a real build fails naming
+# invalid stage index -1), so it keeps counting and the off-set load stays
+# on the artifact-report path.
+cat > "$tmp/Dockerfile" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base AS builder
+FROM builder
+COPY --from=-1 /etc/os-release /o
+EOF
+out=$(SHIM_OUT="$tmp/out-mixed" SHIM_OUT_TARGETS="$tmp/out-targets-multi" \
+      PATH="$shimdir:$PATH" sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  bad "negative index source: expected pass, exit $rc: $out"
+else
+  case "$out" in
+    *"external artifact source docker.io/library/alpine:latest"*) ok ;;
+    *) bad "negative index source: the off-set load should stay an artifact source, got: $out" ;;
+  esac
+fi
+
+echo "--- shim cases: quoted mounts and the artifact-capable count ---"
+# The quote rules from the live quoted-mount cases, held against the count
+# with a canned off-set load: a quoted mount without a from= key counts
+# nothing, so the load is an unexpanded base and the run fails, and an
+# unterminated quote swallows the rest of the line into the mount value as
+# BuildKit swallows it (a real cacheonly build accepts the file and honors
+# the swallowed from=), so its from= source counts and the load stays an
+# artifact source.
+cat > "$tmp/Dockerfile" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN --mount=type=cache,"target=/my cache" echo hi
+EOF
+shim_case "a quoted mount without from= counts nothing" "$tmp/out-mixed" 0 1 "unexpanded base"
+cat > "$tmp/Dockerfile" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+RUN --mount=type=bind,"from=docker.io/library/busybox:latest,target=/mnt echo hi
+EOF
+shim_case "an unterminated quote swallows the line and its from= counts" "$tmp/out-mixed" 0 0 \
+  "external artifact source docker.io/library/alpine:latest"
+
+echo "--- shim case: a base expanding to whitespace or empty is rejected by name ---"
+# The FROM-set scan refuses to serialize a member whose expanded form is
+# empty or contains whitespace, naming the base and the stage, before the
+# allowlist or the count reader can meet the malformed line. A TAB
+# smuggled through --build-arg into the base must hit that refusal, not
+# the numeric backstop on the count line, and the outline call must never
+# run; an empty expansion is refused the same way (a real build fails
+# with base name should not be blank).
+cat > "$tmp/Dockerfile" <<'EOF'
+ARG SNEAK
+FROM ${SNEAK}
+EOF
+sed 's/"base": "cgr.dev\/chainguard\/wolfi-base"/"base": "${SNEAK}"/' \
+  "$tmp/out-targets-good" > "$tmp/out-targets-sneak"
+sneaklog="$tmp/sneaklog"
+: > "$sneaklog"
+out=$(SHIM_OUT="$tmp/out-good" SHIM_OUT_TARGETS="$tmp/out-targets-sneak" SHIM_ARGS="$sneaklog" \
+      PATH="$shimdir:$PATH" sh "$SCRIPT" \
+      --build-arg "SNEAK=$(printf 'cgr.dev/x\tartifact-capable\t9')" \
+      "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 1 ]; then
+  bad "tab-smuggled base: expected exit 1, got $rc: $out"
+else
+  case "$out" in
+    *'the base "${SNEAK}" of stage 1 expands to a reference containing whitespace'*) ok ;;
+    *) bad "tab-smuggled base: should name the base and the stage in the whitespace refusal, got: $out" ;;
+  esac
+  case "$out" in
+    *"no numeric artifact-capable count"*) bad "tab-smuggled base: the refusal should come from the scan, not the count reader backstop, got: $out" ;;
+    *) ok ;;
+  esac
+fi
+if grep -qx -- '--call=outline,format=json' "$sneaklog"; then
+  bad "tab-smuggled base: the outline call reached docker although the FROM set already failed: $(cat "$sneaklog")"
+else
+  ok
+fi
+out=$(SHIM_OUT="$tmp/out-good" SHIM_OUT_TARGETS="$tmp/out-targets-sneak" \
+      PATH="$shimdir:$PATH" sh "$SCRIPT" --build-arg "SNEAK=" \
+      "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 1 ]; then
+  bad "empty-expanding base: expected exit 1, got $rc: $out"
+else
+  case "$out" in
+    *'the base "${SNEAK}" of stage 1 expands to an empty reference'*) ok ;;
+    *) bad "empty-expanding base: should name the base and the stage in the empty refusal, got: $out" ;;
   esac
 fi
 
