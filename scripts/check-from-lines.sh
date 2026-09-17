@@ -4,8 +4,11 @@
 # configured external mirror prefix (on a / boundary), scratch, and
 # previously declared stage aliases.
 #
-# Posture. This check advises; BuildKit's own resolution, asked by
-# check-from-oracle.sh, decides. Findings come in two classes:
+# Posture. The FROM gate exists to catch mistakes in a migration. It is
+# not a guarantee that a Dockerfile written to defeat it cannot pass, and
+# it does not try to lock down every rare way to specify an image. This
+# check advises; BuildKit's own resolution, asked by check-from-oracle.sh,
+# decides. Findings come in two classes:
 #   - REJECTED (exit 1): a base known to resolve outside the allowlist.
 #     The resolution rules below were each verified against BuildKit, so a
 #     REJECTED base is one the build really pulls off the allowlist: a FROM

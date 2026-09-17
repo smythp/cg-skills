@@ -4,8 +4,12 @@
 # cgr.dev/* (exact host boundary) and the configured external mirror prefix
 # (on a / boundary).
 #
-# Posture. This script is the deciding half of the FROM gate:
-# check-from-lines.sh reads the file textually and advises, and this script
+# Posture. The FROM gate exists to catch mistakes in a migration. It is
+# not a guarantee that a Dockerfile written to defeat it cannot pass, and
+# it does not try to lock down every rare way to specify an image. This
+# script is the deciding half of the gate:
+# check-from-lines.sh reads the file textually and advises, with
+# UNVERIFIED lines for the constructs it cannot verify, and this script
 # asks BuildKit itself what the file resolves. It exits 1 in two cases
 # only. REJECTED means a base is known to resolve outside the allowlist,
 # from the stage graph BuildKit reports or through a named build context.

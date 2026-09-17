@@ -41,8 +41,11 @@ directory instead.
 - `references/` — FROM and registry rules, package translation, USER and
   entrypoint discipline, complex bases, build-fix playbook, validation and
   report format, lookup avenues
-- `scripts/` — `preflight.sh`, `apk-lookup.sh`, `check-from-lines.sh`
-  (FROM allowlist gate), `compare-images.sh`, and their tests under
+- `scripts/` — `preflight.sh`, `apk-lookup.sh`, `check-from-lines.sh` and
+  `check-from-oracle.sh` (the FROM allowlist gate, which exists to catch
+  mistakes in a migration rather than to guarantee that an adversarially
+  written Dockerfile cannot pass; the oracle decides with BuildKit's own
+  resolution and the textual check advises), `compare-images.sh`, and their tests under
   `scripts/tests/`: run each suite with `sh scripts/tests/<name>.sh`.
   `test-check-from-lines.sh` needs no Docker; `test-compare-images.sh` needs
   Docker with registry egress; `test-preflight.sh` (the organization listing
