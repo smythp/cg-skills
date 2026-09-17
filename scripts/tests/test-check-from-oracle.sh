@@ -8,7 +8,13 @@
 #      quoted string, a fallback FROM fed by an automatic platform argument,
 #      and a --platform spelling (linux/amd64/v1) whose variant a real build
 #      normalizes away. The oracle rejects all three regardless of how the
-#      textual parser reads them, because it asks BuildKit itself.
+#      textual parser reads them, because it asks BuildKit itself. A
+#      declared default on an automatic argument name is applied with
+#      BuildKit's precedence, so the reviewer's single-quoted TARGETVARIANT
+#      file is rejected on the alpine base the real build pulls while the
+#      benign declared default passes, and a pinned syntax directive runs
+#      under its own frontend with one warning, passing for 1.6 and failing
+#      as not-a-pass for 1.0, whose frontend cannot answer subrequests.
 #   2. a multi-stage file whose runtime stage is cgr.dev/chainguard/static —
 #      every base allowed, exit 0
 #   3. a file whose only external base sits on a configured mirror prefix —
@@ -52,9 +58,11 @@
 # docker exit, a timed-out run (asserting the timeout status 124, skipped
 # with a reason when no timer is installed), the BUILD* and TARGET*
 # overrides asserted pair by pair on both captured buildx invocations, a
+# declared automatic default whose synthetic override must be omitted from
+# both invocations while the other packs still travel, a
 # [context NAME] load line matched against the FROM set, a configured
 # source policy, a pinned
-# syntax directive rejected before any docker call, a context
+# syntax directive that runs both calls with one warning, a context
 # directory named --help, whose name must reach docker as a path after --,
 # never as an option, a base written as artifact-capable rejected as a
 # FROM-set member, copy and mount sources naming a stage left out of the
@@ -129,12 +137,16 @@ else
   esac
 fi
 
-echo "--- case 1d: declared default for an automatic argument is rejected ---"
+echo "--- case 1d: declared default for an automatic argument is applied ---"
 # The pull-request reproduction. The real build keeps the single-quoted
 # default literal, so TARGETVARIANT is set and non-empty, BASE becomes
-# alpine, and alpine is pulled, while the script's synthetic TARGETVARIANT
-# override would empty it and resolve wolfi-base. The scan rejects the
-# declaration before the outline runs, under both platforms.
+# alpine, and alpine is pulled on every platform (re-pinned with real
+# cacheonly builds on 2026-09-17). The pack builder omits the synthetic
+# TARGETVARIANT override for the declared default and the scan applies the
+# same precedence, so the FROM set holds alpine and the run rejects it
+# under both platforms, exactly what the real build pulls. A synthetic
+# override here would have emptied TARGETVARIANT and passed wolfi-base, the
+# reverse of the build.
 cat > "$tmp/Dockerfile" <<'EOF'
 ARG TARGETVARIANT='${UNSET}'
 ARG BASE=${TARGETVARIANT:+alpine}
@@ -146,11 +158,30 @@ for plat in linux/amd64 linux/arm64; do
     bad "declared automatic default ($plat): expected rejection, got a pass"
   else
     case "$out" in
-      *"declares a default for the automatic argument TARGETVARIANT"*) ok ;;
-      *) bad "declared automatic default ($plat): should name TARGETVARIANT, got: $out" ;;
+      *"REJECTED docker.io/library/alpine"*) ok ;;
+      *) bad "declared automatic default ($plat): should reject alpine, the base the real build pulls, got: $out" ;;
     esac
   fi
 done
+
+echo "--- case 1d2: benign declared default for an automatic argument passes ---"
+# The benign shape of the same construct: the declared default is applied
+# with BuildKit's precedence (a real cacheonly build of this file resolves
+# only wolfi-base, 2026-09-17), nothing resolves off the allowlist, and
+# the run passes.
+cat > "$tmp/Dockerfile" <<'EOF'
+ARG TARGETARCH=amd64
+FROM cgr.dev/chainguard/wolfi-base
+EOF
+out=$(sh "$SCRIPT" --platform linux/amd64 "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  bad "benign declared default: expected pass, exit $rc: $out"
+else
+  case "$out" in
+    *"allowed  cgr.dev/chainguard/wolfi-base"*) ok ;;
+    *) bad "benign declared default: should allow wolfi-base, got: $out" ;;
+  esac
+fi
 
 echo "--- case 1e: single-quoted ARG default stays literal in the scan ---"
 # BuildKit keeps the single-quoted default literal, so X is set and
@@ -185,6 +216,54 @@ else
   case "$out" in
     *"external artifact source"*) bad "single-quoted literal default: alpine must be a rejected base, not an artifact source, got: $out" ;;
     *) ok ;;
+  esac
+fi
+
+echo "--- case 1f: a pinned frontend that answers the calls passes with the warning ---"
+# docker/dockerfile:1.6 answers both subrequest calls itself (verified
+# 2026-09-17: the progress log resolves only the 1.6 frontend image), so
+# BuildKit resolves the file under the pin and the run passes, with one
+# WARNING that the textual expansion assumes the rolling syntax.
+cat > "$tmp/Dockerfile" <<'EOF'
+# syntax=docker/dockerfile:1.6
+FROM cgr.dev/chainguard/wolfi-base
+RUN echo hi
+EOF
+out=$(sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  bad "pinned 1.6: expected pass, exit $rc: $out"
+else
+  case "$out" in
+    *"WARNING: the syntax directive pins the frontend docker/dockerfile:1.6"*)
+      case "$out" in
+        *"allowed  cgr.dev/chainguard/wolfi-base"*) ok ;;
+        *) bad "pinned 1.6: should allow wolfi-base, got: $out" ;;
+      esac
+      ;;
+    *) bad "pinned 1.6: should print the pinned-frontend warning, got: $out" ;;
+  esac
+fi
+
+echo "--- case 1g: a pinned frontend without subrequest support is not a pass ---"
+# docker/dockerfile:1.0 fails both calls with unsupported frontend
+# capability moby.buildkit.frontend.subrequests (verified 2026-09-17), so
+# the run is not a pass and the message names the pin and the way out.
+cat > "$tmp/Dockerfile" <<'EOF'
+# syntax=docker/dockerfile:1.0
+FROM cgr.dev/chainguard/wolfi-base
+EOF
+out=$(sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 1 ]; then
+  bad "pinned 1.0: expected exit 1, got $rc: $out"
+else
+  case "$out" in
+    *"the pinned frontend docker/dockerfile:1.0 does not support the outline call"*)
+      case "$out" in
+        *"switching the directive to docker/dockerfile:1 lets the gate run"*) ok ;;
+        *) bad "pinned 1.0: should name the way out, got: $out" ;;
+      esac
+      ;;
+    *) bad "pinned 1.0: should say the frontend lacks the outline call, got: $out" ;;
   esac
 fi
 
@@ -335,7 +414,7 @@ if [ "$rc" -ne 0 ]; then
   bad "copy artifact source: expected pass, exit $rc: $out"
 else
   case "$out" in
-    *"external artifact source docker.io/library/busybox:latest"*) ok ;;
+    *"WARNING: external artifact source docker.io/library/busybox:latest"*) ok ;;
     *) bad "copy artifact source: should report busybox as an artifact source, got: $out" ;;
   esac
 fi
@@ -361,7 +440,7 @@ if [ "$rc" -ne 0 ]; then
   bad "mount artifact source: expected pass, exit $rc: $out"
 else
   case "$out" in
-    *"external artifact source docker.io/library/alpine:latest"*) ok ;;
+    *"WARNING: external artifact source docker.io/library/alpine:latest"*) ok ;;
     *) bad "mount artifact source: should report alpine as an artifact source, got: $out" ;;
   esac
 fi
@@ -380,7 +459,7 @@ if [ "$rc" -ne 0 ]; then
   bad "uppercase mount key: expected pass, exit $rc: $out"
 else
   case "$out" in
-    *"external artifact source docker.io/library/alpine:latest"*) ok ;;
+    *"WARNING: external artifact source docker.io/library/alpine:latest"*) ok ;;
     *) bad "uppercase mount key: should report alpine as an artifact source, got: $out" ;;
   esac
 fi
@@ -403,7 +482,7 @@ if [ "$rc" -ne 0 ]; then
   bad "quoted mount from: expected pass, exit $rc: $out"
 else
   case "$out" in
-    *"external artifact source docker.io/library/busybox:latest"*) ok ;;
+    *"WARNING: external artifact source docker.io/library/busybox:latest"*) ok ;;
     *) bad "quoted mount from: should report busybox as an artifact source, got: $out" ;;
   esac
 fi
@@ -416,7 +495,7 @@ if [ "$rc" -ne 0 ]; then
   bad "quoted mount target with space: expected pass, exit $rc: $out"
 else
   case "$out" in
-    *"external artifact source docker.io/library/busybox:latest"*) ok ;;
+    *"WARNING: external artifact source docker.io/library/busybox:latest"*) ok ;;
     *) bad "quoted mount target with space: should report busybox as an artifact source, got: $out" ;;
   esac
 fi
@@ -714,7 +793,7 @@ FROM cgr.dev/chainguard/wolfi-base
 COPY --from=alpine /etc/os-release /o
 EOF
 shim_case "bracketed-label load is classified as an artifact source" "$tmp/out-mixed" 0 0 \
-  "external artifact source docker.io/library/alpine:latest"
+  "WARNING: external artifact source docker.io/library/alpine:latest"
 cat > "$tmp/Dockerfile" <<'EOF'
 FROM cgr.dev/chainguard/wolfi-base
 EOF
@@ -865,32 +944,76 @@ else
   esac
 fi
 
-echo "--- shim case: pinned syntax directive fails before either buildx call ---"
-# The scan implements the rolling frontend's rules only, so a pinned
-# frontend is rejected exactly as check-from-lines.sh rejects it, naming
-# the frontend, and before either buildx call; the empty args log proves
-# docker was never invoked.
+echo "--- shim case: a pinned syntax directive runs both calls with one warning ---"
+# The pinned frontend runs and BuildKit decides; the scan only warns that
+# its textual expansion assumes the rolling syntax. With the shim answering
+# both calls the run passes, the warning names the pin, and the args log
+# shows both calls reached docker.
 cat > "$tmp/Dockerfile" <<'EOF'
 # syntax=docker/dockerfile:1.6
 FROM cgr.dev/chainguard/wolfi-base
 EOF
 synlog="$tmp/synlog"
 : > "$synlog"
-out=$(SHIM_ARGS="$synlog" PATH="$shimdir:$PATH" \
-      sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
-if [ "$rc" -ne 1 ]; then
-  bad "pinned syntax: expected exit 1, got $rc: $out"
+out=$(SHIM_OUT="$tmp/out-good" SHIM_OUT_TARGETS="$tmp/out-targets-good" SHIM_ARGS="$synlog" \
+      PATH="$shimdir:$PATH" sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  bad "pinned syntax runs: expected pass, exit $rc: $out"
 else
   case "$out" in
-    *"syntax directive 'docker/dockerfile:1.6'"*) ok ;;
-    *) bad "pinned syntax: should name the frontend, got: $out" ;;
+    *"WARNING: the syntax directive pins the frontend docker/dockerfile:1.6"*) ok ;;
+    *) bad "pinned syntax runs: should print the pinned-frontend warning, got: $out" ;;
   esac
 fi
-if [ -s "$synlog" ]; then
-  bad "pinned syntax: docker was invoked before the rejection: $(cat "$synlog")"
+if grep -qx -- '--call=targets,format=json' "$synlog" && grep -qx -- '--call=outline,format=json' "$synlog"; then
+  ok
+else
+  bad "pinned syntax runs: both calls should reach docker, got: $(cat "$synlog")"
+fi
+cat > "$tmp/Dockerfile" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+EOF
+
+echo "--- shim case: a declared automatic default omits its synthetic override ---"
+# The pack builder passes a synthetic override for each automatic name so
+# the platform reaches the frontend, except a name the file gives a
+# declared global default, which BuildKit lets beat an automatic value
+# while a --build-arg would beat the default; for that name nothing is
+# passed and the frontend applies the declared default, as the real build
+# does. Asserted on the captured argument list of both calls: no TARGETARCH
+# pack at all, while TARGETOS still travels.
+cat > "$tmp/Dockerfile" <<'EOF'
+ARG TARGETARCH=amd64
+FROM cgr.dev/chainguard/wolfi-base
+EOF
+dalog="$tmp/dalog"
+: > "$dalog"
+out=$(SHIM_OUT="$tmp/out-good" SHIM_OUT_TARGETS="$tmp/out-targets-good" SHIM_ARGS="$dalog" \
+      PATH="$shimdir:$PATH" sh "$SCRIPT" --platform linux/aarch64 \
+      "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  bad "declared-default pack omission: expected pass, exit $rc: $out"
 else
   ok
 fi
+for call in targets outline; do
+  callargs=$(awk -v want="--call=$call,format=json" '
+    $0 == "buildx" { insec = 0 }
+    insec { print }
+    $0 == want { insec = 1 }
+  ' "$dalog")
+  if printf '%s\n' "$callargs" | grep -q '^TARGETARCH='; then
+    bad "declared-default pack omission: the $call call carries a TARGETARCH override although the file declares a default; it got: $(printf '%s' "$callargs" | tr '\n' ' ')"
+  else
+    ok
+  fi
+  if printf '%s\n' "$callargs" | awk \
+       'prev == "--build-arg" && $0 == "TARGETOS=linux" { found = 1 } { prev = $0 } END { exit !found }'; then
+    ok
+  else
+    bad "declared-default pack omission: the $call call should still receive --build-arg TARGETOS=linux; it got: $(printf '%s' "$callargs" | tr '\n' ' ')"
+  fi
+done
 cat > "$tmp/Dockerfile" <<'EOF'
 FROM cgr.dev/chainguard/wolfi-base
 EOF
@@ -1016,7 +1139,7 @@ if [ "$rc" -ne 0 ]; then
   bad "image copy source: expected pass, exit $rc: $out"
 else
   case "$out" in
-    *"external artifact source docker.io/library/busybox:latest"*) ok ;;
+    *"WARNING: external artifact source docker.io/library/busybox:latest"*) ok ;;
     *) bad "image copy source: should report busybox as an artifact source, got: $out" ;;
   esac
 fi
@@ -1034,7 +1157,7 @@ if [ "$rc" -ne 0 ]; then
   bad "negative index source: expected pass, exit $rc: $out"
 else
   case "$out" in
-    *"external artifact source docker.io/library/alpine:latest"*) ok ;;
+    *"WARNING: external artifact source docker.io/library/alpine:latest"*) ok ;;
     *) bad "negative index source: the off-set load should stay an artifact source, got: $out" ;;
   esac
 fi
@@ -1057,7 +1180,7 @@ FROM cgr.dev/chainguard/wolfi-base
 RUN --mount=type=bind,"from=docker.io/library/busybox:latest,target=/mnt echo hi
 EOF
 shim_case "an unterminated quote swallows the line and its from= counts" "$tmp/out-mixed" 0 0 \
-  "external artifact source docker.io/library/alpine:latest"
+  "WARNING: external artifact source docker.io/library/alpine:latest"
 
 echo "--- shim case: a base expanding to whitespace or empty is rejected by name ---"
 # The FROM-set scan refuses to serialize a member whose expanded form is

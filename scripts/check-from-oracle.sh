@@ -4,6 +4,22 @@
 # cgr.dev/* (exact host boundary) and the configured external mirror prefix
 # (on a / boundary).
 #
+# Posture. This script is the deciding half of the FROM gate:
+# check-from-lines.sh reads the file textually and advises, and this script
+# asks BuildKit itself what the file resolves. It exits 1 in two cases
+# only. REJECTED means a base is known to resolve outside the allowlist,
+# from the stage graph BuildKit reports or through a named build context.
+# Everything else that exits 1 is the script refusing to answer on its own
+# account, printed as not a pass: BuildKit gave no answer (a failed call, a
+# pinned frontend without subrequest support), the answer lacks its
+# positive evidence, a load-metadata line does not parse, a source policy
+# in the environment can rewrite references behind the log, a base cannot
+# be expanded or serialized with certainty (a NUL byte or lone CR in the
+# file breaks the line-based expansion scan the same way), or a resolved
+# load sits outside the FROM set in a file with no artifact-capable
+# instruction, the unexpanded-base fallback that catches any divergence
+# between the scan and the frontend.
+#
 # The FROM set comes from docker buildx build --call=targets,format=json,
 # which returns every stage with its base exactly as written, from
 # BuildKit's own parse of the file. Each base is then expanded with the
@@ -21,7 +37,9 @@
 # --mount=from=IMAGE, ADD from an image) is an external artifact source,
 # not a base: references/from-and-registry-rules.md permits artifact
 # copies and asks the report to name them. The outline run below surfaces
-# them; each one is printed as an external artifact source and allowed. A
+# them; each one is printed as a WARNING naming the linkage reason (a
+# binary copied from another distribution links against that
+# distribution's libraries) and allowed. A
 # reference that is both a FROM base and an artifact source is in the FROM
 # set, so it is checked as a base; the artifact allowance cannot launder a
 # base. The artifact report has a guard: a load outside the FROM set is
@@ -94,22 +112,31 @@
 # platform, which is what a real build on this daemon uses. User --build-arg
 # values follow the platform packs, so they win, as in docker build.
 #
-# The overrides have one precedence difference from a real build. BuildKit
-# lets a global ARG that declares a default for an automatic argument name
-# beat the automatic value, while a --build-arg beats that default, so an
-# override would reverse what the build resolves for such a file. The
-# expansion scan therefore exits 1
-# naming the line when a global ARG gives a default to any of the eleven
-# automatic argument names (TARGETPLATFORM, TARGETOS, TARGETARCH,
-# TARGETVARIANT, TARGETOSVERSION, TARGETSTAGE, BUILDPLATFORM, BUILDOS,
-# BUILDARCH, BUILDVARIANT, BUILDOSVERSION); a bare redeclaration such as
-# ARG TARGETARCH stays allowed. So the scan can trust its own line
+# The overrides are precedence-faithful to a real build. BuildKit lets a
+# global ARG that declares a default for an automatic argument name beat
+# the automatic value, while a --build-arg beats that default (each pinned
+# with real cacheonly builds on 2026-09-17, TARGETSTAGE against --target
+# included), so for every automatic name the file gives a declared global
+# default, the pre-scan below omits that name's synthetic override and
+# BuildKit applies the declared default exactly as the real build does; the
+# expansion scan applies the same precedence when it seeds its own table. A
+# bare redeclaration such as ARG TARGETARCH is not a default and changes
+# nothing. So the scan can trust its own line
 # splitting, a NUL byte anywhere in the file and a CR that is not part of
-# a CRLF ending are rejected first, as check-from-lines.sh rejects them.
+# a CRLF ending are rejected first, as line-based scans require.
 # The scan reads the parser directives the way check-from-lines.sh does,
-# VT and FF normalized to spaces inside a directive line, and it accepts
-# only the rolling docker/dockerfile:1 syntax tag, failing the run on any
-# other frontend before either buildx call.
+# VT and FF normalized to spaces inside a directive line. A syntax
+# directive pinning a frontend other than the rolling docker/dockerfile:1
+# tag runs: BuildKit resolves the file under the pinned frontend (verified
+# with docker/dockerfile:1.6, which answers both calls itself, and 1.4.0,
+# whose subrequests buildx serviced through docker/dockerfile:1.8.1 pulled
+# by digest, both on 2026-09-17), and one WARNING says the textual
+# expansion assumes the rolling syntax while BuildKit resolves under the
+# pin. A pinned frontend without subrequest support fails both calls with
+# unsupported frontend capability moby.buildkit.frontend.subrequests
+# (verified with docker/dockerfile:1.0); the run is then not a pass, with a
+# message that the frontend lacks the outline call and that switching the
+# directive to docker/dockerfile:1 lets the gate run.
 #
 # For the expansion, TARGETSTAGE is seeded from --target when given and a
 # base that reads it without one exits 1 asking for --target, and without
@@ -132,18 +159,17 @@
 # Exit codes:
 #   0 — both calls succeeded with their evidence, every base in the FROM
 #       set is on the allowlist, and every other resolved reference was
-#       printed as an external artifact source
-#   1 — a base is off the allowlist, or a base could not be expanded or
-#       classified with certainty, or a base is overridden by a context
-#       that is not a docker-image:// reference, or either call failed,
-#       lacked its evidence, or printed a load-metadata line this script
-#       cannot parse, or a source policy is configured in the environment,
-#       or the file declares a default for an automatic argument name, or
-#       it contains a NUL byte or a bare CR, or its syntax directive
-#       selects a frontend other than the rolling docker/dockerfile:1 tag
-#       (rejected before either buildx call, as check-from-lines.sh
-#       rejects it), or a resolved load sits outside the FROM set in a
-#       file with no artifact-capable instruction; none of these is a pass
+#       printed as an external artifact source WARNING
+#   1 — a base is off the allowlist (REJECTED), or the script refuses to
+#       answer on its own account: a base could not be expanded or
+#       classified with certainty, a base is overridden by a context
+#       that is not a docker-image:// reference, either call failed
+#       (a pinned frontend without subrequest support included), lacked
+#       its evidence, or printed a load-metadata line this script
+#       cannot parse, a source policy is configured in the environment,
+#       the file contains a NUL byte or a bare CR, or a resolved load
+#       sits outside the FROM set in a file with no artifact-capable
+#       instruction; none of these is a pass
 #   2 — usage error
 #
 # Dependencies: sh, awk, od, grep, sed, sort, tr, docker with buildx
@@ -356,19 +382,17 @@ if [ -n "$BAD_BYTE" ]; then
 fi
 
 # The expansion scan implements the rolling docker/dockerfile:1 frontend's
-# parsing rules, so a syntax directive naming any other frontend is
-# rejected here, before either buildx call, exactly as check-from-lines.sh
-# rejects it. A pinned tag parses by the pin's rules, not the rolling
-# frontend's, and buildx can answer a --call subrequest for a pinned
-# frontend through a different, subrequest-capable frontend, so neither
-# call below could vouch for what the pinned frontend builds. The walk
-# mirrors the directive block of the main scan: consecutive directive
-# lines from the top of the file, a BOM and leading whitespace allowed,
-# VT and FF normalized to spaces before the match, the block ended by the
-# first line that is not a known directive.
-SYN_MSG=$(LC_ALL=C awk '
+# parsing rules. A syntax directive naming any other frontend still runs,
+# because BuildKit resolves the file under the pinned frontend and its
+# answer is the gate; this pre-scan only reads the pin so the run can say
+# so in one WARNING, and so a call that fails on a frontend without
+# subrequest support can name the pin. The walk mirrors the directive
+# block of the main scan: consecutive directive lines from the top of the
+# file, a BOM and leading whitespace allowed, VT and FF normalized to
+# spaces before the match, the block ended by the first line that is not a
+# known directive.
+SYN_PIN=$(LC_ALL=C awk '
 BEGIN {
-  SQ = sprintf("%c", 39)
   BOM = sprintf("%c%c%c", 239, 187, 191)
   WS  = sprintf("[ \t\r%c%c]+", 11, 12)
   CTRL_WS = sprintf("[%c%c\r]", 11, 12)
@@ -392,14 +416,22 @@ BEGIN {
   sub(/[ \t]+$/, "", dval)
   if (dkey != "escape" && dkey != "syntax" && dkey != "check") exit 0
   if (dkey == "syntax" && dval != "docker/dockerfile:1" && dval != "docker.io/docker/dockerfile:1") {
-    print "syntax directive " SQ dval SQ " at line " NR " selects a frontend whose parsing rules this script cannot verify; only the rolling docker/dockerfile:1 tag (an optional docker.io/ prefix allowed) is supported"
-    exit 1
+    print dval
+    exit 0
   }
 }
-' < "$DOCKERFILE"); syn_rc=$?
-if [ "$syn_rc" -ne 0 ]; then
-  not_a_pass "$SYN_MSG"
+' < "$DOCKERFILE")
+if [ -n "$SYN_PIN" ]; then
+  echo "check-from-oracle: WARNING: the syntax directive pins the frontend $SYN_PIN; the textual expansion in this script assumes the rolling docker/dockerfile:1 syntax, and BuildKit is resolving the file under the pinned frontend"
 fi
+
+# When both buildx calls fail because the pinned frontend cannot answer
+# subrequests, this names the pin and the way out.
+pinned_frontend_check() {
+  if [ -n "$SYN_PIN" ] && printf '%s\n' "$1" | grep -q 'unsupported frontend capability moby.buildkit.frontend.subrequests'; then
+    not_a_pass "the pinned frontend $SYN_PIN does not support the outline call (unsupported frontend capability moby.buildkit.frontend.subrequests), so BuildKit cannot answer for this file; switching the directive to docker/dockerfile:1 lets the gate run"
+  fi
+}
 
 # 10-minute bound on each buildx call. TIMEOUT_BIN is timeout if present,
 # else gtimeout (Homebrew coreutils on macOS installs it under that name),
@@ -419,10 +451,97 @@ bounded() {
 }
 [ -n "$TIMEOUT_BIN" ] || echo "check-from-oracle: no timeout binary found; the buildx calls run without a time bound" >&2
 
+# Global ARG defaults for the automatic argument names, read before the
+# packs are built. BuildKit lets a declared default beat the automatic
+# value while a --build-arg beats the default (pinned with real builds), so
+# a synthetic override for a name the file gives a declared default would
+# reverse what the real build resolves. For those names no override is
+# passed and BuildKit applies the declared default itself, exactly as the
+# real build does; the expansion scan below applies the same precedence to
+# its own table. The reader mirrors the main scan's global walk: a BOM, the
+# directive block (the escape directive changes the continuation
+# character), comments and blank lines dropped inside continuations,
+# assignments split on whitespace with the name read up to the first =,
+# stopping at the first FROM. Only names are read here; a token the main
+# scan cannot take apart fails the run there, before the outline call.
+DECLARED_AUTO=$(LC_ALL=C awk '
+function scan_line(logical,   n, f, instr, ai, t, p, name) {
+  sub("^" WS, "", logical)
+  n = split(logical, f, WS)
+  if (n == 0) return 0
+  instr = toupper(f[1])
+  if (instr == "FROM") return 1
+  if (instr != "ARG") return 0
+  for (ai = 2; ai <= n; ai++) {
+    t = f[ai]
+    p = index(t, "=")
+    if (p <= 1) continue
+    name = substr(t, 1, p - 1)
+    if ((name in AUTO) && !(name in SEEN)) { SEEN[name] = 1; print name }
+  }
+  return 0
+}
+BEGIN {
+  BOM = sprintf("%c%c%c", 239, 187, 191)
+  WS  = sprintf("[ \t\r%c%c]+", 11, 12)
+  CTRL_WS = sprintf("[%c%c\r]", 11, 12)
+  ESC = "\\"
+  directive_mode = 1
+  buf = ""
+  n_auto = split("TARGETPLATFORM TARGETOS TARGETARCH TARGETVARIANT TARGETOSVERSION TARGETSTAGE BUILDPLATFORM BUILDOS BUILDARCH BUILDVARIANT BUILDOSVERSION", auto_names, " ")
+  for (b = 1; b <= n_auto; b++) AUTO[auto_names[b]] = 1
+}
+{
+  raw = $0
+  if (NR == 1 && substr(raw, 1, 3) == BOM) raw = substr(raw, 4)
+  line = raw
+  sub(/\r$/, "", line); sub(/[ \t]+$/, "", line)
+  trimmed = line
+  sub("^" WS, "", trimmed)
+  if (directive_mode) {
+    dline = trimmed
+    gsub(CTRL_WS, " ", dline)
+    if (dline ~ /^#[ \t]*[A-Za-z][A-Za-z0-9]*[ \t]*=[ \t]*[^ \t]/) {
+      dkey = dline
+      sub(/^#[ \t]*/, "", dkey)
+      dval = dkey
+      sub(/[ \t]*=.*$/, "", dkey)
+      dkey = tolower(dkey)
+      sub(/^[A-Za-z][A-Za-z0-9]*[ \t]*=[ \t]*/, "", dval)
+      sub(/[ \t]+$/, "", dval)
+      if (dkey == "escape" || dkey == "syntax" || dkey == "check") {
+        if (dkey == "escape" && dval == "`") ESC = "`"
+        next
+      }
+      directive_mode = 0
+    } else {
+      directive_mode = 0
+    }
+  }
+  if (trimmed ~ /^#/) next
+  if (trimmed == "") next
+  llen = length(line)
+  if (substr(line, llen, 1) == ESC && (llen == 1 || substr(line, llen - 1, 1) != ESC)) {
+    buf = buf substr(line, 1, llen - 1)
+    next
+  }
+  buf = buf line
+  logical = buf; buf = ""
+  if (scan_line(logical)) exit 0
+}
+END { if (buf != "") scan_line(buf) }
+' < "$DOCKERFILE")
+DECLARED_AUTO=" $(printf '%s' "$DECLARED_AUTO" | tr '\n' ' ') "
+declared_auto() {
+  case "$DECLARED_AUTO" in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
+
 # Build the argument list: the platform packs first, then the user's
 # --build-arg values so they override them, then the target. Each TARGET*
 # and BUILD* value is overridden individually; BuildKit does not derive the
-# others from an overridden TARGETPLATFORM. Without --build-platform the
+# others from an overridden TARGETPLATFORM, and a name with a declared
+# global default gets no override, per the pre-scan above. Without
+# --build-platform the
 # BUILD* arguments stay the daemon's own platform, which is what a real
 # build on this daemon uses. The values in USER_ARGS contain no newlines
 # (checked above), so one line per argument is a faithful split; set -f
@@ -441,21 +560,20 @@ if [ -n "$PLATFORM" ]; then
   normalize_platform "$PLATFORM" --platform
   T_OS=$NORM_OS; T_ARCH=$NORM_ARCH; T_VAR=$NORM_VARIANT
   T_PLAT="$T_OS/$T_ARCH${T_VAR:+/$T_VAR}"
-  set -- --build-arg "TARGETPLATFORM=$T_PLAT" \
-         --build-arg "TARGETOS=$T_OS" \
-         --build-arg "TARGETARCH=$T_ARCH" \
-         --build-arg "TARGETVARIANT=$T_VAR" \
-         --build-arg "TARGETOSVERSION="
+  declared_auto TARGETPLATFORM  || set -- "$@" --build-arg "TARGETPLATFORM=$T_PLAT"
+  declared_auto TARGETOS        || set -- "$@" --build-arg "TARGETOS=$T_OS"
+  declared_auto TARGETARCH      || set -- "$@" --build-arg "TARGETARCH=$T_ARCH"
+  declared_auto TARGETVARIANT   || set -- "$@" --build-arg "TARGETVARIANT=$T_VAR"
+  declared_auto TARGETOSVERSION || set -- "$@" --build-arg "TARGETOSVERSION="
 fi
 if [ -n "$BUILD_PLATFORM" ]; then
   normalize_platform "$BUILD_PLATFORM" --build-platform
   B_OS=$NORM_OS; B_ARCH=$NORM_ARCH; B_VAR=$NORM_VARIANT
-  set -- "$@" \
-         --build-arg "BUILDPLATFORM=$B_OS/$B_ARCH${B_VAR:+/$B_VAR}" \
-         --build-arg "BUILDOS=$B_OS" \
-         --build-arg "BUILDARCH=$B_ARCH" \
-         --build-arg "BUILDVARIANT=$B_VAR" \
-         --build-arg "BUILDOSVERSION="
+  declared_auto BUILDPLATFORM  || set -- "$@" --build-arg "BUILDPLATFORM=$B_OS/$B_ARCH${B_VAR:+/$B_VAR}"
+  declared_auto BUILDOS        || set -- "$@" --build-arg "BUILDOS=$B_OS"
+  declared_auto BUILDARCH      || set -- "$@" --build-arg "BUILDARCH=$B_ARCH"
+  declared_auto BUILDVARIANT   || set -- "$@" --build-arg "BUILDVARIANT=$B_VAR"
+  declared_auto BUILDOSVERSION || set -- "$@" --build-arg "BUILDOSVERSION="
 elif [ -n "$PLATFORM" ]; then
   B_OS=$T_OS; B_ARCH=$T_ARCH; B_VAR=$T_VAR
 fi
@@ -487,6 +605,7 @@ rc=$?
 if [ "$rc" -ne 0 ]; then
   echo "check-from-oracle: the targets run failed (exit $rc); its output:"
   printf '%s\n' "$tout" | sed 's/^/  | /'
+  pinned_frontend_check "$tout"
   not_a_pass "BuildKit could not enumerate the stages of this file"
 fi
 if ! printf '%s\n' "$tout" | grep -q '^#[0-9][0-9]* \[[^][]*\] load build definition from '; then
@@ -530,8 +649,9 @@ fi
 # Expand each base the way check-from-lines.sh resolves a FROM: the global
 # ARG table (defaults, quoting, the user's --build-arg overrides), the
 # automatic arguments as seeded from --platform, --build-platform, and
-# --target, and the named-context substitution. The scan rejects, rather
-# than guesses at, a declared default for an automatic argument name, an
+# --target with a declared default replacing the seeded value and an
+# override beating both, as BuildKit applies them, and the named-context
+# substitution. The scan rejects, rather than guesses at, an
 # escape character in an ARG token, an expansion form beyond ${NAME},
 # ${NAME:-word} and ${NAME:+word}, and an unresolved variable in a base.
 # On success it prints one line per FROM-set member, "ref<TAB>canonical"
@@ -923,8 +1043,12 @@ function process_global(logical, lineno,   n, f, instr, ai, t, p, name, val, q, 
       fail("ARG at line " lineno " declares an assignment with an empty name (\"" t "\")")
     name = substr(t, 1, p - 1)
     val = substr(t, p + 1)
-    if (name in AUTO)
-      fail("line " lineno " declares a default for the automatic argument " name ". BuildKit lets that default beat the automatic value while a --build-arg beats the default, and this script can pass the platform only as --build-arg overrides, so the outline would resolve a different file than the build. Redeclare it bare (ARG " name ") or use another name")
+    # A declared default for an automatic argument name replaces the
+    # seeded value through this same assignment, and an OVERRIDE entry
+    # beats it below, matching the precedence BuildKit applies (declared
+    # default over automatic value, --build-arg over the default, each
+    # pinned with real builds); the pack builder passed no synthetic
+    # override for such a name, so the frontend applies the same default.
     litq = 0
     if (index(val, "\"") > 0 || index(val, SQ) > 0) {
       q = substr(val, 1, 1)
@@ -1083,6 +1207,7 @@ rc=$?
 if [ "$rc" -ne 0 ]; then
   echo "check-from-oracle: the outline run failed (exit $rc); its output:"
   printf '%s\n' "$out" | sed 's/^/  | /'
+  pinned_frontend_check "$out"
   not_a_pass "BuildKit could not resolve the file for this target and platform"
 fi
 
@@ -1137,7 +1262,7 @@ for ref in $refs; do
         echo "check-from-oracle: this is not a pass; the FROM gate fails."
         exit 1
       fi
-      echo "check-from-oracle: external artifact source $ref (allowed; a COPY --from, RUN mount, or ADD pulls it, not a FROM; name it in the report)"
+      echo "check-from-oracle: WARNING: external artifact source $ref (COPY --from, RUN mount, or ADD): a binary copied from another distribution's image links against that distribution's libraries; prefer the Chainguard image of the same name or build the artifact in a Chainguard stage"
       ;;
   esac
 done
