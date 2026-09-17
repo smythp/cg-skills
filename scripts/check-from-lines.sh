@@ -1,7 +1,25 @@
 #!/bin/sh
-# check-from-lines.sh — gate every FROM in a Dockerfile against the migration
-# allowlist: cgr.dev/* (exact host boundary), the configured external mirror
-# prefix (on a / boundary), scratch, and previously declared stage aliases.
+# check-from-lines.sh — read every FROM in a Dockerfile textually and check
+# each against the migration allowlist: cgr.dev/* (exact host boundary), the
+# configured external mirror prefix (on a / boundary), scratch, and
+# previously declared stage aliases.
+#
+# Posture. This check advises; BuildKit's own resolution, asked by
+# check-from-oracle.sh, decides. Findings come in two classes:
+#   - REJECTED (exit 1): a base known to resolve outside the allowlist.
+#     The resolution rules below were each verified against BuildKit, so a
+#     REJECTED base is one the build really pulls off the allowlist: a FROM
+#     whose resolved reference BuildKit accepts and the allowlist does not,
+#     a stage alias shaped like an image reference (the alias table decides
+#     what later FROMs mean, so an alias this check cannot trust as a name
+#     is refused), and a named build context whose docker-image:// source
+#     is off the allowlist, at a FROM or at a stage definition.
+#   - UNVERIFIED (exit 3): a construct this check cannot verify textually.
+#     Each is reported on its own line naming the construct and the line,
+#     the scan continues where its line classification stays trustworthy so
+#     every such construct is listed, and the oracle decides what the build
+#     resolves. Nothing UNVERIFIED passes silently, and nothing UNVERIFIED
+#     is refused on a guess.
 #
 # Usage: check-from-lines.sh [--mirror PREFIX] [--platform OS/ARCH[/VARIANT]]
 #                            [--build-platform OS/ARCH[/VARIANT]] [--target NAME]
@@ -51,36 +69,44 @@
 #                         matching no FROM and no stage name is ignored,
 #                         as BuildKit ignores it for bases.
 #
-# Exit codes: 0 = all FROMs allowed; 1 = a FROM (or stage alias, or ARG
-# expansion, or a construct this gate refuses to guess about) is not allowed,
-# with a message naming the line; 2 = usage error.
+# Exit codes: 0 = every FROM verified and on the allowlist; 1 = a base
+# known to be off the allowlist (REJECTED), with a message naming the line;
+# 2 = usage error, including a --build-context name buildx itself refuses;
+# 3 = no known off-allowlist base, but constructs this check could not
+# verify (the UNVERIFIED lines name them; check-from-oracle.sh decides
+# them).
 #
 # Semantics ported from Guardener's static validator and checked against
 # BuildKit (the parser rules below were each verified against
 # docker buildx build --call=outline on the builtin Dockerfile frontend):
 #   - Physical lines: a NUL byte anywhere in the file, and a CR that is not
-#     immediately followed by LF, are rejected before parsing, naming the
-#     line. BuildKit keeps both bytes inside the surrounding line where this
-#     parser would split it (its FROM reproductions fail with "FROM requires
-#     either one or three arguments"), awk implementations disagree about
-#     NUL bytes in input, and once the file is split into records a final CR
-#     with no LF cannot be told apart from a CRLF ending. CRLF line endings
-#     are accepted as before.
+#     immediately followed by LF, are reported as UNVERIFIED before parsing,
+#     naming the line, and the file is not scanned further. BuildKit keeps
+#     both bytes inside the surrounding line where this parser would split
+#     it (its FROM reproductions fail with "FROM requires either one or
+#     three arguments"), awk implementations disagree about NUL bytes in
+#     input, and once the file is split into records a final CR with no LF
+#     cannot be told apart from a CRLF ending, so nothing after such a byte
+#     can be classified with certainty. CRLF line endings are accepted as
+#     before.
 #   - Parser directives: consecutive '# key=value' lines from the top of the
 #     file (leading whitespace and a UTF-8 BOM allowed, keys case-insensitive).
 #     The block ends at the first line that is not a known directive (a
 #     plain comment, a blank line, an unknown key, or an instruction). '# escape=' is
-#     honored for backslash and backtick; any other value is rejected with
-#     exit 1, as BuildKit itself errors on it. A duplicate directive is
-#     rejected the same way. '# syntax=' is accepted only when its value is
-#     exactly docker/dockerfile:1 or docker.io/docker/dockerfile:1, the
-#     rolling tag of the frontend these rules were verified against; every
-#     other value is rejected naming the frontend. A pinned tag parses by
-#     the pin's rules, not the rolling frontend's (under docker/dockerfile:1.0
-#     a heredoc body is ordinary instructions), and buildx can answer a
-#     --call=outline for a pinned frontend through a different,
-#     subrequest-capable frontend, so neither this gate nor the outline
-#     oracle can vouch for what a pinned frontend builds.
+#     honored for backslash and backtick; any other value is UNVERIFIED
+#     (BuildKit itself errors on it; this check keeps the previous escape
+#     character and continues). A duplicate directive is UNVERIFIED the same
+#     way, keeping the first value. A line in directive position whose shape
+#     is '# key=value' with a key this check does not know is UNVERIFIED and
+#     is then read as the comment the rolling frontend reads it as, ending
+#     the block. '# syntax=' is verified only when its value is exactly
+#     docker/dockerfile:1 or docker.io/docker/dockerfile:1, the rolling tag
+#     of the frontend these rules were checked against; any other value is
+#     UNVERIFIED naming the frontend, because a pinned tag parses by the
+#     pin's rules, not the rolling frontend's (under docker/dockerfile:1.0
+#     a heredoc body is ordinary instructions). The scan then continues
+#     under the rolling rules as a best effort, and check-from-oracle.sh
+#     runs the pinned frontend itself and decides.
 #   - Line continuation matches BuildKit: a line continues when its last
 #     non-whitespace character is the escape character and the character
 #     before it is not also the escape character (so a line ending in two
@@ -103,50 +129,64 @@
 #     counts. This tokenizer always escapes with backslash: BuildKit
 #     hardcodes it for heredoc scanning even when '# escape=`' changes the
 #     escape character (verified against the oracle). A line this tokenizer
-#     cannot split with certainty is rejected with exit 1 rather than
-#     guessed at: an unbalanced quote (BuildKit silently scans no heredocs
-#     on such a line), a ${...} expansion on a heredoc-capable line in any
-#     form other than ${NAME}, ${NAME:-word} or ${NAME:+word} with a plain
-#     word (other forms can shift BuildKit's word boundaries or disable its
-#     heredoc scan entirely), and a Unicode space character on such a line
-#     (BuildKit splits words on those; this byte-wise scan cannot). The
+#     cannot split with certainty is UNVERIFIED rather than guessed at. An
+#     unbalanced quote is reported and the line opens no heredoc, which is
+#     what BuildKit does (its lexer errors and it silently scans no heredocs
+#     on such a line), so the scan continues. A ${...} expansion on a
+#     heredoc-capable line in any form other than ${NAME}, ${NAME:-word} or
+#     ${NAME:+word} with a plain word (other forms can shift BuildKit's word
+#     boundaries or disable its heredoc scan entirely), and a Unicode space
+#     character on such a line (BuildKit splits words on those; this
+#     byte-wise scan cannot), leave the heredoc extent unknown: every line
+#     after them could be content or instruction, so the report names the
+#     construct and the scan stops there. The
 #     content lines up to and including the line equal to each delimiter, in
 #     order, are file content, not instructions and not comments; for <<-
 #     the delimiter comparison strips leading tabs; otherwise the comparison
 #     is exact, so a delimiter line with trailing whitespace does not
-#     terminate. A heredoc marker this gate cannot classify with certainty
+#     terminate. A heredoc marker this check cannot classify with certainty
 #     (a quoted name spanning whitespace, a name containing a quote, $, a
-#     backslash, or other unusual characters) is rejected with exit 1 rather
-#     than guessed at, and an unterminated heredoc is rejected as BuildKit
-#     rejects it.
+#     backslash, or other unusual characters) is UNVERIFIED and stops the
+#     scan the same way, and an unterminated heredoc is UNVERIFIED
+#     (BuildKit rejects the file).
 #   - ARG lines before the first FROM: every NAME=value assignment on the
 #     line is processed, matching docker build, not just the first. A value
 #     may be wrapped in one pair of quotes; a single-quoted value is kept
 #     literally, with no variable expansion inside it, as BuildKit keeps it
 #     (verified with an outline run), while double-quoted and unquoted
-#     values expand. A quoted value spanning
-#     whitespace, a stray quote, or an escape character in any token is
-#     rejected with exit 1 rather than reassembled. ARGs declared after a
-#     FROM are ignored for FROM resolution. A --build-arg override replaces
-#     the default of a matching ARG declared before the first FROM, and gives
-#     a value to a global ARG declared with no default. An override whose
-#     name no ARG declares is ignored, as in docker build. A global ARG
-#     that declares a default for one of the automatic argument names is
-#     rejected with exit 1 naming the line (see the automatic arguments
-#     bullet); a bare redeclaration stays allowed.
+#     values expand. A quoted value spanning whitespace, a stray quote, an
+#     escape character, or an empty name in any token is UNVERIFIED rather
+#     than reassembled, and it leaves the whole ARG table untrustworthy:
+#     BuildKit reassembles such a line by rules this check does not model
+#     (verified with real builds: ARG A="x y" B=alpine assigns B, while
+#     ARG OTHER=a\ B=alpine swallows B= into OTHER's value), so every later
+#     FROM whose resolution reads any variable is UNVERIFIED too, while a
+#     FROM written as a literal reference stays verifiable. ARGs declared
+#     after a FROM are ignored for FROM resolution. A --build-arg override
+#     replaces the default of a matching ARG declared before the first
+#     FROM, and gives a value to a global ARG declared with no default. An
+#     override whose name no ARG declares is ignored, as in docker build. A
+#     global ARG that declares a default for one of the automatic argument
+#     names replaces the automatic value, and a --build-arg override beats
+#     the declared default, exactly as BuildKit applies them (each verified
+#     with a real build; see the automatic arguments bullet).
 #   - Variable expansion supports $NAME, ${NAME}, ${NAME:-default} (default
 #     when unset or empty) and ${NAME:+alt} (alt when set and non-empty),
 #     with BuildKit's semantics. Every other modifier (%, #, /, ^, and the
-#     colon-less - and + forms) is rejected with exit 1 naming the
-#     expression, never expanded to an empty string.
+#     colon-less - and + forms) is UNVERIFIED naming the expression, never
+#     expanded to an empty string; a value it touches is unknown from then
+#     on, and a FROM that reads such a value is UNVERIFIED too.
 #   - FROM flags such as --platform=... are skipped to reach the image ref.
 #     After the flags, a FROM has exactly one image reference, optionally
-#     followed by AS and a stage name; any other token count is rejected
-#     quoting the line, as BuildKit fails such a line with "FROM requires
-#     either one or three arguments" (a middle token other than AS draws the
-#     same message). scratch is matched case-sensitively; BuildKit treats
-#     only the lowercase spelling as the empty base and rejects FROM SCRATCH
-#     as an invalid reference (repository names must be lowercase).
+#     followed by AS and a stage name; any other token count is UNVERIFIED
+#     quoting the line, because BuildKit fails such a line with "FROM
+#     requires either one or three arguments" (a middle token other than AS
+#     draws the same message), so no base pulls from it. scratch is matched
+#     case-sensitively; BuildKit treats only the lowercase spelling as the
+#     empty base and rejects FROM SCRATCH as an invalid reference
+#     (repository names must be lowercase), so any other spelling that is
+#     not a reference BuildKit accepts is UNVERIFIED, and one it accepts is
+#     checked against the allowlist like any reference.
 #   - Automatic platform arguments: BuildKit seeds TARGETPLATFORM, TARGETOS,
 #     TARGETARCH, TARGETVARIANT, TARGETOSVERSION, TARGETSTAGE, BUILDPLATFORM,
 #     BUILDOS, BUILDARCH, BUILDVARIANT, and BUILDOSVERSION in the global
@@ -162,22 +202,20 @@
 #     arguments are set to the
 #     empty string when the platform has none, which matters for the :- and
 #     :+ modifiers. A bare global redeclaration (ARG TARGETARCH) keeps the
-#     seeded value, matching BuildKit, and a --build-arg override beats a
-#     declaration with or without it. A global declaration that gives one
-#     of these names a default is rejected with exit 1 naming the line.
-#     BuildKit lets the declared default beat the automatic value while a
-#     --build-arg beats the default, and the oracle gate can pass a
-#     platform only as --build-arg overrides, so such a file would resolve
-#     differently under the oracle than under the build. BuildKit itself
-#     accepts the file, so this rejection is conservative, and it keeps
-#     the two gate scripts answering for the same file.
+#     seeded value, and a global declaration that gives one of these names a
+#     default replaces the seeded value, while a --build-arg override beats
+#     both, exactly as BuildKit applies them (declared default over
+#     automatic value, --build-arg over declared default, each verified
+#     with a real build, TARGETSTAGE against --target included).
 #     When --platform was not given and FROM resolution
-#     reads one of these names, the gate exits 1 naming it and asking for
-#     --platform (or --target, for TARGETSTAGE), because BuildKit resolves
-#     a value the gate does not know. A file that never reads them behaves
-#     as before.
-#   - Unresolved variables in a FROM ref are rejected: FROM $UNSET could
-#     resolve to anything at build time, so it cannot pass a static gate.
+#     reads one of these names, the FROM is UNVERIFIED naming the argument
+#     and asking for --platform (or --target, for TARGETSTAGE), because
+#     BuildKit resolves a value this check does not know. A file that never
+#     reads them behaves as before.
+#   - Unresolved variables in a FROM ref are UNVERIFIED: FROM $UNSET could
+#     resolve to anything at build time (the build as captured fails on the
+#     empty expansion, and a --build-arg not on the captured invocation
+#     could send it anywhere), so the check reports it instead of deciding.
 #   - Named build contexts: BuildKit matches each --build-context name
 #     against the expanded FROM reference and against stage names, after
 #     docker reference normalization on both sides (a bare name gains
@@ -190,34 +228,48 @@
 #     reference and a scratch base alike; at a FROM, a context beats a
 #     stage of the same name, while FROM scratch itself cannot be
 #     overridden by a context named scratch; each rule pinned by an
-#     outline run or a real build. The gate applies the same matching at
+#     outline run or a real build. The check applies the same matching at
 #     each FROM and at each AS name. A matching docker-image://REF source
 #     puts REF through the allowlist in place of the FROM (or of the
-#     overridden stage's base); a matching source of any other kind is
-#     rejected as unsupported; a name that matches nothing is ignored.
+#     overridden stage's base); a matching source of any other kind (a
+#     local directory, a git repository, an oci layout, another target) is
+#     UNVERIFIED, because a base built from such a source has no registry
+#     reference to check; a name that matches nothing is ignored. A context
+#     name that is not a valid reference is a usage error (exit 2): buildx
+#     refuses the invocation, so the captured build cannot run with it.
 #   - A stage alias must match ^[a-zA-Z][a-zA-Z0-9_.-]*$ (Docker stage-name
 #     rules) so an image-shaped alias cannot become a trusted name for later
-#     FROMs. Aliases compare case-insensitively.
+#     FROMs; an alias outside that shape is REJECTED, because the alias
+#     table decides what every later FROM in the file means. Aliases compare
+#     case-insensitively.
+#   - A FROM naming a stage that is declared later in the file is a stage
+#     reference to BuildKit, which resolves stage names anywhere in the
+#     file, never a pull (verified with an outline run). This check reads
+#     the file top to bottom and trusts only aliases already declared, so a
+#     forward reference is UNVERIFIED, decided at the end of the scan when
+#     every stage name is known: a bare name matching no stage anywhere is
+#     a pull and meets the allowlist (REJECTED off it), a name only a later
+#     stage declares is reported, and a stage is never its own base, so
+#     FROM alpine AS alpine pulls alpine (verified with a real run).
 #   - Lookalike hosts (cgr.dev.evil.example.com) and mirror prefix siblings
 #     (mirror-extra/...) are rejected by the boundary checks.
 #
-# Known conservative deviations (this gate may reject what Docker accepts,
-# never the reverse): the modifiers beyond ${NAME:-default} and ${NAME:+alt},
-# quoted or escaped whitespace in ARG values, ambiguous heredoc markers,
-# unbalanced quotes and restricted ${...} forms and Unicode spaces on
-# heredoc-capable lines, and non-stable '# syntax=' frontends are all
-# rejected rather than emulated; a NUL byte or a bare CR is rejected
-# file-wide, even where BuildKit tolerates it (inside a comment or a heredoc
-# body, and a final CR with no LF, which BuildKit reads as an ordinary line
-# ending, verified against a real outline run); a global ARG that declares
-# a default for an automatic argument name is rejected even though BuildKit
-# accepts the file (the automatic arguments bullet above says why); a
-# --build-context whose source is not docker-image:// is rejected when its
-# name matches a FROM or a stage name, where BuildKit would build the base
-# from that source; and with --platform but no
-# --build-platform the BUILD* arguments take the target platform's values,
-# which matches every same-platform build but differs on a cross-platform
-# one until the caller passes --build-platform.
+# What UNVERIFIED covers, in one list: the modifiers beyond ${NAME:-default}
+# and ${NAME:+alt}, quoted or escaped whitespace and empty names in ARG
+# tokens, ambiguous heredoc markers, unbalanced quotes and restricted
+# ${...} forms and Unicode spaces on heredoc-capable lines, unterminated
+# heredocs, pinned '# syntax=' frontends, unknown or duplicate parser
+# directives and invalid escape values, NUL bytes and lone CRs, FROM token
+# counts BuildKit refuses, references BuildKit refuses, unresolved
+# variables in a FROM, automatic platform arguments read without
+# --platform or --target, forward stage references, and named build
+# contexts whose source is not docker-image://. None of these is emulated
+# or guessed at; each is named for the report, and check-from-oracle.sh
+# decides them with BuildKit's own resolution. One documented deviation
+# stays: with --platform but no --build-platform the BUILD* arguments take
+# the target platform's values, which matches every same-platform build
+# but differs on a cross-platform one until the caller passes
+# --build-platform.
 #
 # Dependencies: sh, awk, od (POSIX). No network, no writes.
 
@@ -395,13 +447,13 @@ BAD_BYTE=$(od -An -v -t o1 < "$DOCKERFILE" | LC_ALL=C awk '
 if [ -n "$BAD_BYTE" ]; then
   case "$BAD_BYTE" in
     NUL*)
-      echo "check-from-lines: line ${BAD_BYTE#* } contains a NUL byte; this gate cannot split such a line the way BuildKit does, so the file is rejected rather than guessed at"
+      echo "check-from-lines: UNVERIFIED line ${BAD_BYTE#* } contains a NUL byte; this check cannot split such a line the way BuildKit does, so the file is reported instead of scanned. check-from-oracle.sh decides what the build resolves"
       ;;
     *)
-      echo "check-from-lines: line ${BAD_BYTE#* } contains a CR that is not part of a CRLF line ending; this gate cannot split such a line the way BuildKit does, so the file is rejected rather than guessed at (CRLF endings are accepted)"
+      echo "check-from-lines: UNVERIFIED line ${BAD_BYTE#* } contains a CR that is not part of a CRLF line ending; this check cannot split such a line the way BuildKit does, so the file is reported instead of scanned (CRLF endings are accepted). check-from-oracle.sh decides what the build resolves"
       ;;
   esac
-  exit 1
+  exit 3
 fi
 
 # Resolve the automatic platform argument values BuildKit would seed. The
@@ -447,32 +499,62 @@ CHECK_FROM_BUILD_ARGS="$BUILD_ARGS" CHECK_FROM_BUILD_CONTEXTS="$BUILD_CONTEXTS" 
 function rtrim_c(s) { sub(/\r$/, "", s); sub(/[ \t]+$/, "", s); return s }
 function ltrim(s)   { sub(WSL, "", s); return s }
 
-function fail(msg) { print "check-from-lines: " msg; EXITCODE = 1; exit 1 }
+# hard: a base known to resolve outside the allowlist; the scan stops.
+# warn: a construct this check cannot verify; the line is reported and the
+# scan continues where its line classification stays trustworthy.
+# warn_halt: an unverifiable construct after which no line can be told
+# apart from heredoc content, so the scan stops with the report so far.
+function hard(msg) { print "check-from-lines: REJECTED: " msg; EXITCODE = 1; exit 1 }
+function warn(msg) { print "check-from-lines: UNVERIFIED " msg; WARNED++ }
+function warn_halt(msg) {
+  warn(msg)
+  print "check-from-lines: the lines after this construct cannot be told apart from heredoc content, so the scan stops here; check-from-oracle.sh decides the rest of the file"
+  HALT = 1
+  exit
+}
 
 # BuildKit sets the automatic platform arguments on every build, so a FROM
-# resolution that reads one is checkable only when the gate knows the
+# resolution that reads one is checkable only when this check knows the
 # platform (or, for TARGETSTAGE, the build target). A name that was seeded,
-# declared with a default, or overridden is in ARGS and needs no check.
-function autofail(name, lineno) {
+# declared with a default, or overridden is in ARGS and needs no check; a
+# read this check cannot resolve marks the expansion uncertain.
+function autocheck(name, lineno) {
   if (name in ARGS || !(name in AUTO)) return
+  UNCERTAIN = 1
   if (name == "TARGETSTAGE")
-    fail("line " lineno " reads the automatic argument TARGETSTAGE, which BuildKit sets to the target stage name on every build. Pass --target so the gate resolves the same value the build does")
-  fail("line " lineno " reads the automatic platform argument " name ", which BuildKit sets on every build. Pass --platform (and --build-platform when the build platform differs from the target) so the gate resolves the same file the builder does")
+    warn("line " lineno " reads the automatic argument TARGETSTAGE, which BuildKit sets to the target stage name on every build, and this run has no --target. Pass --target so the check resolves the same value the build does")
+  else
+    warn("line " lineno " reads the automatic platform argument " name ", which BuildKit sets on every build, and this run has no --platform. Pass --platform (and --build-platform when the build platform differs from the target) so the check resolves the same file the builder does")
+}
+
+# unknown_var(name): true when this check lost track of the value of name.
+# An unverifiable ARG line taints every name it could have assigned, which
+# is any name (ARG_TAINT); a name assigned after the tainted line (CLEAN)
+# or forced by a --build-arg override, which beats any declared default, is
+# certain again, and a name whose own default could not be expanded stays
+# unknown (ARGS_UNKNOWN).
+function unknown_var(name) {
+  if (name in ARGS_UNKNOWN) return 1
+  if (ARG_TAINT && !(name in OVERRIDE) && !(name in CLEAN)) return 1
+  return 0
 }
 
 # Resolve one variable name. In "from" mode an unknown name is collected in
 # UNRESOLVED instead of guessed at; in "default" mode it expands to the empty
-# string, matching the builder.
+# string, matching the builder. A name whose value this check lost track of
+# marks the expansion uncertain instead of answering.
 function lookup(name, mode, lineno) {
-  autofail(name, lineno)
+  autocheck(name, lineno)
+  if (unknown_var(name)) { UNCERTAIN = 1; return "" }
   if (name in ARGS) return ARGS[name]
   if (mode == "from") UNRESOLVED = UNRESOLVED " " name
   return ""
 }
 
 # Expand $NAME, ${NAME}, ${NAME:-default}, ${NAME:+alt} in s. Any other
-# modifier is rejected with exit 1 naming the expression: expanding it to an
-# empty string could silently change the registry being checked.
+# modifier is UNVERIFIED naming the expression, never expanded to an empty
+# string, and it marks the expansion uncertain: the caller treats the value
+# as unknown instead of checking a guess against the allowlist.
 function expand_str(s, mode, lineno,   out, j, k, name, c, mod, word, isset) {
   out = ""
   while (length(s) > 0) {
@@ -482,8 +564,11 @@ function expand_str(s, mode, lineno,   out, j, k, name, c, mod, word, isset) {
     s = substr(s, j + 1)
     if (substr(s, 1, 1) == "{") {
       s = substr(s, 2)
-      if (!match(s, /^[A-Za-z_][A-Za-z0-9_]*/))
-        fail("bad substitution \"${" s "\" at line " lineno)
+      if (!match(s, /^[A-Za-z_][A-Za-z0-9_]*/)) {
+        warn("bad substitution \"${" s "\" at line " lineno "; BuildKit fails the file on it, so no base pulls from this expansion")
+        UNCERTAIN = 1
+        return out
+      }
       name = substr(s, RSTART, RLENGTH)
       s = substr(s, RLENGTH + 1)
       c = substr(s, 1, 1)
@@ -492,23 +577,38 @@ function expand_str(s, mode, lineno,   out, j, k, name, c, mod, word, isset) {
         out = out lookup(name, mode, lineno)
       } else if (c == ":") {
         mod = substr(s, 2, 1)
-        if (mod != "-" && mod != "+")
-          fail("unsupported modifier in \"${" name ":" mod "...}\" at line " lineno ": only ${NAME}, ${NAME:-default} and ${NAME:+alt} are supported")
+        if (mod != "-" && mod != "+") {
+          warn("unsupported modifier in \"${" name ":" mod "...}\" at line " lineno ": only ${NAME}, ${NAME:-default} and ${NAME:+alt} can be verified textually")
+          UNCERTAIN = 1
+          return out
+        }
         k = index(s, "}")
-        if (k == 0)
-          fail("missing } in \"${" name s "\" at line " lineno)
+        if (k == 0) {
+          warn("missing } in \"${" name s "\" at line " lineno)
+          UNCERTAIN = 1
+          return out
+        }
         word = substr(s, 3, k - 3)
         s = substr(s, k + 1)
-        if (word ~ /[${}"]/ || index(word, SQ) > 0 || index(word, ESC) > 0)
-          fail("unsupported nested expansion in \"${" name ":" mod word "}\" at line " lineno)
-        autofail(name, lineno)
+        if (word ~ /[${}"]/ || index(word, SQ) > 0 || index(word, ESC) > 0) {
+          warn("nested expansion in \"${" name ":" mod word "}\" at line " lineno " cannot be verified textually")
+          UNCERTAIN = 1
+          return out
+        }
+        autocheck(name, lineno)
+        if (unknown_var(name)) UNCERTAIN = 1
+        if (UNCERTAIN) return out
         isset = (name in ARGS && ARGS[name] != "")
         if (mod == "-") out = out (isset ? ARGS[name] : word)
         else            out = out (isset ? word : "")
       } else if (c == "") {
-        fail("missing } in \"${" name "\" at line " lineno)
+        warn("missing } in \"${" name "\" at line " lineno)
+        UNCERTAIN = 1
+        return out
       } else {
-        fail("unsupported variable modifier in \"${" name c "...}\" at line " lineno ": only ${NAME}, ${NAME:-default} and ${NAME:+alt} are supported")
+        warn("unsupported variable modifier in \"${" name c "...}\" at line " lineno ": only ${NAME}, ${NAME:-default} and ${NAME:+alt} can be verified textually")
+        UNCERTAIN = 1
+        return out
       }
     } else if (match(s, /^[A-Za-z_][A-Za-z0-9_]*/)) {
       name = substr(s, RSTART, RLENGTH)
@@ -616,7 +716,7 @@ function strict_heredoc_name(s,   q, inner) {
 function lex_words(s, lineno, W,   n, i, len, c, w, inw, j, k, q, nc, inner) {
   for (j = 1; j <= N_USPACE; j++)
     if (index(s, USPACE[j]) > 0)
-      fail("line " lineno " combines a heredoc-capable instruction with a Unicode space character; this gate cannot split its words the way BuildKit does. Use ASCII spaces on lines that open heredocs")
+      warn_halt("line " lineno " combines a heredoc-capable instruction with a Unicode space character; this check cannot split its words the way BuildKit does, so it cannot tell whether a heredoc opens")
   n = 0; w = ""; inw = 0
   len = length(s); i = 1
   while (i <= len) {
@@ -635,8 +735,10 @@ function lex_words(s, lineno, W,   n, i, len, c, w, inw, j, k, q, nc, inner) {
     }
     if (c == SQ) {
       j = index(substr(s, i + 1), SQ)
-      if (j == 0)
-        fail("unbalanced single quote on a heredoc-capable instruction at line " lineno ": this gate cannot tell where its words end (BuildKit scans no heredocs on such a line). Balance the quote")
+      if (j == 0) {
+        warn("unbalanced single quote on a heredoc-capable instruction at line " lineno ": this check cannot tell where its words end. BuildKit scans no heredocs on such a line (verified), so the scan continues with none open here")
+        return -1
+      }
       w = w substr(s, i, j + 1); inw = 1; i += j + 1
       continue
     }
@@ -659,8 +761,10 @@ function lex_words(s, lineno, W,   n, i, len, c, w, inw, j, k, q, nc, inner) {
         }
         w = w c; i++
       }
-      if (!q)
-        fail("unbalanced double quote on a heredoc-capable instruction at line " lineno ": this gate cannot tell where its words end (BuildKit scans no heredocs on such a line). Balance the quote")
+      if (!q) {
+        warn("unbalanced double quote on a heredoc-capable instruction at line " lineno ": this check cannot tell where its words end. BuildKit scans no heredocs on such a line (verified), so the scan continues with none open here")
+        return -1
+      }
       continue
     }
     if (c == "$" && substr(s, i + 1, 1) == "{") {
@@ -694,7 +798,7 @@ function lex_words(s, lineno, W,   n, i, len, c, w, inw, j, k, q, nc, inner) {
 function lex_brace(s, i, lineno,   k, inner, ok) {
   k = index(substr(s, i + 2), "}")
   if (k == 0)
-    fail("missing } in a ${ expansion on a heredoc-capable instruction at line " lineno)
+    warn_halt("missing } in a ${ expansion on a heredoc-capable instruction at line " lineno "; this check cannot tell whether a heredoc opens on the line")
   inner = substr(s, i + 2, k - 1)
   ok = 0
   if (inner ~ /^[A-Za-z_][A-Za-z0-9_]*$/) ok = 1
@@ -702,7 +806,7 @@ function lex_brace(s, i, lineno,   k, inner, ok) {
            index(inner, SQ) == 0 && index(inner, VT) == 0 && index(inner, FF) == 0)
     ok = 1
   if (!ok)
-    fail("the expansion \"${" inner "}\" at line " lineno " is not supported on a heredoc-capable instruction: only ${NAME}, ${NAME:-word} and ${NAME:+word} with a plain word can be split into words the way BuildKit does. Rewrite the expansion or move it off the line that opens the heredoc")
+    warn_halt("the expansion \"${" inner "}\" at line " lineno " is not supported on a heredoc-capable instruction: only ${NAME}, ${NAME:-word} and ${NAME:+word} with a plain word can be split into words the way BuildKit does, so this check cannot tell whether a heredoc opens on the line")
   return i + 1 + k
 }
 
@@ -726,7 +830,7 @@ function scan_heredocs(W, n, lineno,   i, t, body, chomp, name) {
     if (index(body, "<") > 0) continue # not a heredoc to BuildKit either
     name = strict_heredoc_name(body)
     if (name == "")
-      fail("heredoc marker \"" t "\" at line " lineno " is not supported by this gate: the delimiter could not be classified with certainty, so the following lines cannot be told apart from instructions. Use a plain <<NAME heredoc")
+      warn_halt("heredoc marker \"" t "\" at line " lineno " is not supported by this check: the delimiter could not be classified with certainty, so the following lines cannot be told apart from instructions")
     HD_N++; HD_NAME[HD_N] = name; HD_CHOMP[HD_N] = chomp
   }
 }
@@ -762,6 +866,8 @@ BEGIN {
   buf = ""; bufline = 0
   directive_mode = 1
   HD_N = 0; HD_I = 1
+  WARNED = 0; HALT = 0; ARG_TAINT = 0; UNCERTAIN = 0
+  STAGE_N = 0; NPEND = 0
   # The same normalization check-from-oracle.sh applies to its mirror:
   # lowercase, strip trailing slashes, trim spaces and tabs, in that order.
   mirror = tolower(ENVIRON["CHECK_FROM_MIRROR"])
@@ -777,8 +883,9 @@ BEGIN {
   # context against a FROM reference or a stage name after reference
   # normalization on both sides, and a repeated flag with the same name
   # wins with its last value, both pinned by outline runs. A name docker
-  # cannot parse is refused here because buildx refuses the invocation
-  # (verified; it names the context and the lowercase repository rule).
+  # cannot parse is a usage error (exit 2), because buildx refuses the
+  # invocation (verified; it names the context and the lowercase repository
+  # rule), so the captured build cannot run with it.
   N_CTX = 0
   n_bc = split(ENVIRON["CHECK_FROM_BUILD_CONTEXTS"], bc_lines, "\n")
   for (b = 1; b <= n_bc; b++) {
@@ -787,8 +894,11 @@ BEGIN {
     if (p <= 1) continue
     cname = substr(bc_lines[b], 1, p - 1)
     cnorm = norm_ref(cname)
-    if (cnorm == "")
-      fail("the build context name \"" cname "\" is not a valid image reference, so buildx refuses this invocation; the captured build cannot run with it")
+    if (cnorm == "") {
+      print "check-from-lines: the build context name \"" cname "\" is not a valid image reference, so buildx refuses this invocation; the captured build cannot run with it"
+      EXITCODE = 2
+      exit 2
+    }
     CTX[cnorm] = substr(bc_lines[b], p + 1)
     N_CTX++
   }
@@ -850,27 +960,32 @@ BEGIN {
       sub(/^[A-Za-z][A-Za-z0-9]*[ \t]*=[ \t]*/, "", dval)
       sub(/[ \t]+$/, "", dval)
       if (dkey == "escape" || dkey == "syntax" || dkey == "check") {
-        if (dkey in SEEN_DIRECTIVE)
-          fail("only one " dkey " parser directive can be used (line " NR ")")
+        if (dkey in SEEN_DIRECTIVE) {
+          warn("only one " dkey " parser directive can be used (line " NR "); BuildKit rejects the file, so the first value is kept and no base pulls as written")
+          next
+        }
         SEEN_DIRECTIVE[dkey] = 1
         if (dkey == "escape") {
-          if (dval != "\\" && dval != "`")
-            fail("invalid escape directive value " SQ dval SQ " at line " NR ": must be \\ or ` (BuildKit rejects this file too)")
+          if (dval != "\\" && dval != "`") {
+            warn("invalid escape directive value " SQ dval SQ " at line " NR ": must be \\ or `. BuildKit rejects the file, so no base pulls as written; the scan keeps the previous escape character")
+            next
+          }
           ESC = dval
         } else if (dkey == "syntax") {
-          # Only the rolling tag, byte for byte. A pinned tag parses by the
-          # pin, not by the rules this gate implements (BuildKit under
-          # docker/dockerfile:1.0 treats a heredoc body as ordinary
-          # instructions, so a FROM inside it is a real FROM), buildx can
-          # answer --call=outline for a pinned frontend through a different
-          # subrequest-capable frontend, and BuildKit itself rejects an
-          # uppercase spelling such as Docker/Dockerfile:1 as an invalid
-          # reference.
+          # Only the rolling tag, byte for byte, is verified. A pinned tag
+          # parses by the pin, not by the rules this check implements
+          # (BuildKit under docker/dockerfile:1.0 treats a heredoc body as
+          # ordinary instructions, so a FROM inside it is a real FROM), and
+          # BuildKit itself rejects an uppercase spelling such as
+          # Docker/Dockerfile:1 as an invalid reference. The scan continues
+          # under the rolling rules as a best effort; the oracle runs the
+          # pinned frontend itself.
           if (dval != "docker/dockerfile:1" && dval != "docker.io/docker/dockerfile:1")
-            fail("syntax directive " SQ dval SQ " at line " NR " selects a frontend whose parsing rules this gate cannot verify; only the rolling docker/dockerfile:1 tag (an optional docker.io/ prefix allowed) is supported")
+            warn("syntax directive " SQ dval SQ " at line " NR " pins a frontend; this textual check assumes the rolling docker/dockerfile:1 syntax and reads the rest of the file by its rules, and check-from-oracle.sh runs the pinned frontend and decides")
         }
         next
       }
+      warn("the line at " NR " is shaped like a parser directive with the key " SQ dkey SQ ", which this check does not know; the rolling frontend reads it as a comment that ends the directive block, and the scan does the same")
       directive_mode = 0   # unknown key: the line is a comment and ends the block
     } else {
       directive_mode = 0
@@ -899,11 +1014,38 @@ BEGIN {
 
 END {
   if (EXITCODE) exit EXITCODE
-  if (buf != "") process(ltrim(buf), bufline)
-  if (EXITCODE) exit EXITCODE
-  if (HD_N > 0 && HD_I <= HD_N)
-    fail("unterminated heredoc (delimiter \"" HD_NAME[HD_I] "\" never appeared; BuildKit rejects this file too)")
-  exit EXITCODE + 0
+  if (!HALT) {
+    if (buf != "") process(ltrim(buf), bufline)
+    if (EXITCODE) exit EXITCODE
+    if (HD_N > 0 && HD_I <= HD_N)
+      warn("unterminated heredoc (delimiter \"" HD_NAME[HD_I] "\" never appeared); BuildKit rejects the file, so no base pulls from it as written")
+  }
+  # Deferred bare-name FROMs, decided now that every stage name is known: a
+  # name some other stage declares is a forward stage reference, which
+  # BuildKit resolves as a stage and this sequential scan cannot verify; a
+  # name no stage declares that BuildKit accepts as a reference is a pull
+  # off the allowlist; a name BuildKit refuses pulls nothing. A stage is
+  # never its own base (verified with a real run), so FROM alpine AS alpine
+  # stays a pull. When the scan stopped early the stage list is incomplete
+  # and every deferred name is reported instead of decided.
+  for (pd = 1; pd <= NPEND; pd++) {
+    fwd = 0
+    for (js = 1; js <= STAGE_N; js++)
+      if (js != PEND_STAGE[pd] && STAGE_ALIAS[js] == PEND_REF[pd]) { fwd = 1; break }
+    if (HALT)
+      warn("FROM \"" PEND_DISP[pd] "\" at line " PEND_LINE[pd] " could not be classified: the scan stopped before the stage list was complete")
+    else if (fwd)
+      warn("FROM \"" PEND_DISP[pd] "\" at line " PEND_LINE[pd] " references the stage \"" PEND_REF[pd] "\" declared later in the file; BuildKit resolves stage names anywhere in the file, so this is a stage reference and not a pull, but a sequential scan cannot verify a forward reference. check-from-oracle.sh decides it from the stage graph BuildKit itself reports")
+    else if (norm_ref(PEND_DISP[pd]) != "")
+      hard("FROM \"" PEND_DISP[pd] "\" at line " PEND_LINE[pd] " is not allowed: base images must come from cgr.dev/* or the configured external mirror")
+    else
+      warn("FROM \"" PEND_DISP[pd] "\" at line " PEND_LINE[pd] " is not a reference BuildKit accepts, so no base pulls from it as written; check-from-oracle.sh decides what the build does with this file")
+  }
+  if (WARNED) {
+    printf "check-from-lines: %d UNVERIFIED construct(s) and no known off-allowlist base; check-from-oracle.sh decides what the build resolves\n", WARNED
+    exit 3
+  }
+  exit 0
 }
 
 function process(logical, lineno,   n, f, instr, sub2, p, q, ref, resolved, alias, lc, i, ai, t, name, val, inner, litq, cnorm, anorm, csrc, checked, lc2, LEXW, ln) {
@@ -912,11 +1054,13 @@ function process(logical, lineno,   n, f, instr, sub2, p, q, ref, resolved, alia
   instr = toupper(f[1])
 
   # Heredoc scanning lexes the whole logical line, as BuildKit does, so a
-  # marker is recognized only where its << starts an unquoted word.
+  # marker is recognized only where its << starts an unquoted word. A
+  # negative word count is the unbalanced-quote report from lex_words:
+  # BuildKit scans no heredocs on such a line, so neither does this check.
   if (instr == "RUN" || instr == "COPY" || instr == "ADD") {
     if (index(logical, "<<") > 0) {
       ln = lex_words(logical, lineno, LEXW)
-      scan_heredocs(LEXW, ln, lineno)
+      if (ln >= 0) scan_heredocs(LEXW, ln, lineno)
     }
     return
   }
@@ -924,7 +1068,7 @@ function process(logical, lineno,   n, f, instr, sub2, p, q, ref, resolved, alia
     sub2 = toupper(f[2])
     if ((sub2 == "RUN" || sub2 == "COPY" || sub2 == "ADD") && index(logical, "<<") > 0) {
       ln = lex_words(logical, lineno, LEXW)
-      scan_heredocs(LEXW, ln, lineno)
+      if (ln >= 0) scan_heredocs(LEXW, ln, lineno)
     }
     return
   }
@@ -933,76 +1077,98 @@ function process(logical, lineno,   n, f, instr, sub2, p, q, ref, resolved, alia
     # Every assignment token on the line counts, matching docker build. A
     # --build-arg override beats the declared default, and gives a value to
     # an ARG declared with none. An override with no matching ARG
-    # declaration never applies, also matching docker build.
+    # declaration never applies, also matching docker build. A declared
+    # default for an automatic argument name replaces the automatic value
+    # through this same flow, and an override beats it, exactly as BuildKit
+    # applies them (verified with real builds). A token this check cannot
+    # take apart leaves the whole ARG table unverified from that token on:
+    # BuildKit reassembles such a line by rules this check does not model
+    # (verified with real builds: ARG A="x y" B=alpine assigns B, while
+    # ARG OTHER=a\ B=alpine swallows B= into the value of OTHER), so any name
+    # could have been assigned, and every later variable read is uncertain
+    # until the name is assigned again.
     for (ai = 2; ai <= n; ai++) {
       t = f[ai]
-      if (index(t, ESC) > 0)
-        fail("ARG at line " lineno " contains the escape character in \"" t "\"; escaped whitespace in ARG values is not supported by this gate. Write the value without escapes")
+      if (index(t, ESC) > 0) {
+        warn("ARG at line " lineno " contains the escape character in \"" t "\"; BuildKit joins escaped whitespace by rules this check does not model, so what this line assigns cannot be verified and later variable reads are unverified too")
+        ARG_TAINT = 1
+        return
+      }
       p = index(t, "=")
       if (p == 0) {
-        if (t ~ /^[A-Za-z_][A-Za-z0-9_]*$/ && (t in OVERRIDE)) ARGS[t] = OVERRIDE[t]
+        if (t ~ /^[A-Za-z_][A-Za-z0-9_]*$/ && (t in OVERRIDE)) { ARGS[t] = OVERRIDE[t]; CLEAN[t] = 1; delete ARGS_UNKNOWN[t] }
         continue
       }
-      if (p == 1)
-        fail("ARG at line " lineno " declares an assignment with an empty name (\"" t "\")")
+      if (p == 1) {
+        warn("ARG at line " lineno " declares an assignment with an empty name (\"" t "\"); this check cannot tell what the line assigns, so later variable reads are unverified too (BuildKit rejects the file)")
+        ARG_TAINT = 1
+        return
+      }
       name = substr(t, 1, p - 1)
       val = substr(t, p + 1)
-      # A declared default for an automatic argument name is rejected, not
-      # emulated. BuildKit lets the declared default beat the automatic
-      # value while a --build-arg beats the default, and the oracle gate
-      # can pass a platform only as --build-arg overrides, so a default
-      # here would make the oracle check a different file than the build
-      # resolves. A bare redeclaration (ARG TARGETARCH) stays allowed.
-      if (name in AUTO)
-        fail("ARG at line " lineno " declares a default for the automatic argument " name ". The FROM gate passes the platform as --build-arg overrides, which beat a declared default where the automatic value would lose to it, so the gate cannot check this file the way the build resolves it. Redeclare it bare (ARG " name ") or use another name")
       litq = 0
       if (index(val, "\"") > 0 || index(val, SQ) > 0) {
         q = substr(val, 1, 1)
         inner = substr(val, 2, length(val) - 2)
-        if ((q != "\"" && q != SQ) || length(val) < 2 || substr(val, length(val), 1) != q || index(inner, q) > 0)
-          fail("ARG at line " lineno " has a quoted value this gate cannot take apart (\"" t "\"): a quoted value spanning whitespace or a stray quote is not supported. Quote the whole value or none of it")
+        if ((q != "\"" && q != SQ) || length(val) < 2 || substr(val, length(val), 1) != q || index(inner, q) > 0) {
+          warn("ARG at line " lineno " has a quoted value this check cannot take apart (\"" t "\"): a quoted value spanning whitespace or a stray quote is reassembled by rules this check does not model, so what this line assigns cannot be verified and later variable reads are unverified too")
+          ARG_TAINT = 1
+          return
+        }
         val = inner
         # BuildKit keeps a single-quoted default literal (verified with an
         # outline run; the value ${UNSET} survives as those seven
         # characters), where a double-quoted or unquoted default expands.
         if (q == SQ) litq = 1
       }
-      if (name in OVERRIDE) ARGS[name] = OVERRIDE[name]
-      else if (litq) ARGS[name] = val
-      else ARGS[name] = expand_str(val, "default", lineno)
+      if (name in OVERRIDE) { ARGS[name] = OVERRIDE[name]; CLEAN[name] = 1; delete ARGS_UNKNOWN[name] }
+      else if (litq) { ARGS[name] = val; CLEAN[name] = 1; delete ARGS_UNKNOWN[name] }
+      else {
+        UNCERTAIN = 0
+        val = expand_str(val, "default", lineno)
+        if (UNCERTAIN) { delete ARGS[name]; ARGS_UNKNOWN[name] = 1 }
+        else { ARGS[name] = val; delete ARGS_UNKNOWN[name] }
+        CLEAN[name] = 1
+      }
     }
     return
   }
 
   if (instr != "FROM") return
   seen_from = 1
+  STAGE_N++
 
   # Skip flags (--platform=... etc.) to reach the image ref.
   i = 2
   while (i <= n && substr(f[i], 1, 2) == "--") i++
-  if (i > n)
-    fail("FROM at line " lineno " has no image reference")
+  if (i > n) {
+    warn("FROM at line " lineno " has no image reference; BuildKit fails such a line with \"FROM requires either one or three arguments\", so no base pulls from it as written")
+    return
+  }
   # After the flags, exactly one image reference, optionally followed by AS
   # and a stage name. BuildKit fails every other token count, including
   # three tokens whose middle one is not AS, with "FROM requires either one
-  # or three arguments", so extra tokens this gate would otherwise ignore
-  # can never hide a reference from it.
-  if (n - i != 0 && !(n - i == 2 && toupper(f[i + 1]) == "AS"))
-    fail("FROM at line " lineno " (\"" logical "\") does not have exactly one image reference plus an optional AS name; BuildKit fails such a line with \"FROM requires either one or three arguments\"")
+  # or three arguments", so no base pulls from such a line as written and
+  # extra tokens can never hide a reference from this check.
+  if (n - i != 0 && !(n - i == 2 && toupper(f[i + 1]) == "AS")) {
+    warn("FROM at line " lineno " (\"" logical "\") does not have exactly one image reference plus an optional AS name; BuildKit fails such a line with \"FROM requires either one or three arguments\", so no base pulls from it as written")
+    return
+  }
   ref = f[i]
 
-  UNRESOLVED = ""
-  resolved = expand_str(ref, "from", lineno)
-  if (UNRESOLVED != "")
-    fail("FROM \"" ref "\" at line " lineno " has unresolved ARG variable(s):" UNRESOLVED ". Declare a default before the first FROM or remove the interpolation")
-  if (resolved == "") resolved = ref
-
+  # The alias parses first: the advisory paths below register it, because
+  # the stage is a real name for later FROMs whatever its base turns out to
+  # be. An alias outside the Docker stage-name shape is REJECTED, not
+  # reported: the alias table decides what every later FROM in this file
+  # means, so a name this check cannot trust would poison every decision
+  # after it.
   alias = ""
   if (i + 2 <= n && toupper(f[i + 1]) == "AS") {
     alias = f[i + 2]
     if (alias !~ /^[a-zA-Z][a-zA-Z0-9_.-]*$/)
-      fail("FROM stage alias \"" alias "\" at line " lineno " is not allowed: aliases must match ^[a-zA-Z][a-zA-Z0-9_.-]*$ (Docker stage-name rules)")
+      hard("FROM stage alias \"" alias "\" at line " lineno " is not allowed: aliases must match ^[a-zA-Z][a-zA-Z0-9_.-]*$ (Docker stage-name rules)")
     alias = tolower(alias)
+    STAGE_ALIAS[STAGE_N] = alias
   }
 
   # A context whose name matches the AS name of this stage applies at the
@@ -1012,24 +1178,43 @@ function process(logical, lineno,   n, f, instr, sub2, p, q, ref, resolved, alia
   # alias, and it beats a context matching the base reference and a
   # scratch base alike; each rule pinned by an outline run (the scratch
   # replacement by a real cacheonly build too). The base as written is
-  # never pulled, so the context source stands in for it entirely.
+  # never pulled, so the context source stands in for it entirely, before
+  # any expansion of the written base.
   if (alias != "" && N_CTX > 0) {
     anorm = norm_ref(alias)
     if (anorm != "" && (anorm in CTX)) {
       csrc = CTX[anorm]
-      if (substr(csrc, 1, 15) != "docker-image://")
-        fail("the stage \"" alias "\" at line " lineno " is overridden by a --build-context whose source (" csrc ") is not a docker-image:// reference. BuildKit builds the stage from that source in place of its base, and a base taken from a local directory, a git repository, an oci layout, or another build target cannot be checked against the allowlist, so a named context of that kind is unsupported for a stage name")
+      if (substr(csrc, 1, 15) != "docker-image://") {
+        warn("the stage \"" alias "\" at line " lineno " is overridden by a --build-context whose source (" csrc ") is not a docker-image:// reference. BuildKit builds the stage from that source in place of its base, and a base taken from a local directory, a git repository, an oci layout, or another build target has no registry reference this check can verify")
+        ALIASES[alias] = 1
+        return
+      }
       checked = substr(csrc, 16)
       lc2 = tolower(checked)
       ok = 0
       if (substr(lc2, 1, 8) == "cgr.dev/") ok = 1
       else if (mirror != "" && substr(lc2, 1, length(mirror) + 1) == mirror "/") ok = 1
       if (!ok)
-        fail("the stage \"" alias "\" at line " lineno " (base \"" resolved "\") is overridden by --build-context to \"" checked "\", which is not allowed: base images must come from cgr.dev/* or the configured external mirror")
+        hard("the stage \"" alias "\" at line " lineno " (base \"" ref "\") is overridden by --build-context to \"" checked "\", which is not allowed: base images must come from cgr.dev/* or the configured external mirror")
       ALIASES[alias] = 1
       return
     }
   }
+
+  UNRESOLVED = ""
+  UNCERTAIN = 0
+  resolved = expand_str(ref, "from", lineno)
+  if (UNCERTAIN) {
+    warn("FROM \"" ref "\" at line " lineno " could not be resolved textually; an UNVERIFIED construct above decides its value, and check-from-oracle.sh resolves it")
+    if (alias != "") ALIASES[alias] = 1
+    return
+  }
+  if (UNRESOLVED != "") {
+    warn("FROM \"" ref "\" at line " lineno " has unresolved ARG variable(s):" UNRESOLVED ", so the build as captured resolves no base from it. Declare a default before the first FROM, pass the --build-arg the real build passes, or remove the interpolation")
+    if (alias != "") ALIASES[alias] = 1
+    return
+  }
+  if (resolved == "") resolved = ref
 
   lc = tolower(resolved)
   ok = 0
@@ -1045,14 +1230,17 @@ function process(logical, lineno,   n, f, instr, sub2, p, q, ref, resolved, alia
       cnorm = norm_ref(resolved)
       if (cnorm != "" && (cnorm in CTX)) {
         csrc = CTX[cnorm]
-        if (substr(csrc, 1, 15) != "docker-image://")
-          fail("FROM \"" resolved "\" at line " lineno " is overridden by a --build-context whose source (" csrc ") is not a docker-image:// reference. A base taken from a local directory, a git repository, an oci layout, or another build target cannot be checked against the allowlist, so a named context of that kind is unsupported for a base")
+        if (substr(csrc, 1, 15) != "docker-image://") {
+          warn("FROM \"" resolved "\" at line " lineno " is overridden by a --build-context whose source (" csrc ") is not a docker-image:// reference. A base taken from a local directory, a git repository, an oci layout, or another build target has no registry reference this check can verify")
+          if (alias != "") ALIASES[alias] = 1
+          return
+        }
         checked = substr(csrc, 16)
         lc2 = tolower(checked)
         if (substr(lc2, 1, 8) == "cgr.dev/") ok = 1
         else if (mirror != "" && substr(lc2, 1, length(mirror) + 1) == mirror "/") ok = 1
         if (!ok)
-          fail("FROM \"" resolved "\" at line " lineno " is overridden by --build-context to \"" checked "\", which is not allowed: base images must come from cgr.dev/* or the configured external mirror")
+          hard("FROM \"" resolved "\" at line " lineno " is overridden by --build-context to \"" checked "\", which is not allowed: base images must come from cgr.dev/* or the configured external mirror")
       }
     }
     if (!ok) {
@@ -1062,8 +1250,26 @@ function process(logical, lineno,   n, f, instr, sub2, p, q, ref, resolved, alia
     }
   }
 
-  if (!ok)
-    fail("FROM \"" resolved "\" at line " lineno " is not allowed: base images must come from cgr.dev/* or the configured external mirror")
+  if (!ok) {
+    # A bare name in stage-name shape could be a forward reference to a
+    # stage declared later, which BuildKit resolves as a stage, not a pull
+    # (verified with an outline run), so its classification is deferred to
+    # the end of the scan, when every stage name is known. Anything else
+    # is decided here: a reference BuildKit accepts is a base the build
+    # pulls off the allowlist, and a reference BuildKit refuses pulls
+    # nothing.
+    if (resolved ~ /^[a-zA-Z][a-zA-Z0-9_.-]*$/) {
+      NPEND++
+      PEND_REF[NPEND] = lc
+      PEND_DISP[NPEND] = resolved
+      PEND_LINE[NPEND] = lineno
+      PEND_STAGE[NPEND] = STAGE_N
+    } else if (norm_ref(resolved) != "") {
+      hard("FROM \"" resolved "\" at line " lineno " is not allowed: base images must come from cgr.dev/* or the configured external mirror")
+    } else {
+      warn("FROM \"" resolved "\" at line " lineno " is not a reference BuildKit accepts, so no base pulls from it as written; check-from-oracle.sh decides what the build does with this file")
+    }
+  }
 
   if (alias != "") ALIASES[alias] = 1
 }
