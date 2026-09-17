@@ -20,7 +20,10 @@
 #      and a self-referential default, are refused naming the argument and
 #      the lines, because one buildx call cannot reproduce the order the
 #      real build applies (cases 1h and 1i, pinned with real arm/v7
-#      builds).
+#      builds). A read inside the default of a global ARG the user
+#      overrides with --build-arg does not count for that refusal, because
+#      the override replaces the default; case 1j passes with the override
+#      and is refused without it.
 #   2. a multi-stage file whose runtime stage is cgr.dev/chainguard/static —
 #      every base allowed, exit 0
 #   3. a file whose only external base sits on a configured mirror prefix —
@@ -79,7 +82,9 @@
 # stage indices left out of the count while a negative index stays in it,
 # a quoted mount without from= counting nothing while an unterminated
 # quote swallows the line and its from= counts, a base expanding to
-# whitespace or to nothing refused by name before serialization, and the
+# whitespace or to nothing refused by name before serialization, a
+# FROM-set member outside the reference grammar refused by name with no
+# REJECTED line, and the
 # single-quoted default rejected from the FROM set with no outline
 # invocation on the args log.
 
@@ -105,8 +110,8 @@ echo hi
 EOT
 EOF
 out=$(sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
-if [ "$rc" -eq 0 ]; then
-  bad "quoted heredoc marker: expected rejection, got a pass"
+if [ "$rc" -ne 1 ]; then
+  bad "quoted heredoc marker: expected exit 1, got $rc: $out"
 else
   case "$out" in
     *"REJECTED docker.io/library/alpine"*) ok ;;
@@ -121,8 +126,8 @@ FROM ${BASE:-cgr.dev/chainguard/wolfi-base}
 RUN echo hi
 EOF
 out=$(sh "$SCRIPT" --platform linux/amd64 "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
-if [ "$rc" -eq 0 ]; then
-  bad "platform argument bypass: expected rejection, got a pass"
+if [ "$rc" -ne 1 ]; then
+  bad "platform argument bypass: expected exit 1, got $rc: $out"
 else
   case "$out" in
     *"REJECTED docker.io/library/alpine"*) ok ;;
@@ -137,8 +142,8 @@ FROM ${BASE:-alpine}
 RUN echo hi
 EOF
 out=$(sh "$SCRIPT" --platform linux/amd64/v1 "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
-if [ "$rc" -eq 0 ]; then
-  bad "amd64/v1 normalization: expected rejection, got a pass"
+if [ "$rc" -ne 1 ]; then
+  bad "amd64/v1 normalization: expected exit 1, got $rc: $out"
 else
   case "$out" in
     *"REJECTED docker.io/library/alpine"*) ok ;;
@@ -163,8 +168,8 @@ FROM ${BASE:-cgr.dev/chainguard/wolfi-base}
 EOF
 for plat in linux/amd64 linux/arm64; do
   out=$(sh "$SCRIPT" --platform "$plat" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
-  if [ "$rc" -eq 0 ]; then
-    bad "declared automatic default ($plat): expected rejection, got a pass"
+  if [ "$rc" -ne 1 ]; then
+    bad "declared automatic default ($plat): expected exit 1, got $rc: $out"
   else
     case "$out" in
       *"REJECTED docker.io/library/alpine"*) ok ;;
@@ -211,8 +216,8 @@ ARG B=${X:+docker.io/library/alpine}
 FROM ${B:-cgr.dev/chainguard/wolfi-base}
 EOF
 out=$(sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
-if [ "$rc" -eq 0 ]; then
-  bad "single-quoted literal default: expected rejection, got a pass"
+if [ "$rc" -ne 1 ]; then
+  bad "single-quoted literal default: expected exit 1, got $rc: $out"
 else
   case "$out" in
     *"REJECTED docker.io/library/alpine:latest"*) ok ;;
@@ -332,6 +337,38 @@ else
   esac
 fi
 
+echo "--- case 1j: a read inside an overridden default does not count for the order refusal ---"
+# A real cacheonly build of this file with --platform linux/amd64 and
+# --build-arg BASE=cgr.dev/chainguard/wolfi-base loads only
+# cgr.dev/chainguard/wolfi-base:latest (2026-09-17): the override replaces
+# the default of BASE, so the read of TARGETARCH inside that default never
+# reaches the build and the order cannot diverge. The gate passes the
+# file. Without the override the read is real, the order from case 1h
+# applies, and the same file is refused naming the argument and the lines.
+cat > "$tmp/Dockerfile" <<'EOF'
+ARG BASE=${TARGETARCH}
+ARG TARGETARCH=amd64
+FROM ${BASE}
+EOF
+out=$(sh "$SCRIPT" --platform linux/amd64 --build-arg BASE=cgr.dev/chainguard/wolfi-base "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  bad "overridden default read: expected pass, exit $rc: $out"
+else
+  case "$out" in
+    *"allowed  cgr.dev/chainguard/wolfi-base"*) ok ;;
+    *) bad "overridden default read: should allow wolfi-base, got: $out" ;;
+  esac
+fi
+out=$(sh "$SCRIPT" --platform linux/amd64 "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 1 ]; then
+  bad "unoverridden default read: expected exit 1, got $rc: $out"
+else
+  case "$out" in
+    *"line 1 of"*"reads the automatic argument TARGETARCH and line 2 declares its default"*) ok ;;
+    *) bad "unoverridden default read: should name TARGETARCH and lines 1 and 2, got: $out" ;;
+  esac
+fi
+
 echo "--- case 2: multi-stage file on the allowlist ---"
 cat > "$tmp/Dockerfile" <<'EOF'
 FROM cgr.dev/chainguard/wolfi-base AS builder
@@ -355,8 +392,8 @@ FROM docker.io/library/busybox:latest
 RUN echo hi
 EOF
 out=$(sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
-if [ "$rc" -eq 0 ]; then
-  bad "mirror prefix without --mirror: expected rejection, got a pass"
+if [ "$rc" -ne 1 ]; then
+  bad "mirror prefix without --mirror: expected exit 1, got $rc: $out"
 else
   case "$out" in
     *"REJECTED docker.io/library/busybox"*) ok ;;
@@ -380,8 +417,8 @@ cat > "$tmp/Dockerfile" <<'EOF'
 FROM resolv-fail.invalid/image:latest
 EOF
 out=$(sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
-if [ "$rc" -eq 0 ]; then
-  bad "unresolvable off-allowlist base: expected exit 1, got a pass"
+if [ "$rc" -ne 1 ]; then
+  bad "unresolvable off-allowlist base: expected exit 1, got $rc: $out"
 else
   case "$out" in
     *"REJECTED resolv-fail.invalid/image:latest"*) ok ;;
@@ -396,8 +433,8 @@ cat > "$tmp/Dockerfile" <<'EOF'
 FROM cgr.dev/chainguard/no-such-image-zqxw:latest
 EOF
 out=$(sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
-if [ "$rc" -eq 0 ]; then
-  bad "unresolvable allowed base: expected exit 1, got a pass"
+if [ "$rc" -ne 1 ]; then
+  bad "unresolvable allowed base: expected exit 1, got $rc: $out"
 else
   case "$out" in
     *"not a pass"*) ok ;;
@@ -420,8 +457,8 @@ cat > "$tmp/Dockerfile" <<'EOF'
 FROM cgr.dev/chainguard/wolfi-base:b-${BUILDARCH}
 EOF
 out=$(sh "$SCRIPT" --platform linux/amd64 --build-platform linux/arm64 "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
-if [ "$rc" -eq 0 ]; then
-  bad "build-platform override: expected a failing run, got a pass"
+if [ "$rc" -ne 1 ]; then
+  bad "build-platform override: expected exit 1, got $rc: $out"
 else
   if printf '%s\n' "$out" | grep -q '^  | .*b-arm64'; then
     ok
@@ -446,8 +483,8 @@ RUN echo hi
 EOF
 out=$(sh "$SCRIPT" --build-context cgr.dev/chainguard/wolfi-base=docker-image://alpine:latest \
       "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
-if [ "$rc" -eq 0 ]; then
-  bad "context override to alpine: expected rejection, got a pass"
+if [ "$rc" -ne 1 ]; then
+  bad "context override to alpine: expected exit 1, got $rc: $out"
 else
   case "$out" in
     *"REJECTED docker.io/library/alpine:latest"*) ok ;;
@@ -488,8 +525,8 @@ FROM alpine
 COPY --from=alpine /etc/os-release /o
 EOF
 out=$(sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
-if [ "$rc" -eq 0 ]; then
-  bad "base doubling as copy source: expected rejection, got a pass"
+if [ "$rc" -ne 1 ]; then
+  bad "base doubling as copy source: expected exit 1, got $rc: $out"
 else
   case "$out" in
     *"REJECTED docker.io/library/alpine:latest"*) ok ;;
@@ -580,8 +617,8 @@ RUN echo hi
 EOF
 out=$(sh "$SCRIPT" --build-context builder=docker-image://alpine:latest \
       "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
-if [ "$rc" -eq 0 ]; then
-  bad "stage-name context to alpine: expected rejection, got a pass"
+if [ "$rc" -ne 1 ]; then
+  bad "stage-name context to alpine: expected exit 1, got $rc: $out"
 else
   case "$out" in
     *"REJECTED docker.io/library/alpine:latest"*) ok ;;
@@ -600,8 +637,8 @@ else
 fi
 out=$(sh "$SCRIPT" --build-context docker.io/library/builder=docker-image://alpine:latest \
       "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
-if [ "$rc" -eq 0 ]; then
-  bad "normalized stage-name context: expected rejection, got a pass"
+if [ "$rc" -ne 1 ]; then
+  bad "normalized stage-name context: expected exit 1, got $rc: $out"
 else
   case "$out" in
     *"REJECTED docker.io/library/alpine:latest"*) ok ;;
@@ -622,8 +659,8 @@ RUN echo hi
 EOF
 out=$(sh "$SCRIPT" --build-context DOCKER.io/library/alpine=docker-image://cgr.dev/chainguard/static:latest \
       "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
-if [ "$rc" -eq 0 ]; then
-  bad "uppercase-host context: expected rejection, got a pass"
+if [ "$rc" -ne 1 ]; then
+  bad "uppercase-host context: expected exit 1, got $rc: $out"
 else
   case "$out" in
     *"REJECTED docker.io/library/alpine:latest"*) ok ;;
@@ -1375,13 +1412,44 @@ else
   ok
 fi
 
+echo "--- shim cases: a FROM member outside the reference grammar is refused, not REJECTED ---"
+# Each shape fails a real build with failed to parse stage name ...:
+# invalid reference format (pinned 2026-09-17; for Alpine the message adds
+# that the repository name must be lowercase), so none of them is a base
+# the build pulls, and a REJECTED line would misname one as a base known
+# off the allowlist. The run refuses to answer naming the reference, and
+# no REJECTED line prints.
+for badref in 'alpine:--' 'Alpine' 'alpine:latest@sha256:zzz' 'alpine..x' 'example.com:abc/alpine'; do
+  printf 'FROM %s\n' "$badref" > "$tmp/Dockerfile"
+  sed "s|\"base\": \"cgr.dev/chainguard/wolfi-base\"|\"base\": \"$badref\"|" \
+    "$tmp/out-targets-good" > "$tmp/out-targets-badref"
+  out=$(SHIM_OUT="$tmp/out-good" SHIM_OUT_TARGETS="$tmp/out-targets-badref" \
+        PATH="$shimdir:$PATH" sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+  if [ "$rc" -ne 1 ]; then
+    bad "invalid member ($badref): expected exit 1, got $rc: $out"
+  else
+    case "$out" in
+      *"is not a reference BuildKit accepts"*)
+        case "$out" in
+          *REJECTED*) bad "invalid member ($badref): must refuse to answer, not reject: $out" ;;
+          *) ok ;;
+        esac
+        ;;
+      *) bad "invalid member ($badref): should name the reference as one BuildKit does not accept, got: $out" ;;
+    esac
+  fi
+done
+cat > "$tmp/Dockerfile" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+EOF
+
 echo "--- case 8: a base identical to its own stage name is a pull, not a stage reference ---"
 cat > "$tmp/Dockerfile" <<'EOF'
 FROM alpine AS alpine
 EOF
 out=$(sh "$SCRIPT" --platform linux/amd64 "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
-if [ "$rc" -eq 0 ]; then
-  bad "self-named stage: FROM alpine AS alpine pulls alpine and must be rejected, got a pass"
+if [ "$rc" -ne 1 ]; then
+  bad "self-named stage: FROM alpine AS alpine pulls alpine and must be rejected; expected exit 1, got $rc: $out"
 else
   case "$out" in
     *"REJECTED docker.io/library/alpine"*) ok ;;
@@ -1408,8 +1476,8 @@ echo "--- case 11: VT-prefixed escape directive reaches the scan ---"
 # alpine into the FROM set, and rejects it.
 printf '#\013escape=`\nARG A=cgr.dev/chainguard/static `\nFROM ignored\nARG A=docker.io/library/alpine\nFROM $A\n' > "$tmp/Dockerfile"
 out=$(sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
-if [ "$rc" -eq 0 ]; then
-  bad "VT-prefixed escape directive: expected rejection, got a pass"
+if [ "$rc" -ne 1 ]; then
+  bad "VT-prefixed escape directive: expected exit 1, got $rc: $out"
 else
   case "$out" in
     *"REJECTED docker.io/library/alpine"*) ok ;;

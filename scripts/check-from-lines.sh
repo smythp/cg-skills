@@ -170,7 +170,15 @@
 #     after a FROM are ignored for FROM resolution. A --build-arg override
 #     replaces the default of a matching ARG declared before the first
 #     FROM, and gives a value to a global ARG declared with no default. An
-#     override whose name no ARG declares is ignored, as in docker build. A
+#     override whose name no ARG declares is ignored, as in docker build,
+#     so through an unverifiable ARG line an overridden name stays certain
+#     only when a trusted line already declared it, and the override value
+#     wins; a name declared only on the unverifiable line, or not yet
+#     declared, is uncertain like every other name until a trusted ARG
+#     declares it (each verified with real builds: with the override for
+#     BASE, an earlier trusted declaration resolves the override value,
+#     while ARG OTHER="x BASE=y" alone never declares BASE and the
+#     override does not apply). A
 #     global ARG that declares a default for one of the automatic argument
 #     names replaces the automatic value, and a --build-arg override beats
 #     the declared default, exactly as BuildKit applies them (each verified
@@ -274,8 +282,9 @@
 # ${...} forms and Unicode spaces on heredoc-capable lines, unterminated
 # heredocs, pinned '# syntax=' frontends, unknown or duplicate parser
 # directives and invalid escape values, NUL bytes and lone CRs, FROM token
-# counts BuildKit refuses, references BuildKit refuses (an invalid tag or
-# digest included), a FROM whose reference expands to the empty string,
+# counts BuildKit refuses, references BuildKit refuses (an invalid tag,
+# digest, path component, or registry host included), a FROM whose
+# reference expands to the empty string,
 # automatic platform arguments read without
 # --platform or --target, forward stage references, and named build
 # contexts whose source is not docker-image:// or whose docker-image://
@@ -550,22 +559,32 @@ function autocheck(name, lineno) {
 # reassigning BASE must not leave the stale alpine trusted (a real build
 # of that shape assigns the later value, so a FROM reading BASE is
 # unverified, never rejected on the stale value). Clearing CLEAN puts every
-# name under the ARG_TAINT rule in unknown_var below.
+# name under the ARG_TAINT rule in unknown_var below. A name a trusted
+# line already declared that carries a --build-arg override keeps its
+# entry: the override beats any default the unverifiable line could have
+# assigned (a real build of ARG BASE=alpine, then an unverifiable line
+# reassigning BASE, then FROM ${BASE}base with the override resolves the
+# override value), so its value stays certain.
 function taint_args(   k) {
   ARG_TAINT = 1
-  for (k in CLEAN) delete CLEAN[k]
+  for (k in CLEAN) if (!(k in OVERRIDE)) delete CLEAN[k]
 }
 
 # unknown_var(name): true when this check lost track of the value of name.
 # An unverifiable ARG line taints every name it could have assigned, which
 # is any name (ARG_TAINT), the names earlier lines assigned included; a
-# name assigned after the tainted line (CLEAN)
-# or forced by a --build-arg override, which beats any declared default, is
-# certain again, and a name whose own default could not be expanded stays
-# unknown (ARGS_UNKNOWN).
+# name assigned by a trusted line after the tainted one (CLEAN) is certain
+# again, and a name whose own default could not be expanded stays unknown
+# (ARGS_UNKNOWN). A --build-arg override applies only to a name the file
+# declares with a global ARG (verified with real builds; see the ARG
+# bullet in the header), so an override exempts a name from the taint only
+# when a trusted line declared it, before the taint (taint_args keeps that
+# entry) or after it, and the name then carries the override value; a name
+# declared only on the unverifiable line, or not yet declared, is
+# uncertain like every other name.
 function unknown_var(name) {
   if (name in ARGS_UNKNOWN) return 1
-  if (ARG_TAINT && !(name in OVERRIDE) && !(name in CLEAN)) return 1
+  if (ARG_TAINT && !(name in CLEAN)) return 1
   return 0
 }
 
@@ -667,16 +686,23 @@ function expand_str(s, mode, lineno,   out, j, k, name, c, mod, word, isset) {
 # spelling; a docker.io path without a slash gains library/; a reference
 # with neither tag nor digest gains :latest; a digest part is validated
 # against the docker digest grammar (letter-led algorithm segments, then a
-# colon and at least 32 hex digits) and kept verbatim. Returns the empty
-# string for a value docker refuses (an
-# uppercase repository, whitespace, empty parts, a colon inside the
-# path, a tag that does not start with a letter, digit, or underscore, a
-# digest outside the grammar; alpine:-- and alpine@sha256:zzz are both
-# refused with invalid reference format, verified against real builds).
-# BuildKit fails any build whose FROM needs such a value and
-# buildx refuses such a context name, so an empty result never silently
-# matches.
-function norm_ref(r,   host, rest, dig, tag, slash, last, colon, dpos) {
+# colon and at least 32 hex digits) and kept verbatim. The whole
+# distribution reference grammar is applied, so every hard classification
+# and every allowed OK passes through it: the normalized path is at most
+# 255 characters, the domain excluded (a bare 247-character name pulls in
+# a real build and 248 fails with repository name must not be more than
+# 255 characters, both pinned); a recognized domain is dot-separated components, each
+# alphanumeric with interior hyphens, then an optional colon and a numeric
+# port; each path component is lowercase alphanumerics joined by a single
+# dot, a single underscore, a double underscore, or one or more hyphens; a
+# tag starts with a letter, digit, or underscore and runs at most 128
+# characters of word, dot, or hyphen characters. Returns the empty string
+# for a value docker refuses (alpine:--, alpine@sha256:zzz, alpine..x,
+# example.com:abc/alpine, and an uppercase path component are each refused
+# with invalid reference format, verified against real builds). BuildKit
+# fails any build whose FROM needs such a value and buildx refuses such a
+# context name, so an empty result never silently matches.
+function norm_ref(r,   host, rest, dig, tag, slash, last, colon, dpos, hn, port, np, ci, comps) {
   if (r == "") return ""
   if (r ~ /[ \t\r]/ || index(r, VT) > 0 || index(r, FF) > 0) return ""
   dig = ""
@@ -692,7 +718,17 @@ function norm_ref(r,   host, rest, dig, tag, slash, last, colon, dpos) {
   if (slash == 0) { host = "docker.io"; rest = r }
   else {
     host = substr(r, 1, slash - 1)
-    if (host ~ /[.:]/ || host == "localhost" || host != tolower(host)) rest = substr(r, slash + 1)
+    if (host ~ /[.:]/ || host == "localhost" || host != tolower(host)) {
+      rest = substr(r, slash + 1)
+      hn = host
+      colon = index(hn, ":")
+      if (colon > 0) {
+        port = substr(hn, colon + 1)
+        hn = substr(hn, 1, colon - 1)
+        if (port !~ /^[0-9]+$/) return ""
+      }
+      if (hn !~ /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$/) return ""
+    }
     else { host = "docker.io"; rest = r }
   }
   if (host == "index.docker.io") host = "docker.io"
@@ -707,8 +743,10 @@ function norm_ref(r,   host, rest, dig, tag, slash, last, colon, dpos) {
     if (tag == "" || tag !~ /^[A-Za-z0-9_]/ || tag ~ /[^A-Za-z0-9_.-]/ || length(tag) > 128) return ""
   }
   if (host == "docker.io" && index(rest, "/") == 0) rest = "library/" rest
-  if (rest ~ /[^a-z0-9._\/-]/) return ""
-  if (rest ~ /^[\/.]/ || rest ~ /[\/.]$/ || index(rest, "//") > 0) return ""
+  np = split(rest, comps, "/")
+  for (ci = 1; ci <= np; ci++)
+    if (comps[ci] !~ /^[a-z0-9]+((\.|__|_|-+)[a-z0-9]+)*$/) return ""
+  if (length(rest) > 255) return ""
   if (tag == "" && dig == "") tag = "latest"
   if (tag != "") return host "/" rest ":" tag dig
   return host "/" rest dig

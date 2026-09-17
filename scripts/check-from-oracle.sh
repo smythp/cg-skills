@@ -23,10 +23,12 @@
 # positive evidence, a load-metadata line does not parse, a source policy
 # in the environment can rewrite references behind the log, a base cannot
 # be expanded or serialized with certainty (a NUL byte or lone CR in the
-# file breaks the line-based expansion scan the same way), an automatic
-# argument's declared default sits below a line that already reads the
-# name (an order one buildx call cannot reproduce), a docker-image://
-# context reference is empty or invalid, or a resolved
+# file breaks the line-based expansion scan the same way), a FROM-set
+# member is not a reference BuildKit accepts (a build on it fails with
+# invalid reference format, so it is not a base the build pulls), an
+# automatic argument's declared default sits below a line that already
+# reads the name (an order one buildx call cannot reproduce), a
+# docker-image:// context reference is empty or invalid, or a resolved
 # load on the allowlist sits outside the FROM set in a file with no
 # artifact-capable instruction, an unexplained load; the fallback catches
 # any divergence between the scan and the frontend either way.
@@ -135,7 +137,10 @@
 # nothing. One order no single call reproduces is a read of the name above
 # the line that declares its default, a self-referential default included:
 # the pre-scan refuses it naming the argument and both lines, and
-# declaring the default above its first use lets the gate run.
+# declaring the default above its first use lets the gate run. A read
+# inside the default of a global ARG the user overrides with --build-arg
+# does not count, because the override replaces that default and the
+# automatic value never reaches the build through it.
 # So the scan can trust its own line
 # splitting, a NUL byte anywhere in the file and a CR that is not part of
 # a CRLF ending are rejected first, as line-based scans require.
@@ -179,7 +184,8 @@
 #       outside the FROM set with no artifact-capable instruction
 #       included), or the script refuses to
 #       answer on its own account: a base could not be expanded or
-#       classified with certainty, a base is overridden by a context
+#       classified with certainty, a FROM-set member is not a reference
+#       BuildKit accepts, a base is overridden by a context
 #       that is not a docker-image:// reference or whose docker-image://
 #       reference is empty or invalid, an automatic argument's declared
 #       default sits below a line that already reads the name, either
@@ -498,7 +504,12 @@ bounded() {
 # --platform, the BUILD* names with --build-platform. TARGETSTAGE travels
 # as --target itself, which the call keeps, and a name the user overrides
 # with --build-arg reads the override everywhere in the real build too, so
-# neither can diverge.
+# neither can diverge. On the reading side, a read inside the default of a
+# global ARG the user overrides with --build-arg does not count: the
+# override replaces that default, so the automatic value never reaches the
+# build through it (pinned with a real build; see scan_line below), while
+# a read in a FROM line, or in the default of a name without an override,
+# still counts.
 #
 # The reader mirrors the main scan's global walk: a BOM, the
 # directive block (the escape directive changes the continuation
@@ -548,7 +559,12 @@ function scan_line(logical, lineno,   n, f, instr, ai, t, p, name, val, q) {
     name = substr(t, 1, p - 1)
     val = substr(t, p + 1)
     q = substr(val, 1, 1)
-    if (!(q == SQ && length(val) >= 2 && substr(val, length(val), 1) == SQ))
+    # A default the user overrides with --build-arg never reaches the
+    # build, so a read inside it does not count (a real build of
+    # ARG BASE=${TARGETARCH}, ARG TARGETARCH=amd64, FROM ${BASE} with the
+    # BASE override resolves only the override value, pinned); a read in a
+    # FROM line, or in the default of a name without an override, counts.
+    if (!(name in OVERRIDE) && !(q == SQ && length(val) >= 2 && substr(val, length(val), 1) == SQ))
       note_reads(val, lineno)
     if ((name in AUTO) && !(name in DECL)) {
       DECL[name] = lineno
@@ -853,12 +869,21 @@ function expand_str(s, mode, where,   out, j, k, name, c, mod, word, isset) {
 # registry host when it contains a dot or a colon, is exactly localhost,
 # or is not all-lowercase (splitDockerDomain); the host keeps its case and
 # compares byte-exact, and index.docker.io maps to docker.io only in that
-# exact lowercase spelling. A tag must start with a letter, digit, or
-# underscore and a digest must be letter-led algorithm segments, a colon,
-# and at least 32 hex digits; a build on a value outside those rules fails
-# with invalid reference format (alpine:-- and alpine@sha256:zzz both
-# verified), so the empty return never vouches for one.
-function norm_ref(r,   host, rest, dig, tag, slash, last, colon, dpos) {
+# exact lowercase spelling. The whole distribution reference grammar is
+# applied: the normalized path is at most 255 characters, the domain
+# excluded (pinned at the 255 and 256 boundary with real builds); a
+# recognized
+# domain is dot-separated components, each alphanumeric with interior
+# hyphens, then an optional colon and a numeric port; each path component
+# is lowercase alphanumerics joined by a single dot, a single underscore,
+# a double underscore, or one or more hyphens; a tag starts with a letter,
+# digit, or underscore and runs at most 128 characters; a digest is
+# letter-led algorithm segments, a colon, and at least 32 hex digits. A
+# build on a value outside the grammar fails with invalid reference format
+# (alpine:--, alpine@sha256:zzz, alpine..x, example.com:abc/alpine, and an
+# uppercase path component each verified), so the empty return never
+# vouches for one.
+function norm_ref(r,   host, rest, dig, tag, slash, last, colon, dpos, hn, port, np, ci, comps) {
   if (r == "") return ""
   if (r ~ /[ \t\r]/ || index(r, VT) > 0 || index(r, FF) > 0) return ""
   dig = ""
@@ -874,7 +899,17 @@ function norm_ref(r,   host, rest, dig, tag, slash, last, colon, dpos) {
   if (slash == 0) { host = "docker.io"; rest = r }
   else {
     host = substr(r, 1, slash - 1)
-    if (host ~ /[.:]/ || host == "localhost" || host != tolower(host)) rest = substr(r, slash + 1)
+    if (host ~ /[.:]/ || host == "localhost" || host != tolower(host)) {
+      rest = substr(r, slash + 1)
+      hn = host
+      colon = index(hn, ":")
+      if (colon > 0) {
+        port = substr(hn, colon + 1)
+        hn = substr(hn, 1, colon - 1)
+        if (port !~ /^[0-9]+$/) return ""
+      }
+      if (hn !~ /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$/) return ""
+    }
     else { host = "docker.io"; rest = r }
   }
   if (host == "index.docker.io") host = "docker.io"
@@ -889,8 +924,10 @@ function norm_ref(r,   host, rest, dig, tag, slash, last, colon, dpos) {
     if (tag == "" || tag !~ /^[A-Za-z0-9_]/ || tag ~ /[^A-Za-z0-9_.-]/ || length(tag) > 128) return ""
   }
   if (host == "docker.io" && index(rest, "/") == 0) rest = "library/" rest
-  if (rest ~ /[^a-z0-9._\/-]/) return ""
-  if (rest ~ /^[\/.]/ || rest ~ /[\/.]$/ || index(rest, "//") > 0) return ""
+  np = split(rest, comps, "/")
+  for (ci = 1; ci <= np; ci++)
+    if (comps[ci] !~ /^[a-z0-9]+((\.|__|_|-+)[a-z0-9]+)*$/) return ""
+  if (length(rest) > 255) return ""
   if (tag == "" && dig == "") tag = "latest"
   if (tag != "") return host "/" rest ":" tag dig
   return host "/" rest dig
@@ -903,14 +940,23 @@ function norm_ref(r,   host, rest, dig, tag, slash, last, colon, dpos) {
 # (base name should not be blank, pinned by a real build), no reference
 # the builder accepts contains whitespace, and the reader parses one
 # member per line with a TAB between the fields, which such a member
-# would break. The numeric check on the count line stays as the backstop,
-# but a malformed member never reaches it.
-function member_line(resolved, where) {
+# would break. A member outside the reference grammar is refused by name
+# the same way, before any allowlist comparison: a build on it fails with
+# invalid reference format (alpine:--, Alpine, alpine:latest@sha256:zzz,
+# alpine..x, and example.com:abc/alpine each pinned with real builds), so
+# it is not a base the build pulls, and a REJECTED line would misname a
+# reference that never enters the build as a base known off the allowlist.
+# The numeric check on the count line stays as the backstop, but a
+# malformed member never reaches it.
+function member_line(resolved, where,   canon) {
   if (resolved == "")
     fail(where " expands to an empty reference, which BuildKit refuses (base name should not be blank), so there is no base to check against the allowlist")
   if (resolved ~ /[ \t\r]/ || index(resolved, VT) > 0 || index(resolved, FF) > 0)
     fail(where " expands to a reference containing whitespace, which no reference the builder accepts contains, so the FROM set cannot be serialized or checked with certainty")
-  return resolved "\t" norm_ref(resolved) "\n"
+  canon = norm_ref(resolved)
+  if (canon == "")
+    fail(where " is not a reference BuildKit accepts, and a build on it fails with invalid reference format, so there is no base to check against the allowlist")
+  return resolved "\t" canon "\n"
 }
 
 BEGIN {

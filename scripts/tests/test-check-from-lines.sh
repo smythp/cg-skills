@@ -23,11 +23,13 @@ pass=0
 failcount=0
 
 # run_case NAME MIRROR EXPECT CONTAINS [ARG...]  (dockerfile on stdin)
-#   EXPECT: ok   -> script must exit 0
-#           err  -> script must exit non-zero and output must contain CONTAINS
-#           warn -> script must exit 3 and output must contain UNVERIFIED
-#                   and CONTAINS (an advisory construct, decided by the
-#                   oracle)
+#   EXPECT: ok    -> script must exit 0
+#           err   -> script must exit 1 and a line containing REJECTED must
+#                    contain CONTAINS (a base known off the allowlist)
+#           warn  -> script must exit 3 and output must contain UNVERIFIED
+#                    and CONTAINS (an advisory construct, decided by the
+#                    oracle)
+#           usage -> script must exit 2 and output must contain CONTAINS
 #   An extra argument of --platform, --build-platform, --target, or
 #   --build-context passes
 #   through with its following value; every other extra argument is passed
@@ -79,18 +81,28 @@ run_case() {
           ;;
       esac
     fi
-  else
-    if [ "$rc" -eq 0 ]; then
+  elif [ "$expect" = "usage" ]; then
+    if [ "$rc" -ne 2 ]; then
       failcount=$((failcount + 1))
-      echo "FAIL: $name — expected rejection, but it passed"
+      echo "FAIL: $name — expected exit 2 (usage), got exit $rc: $out"
     else
       case "$out" in
         *"$contains"*) pass=$((pass + 1)) ;;
         *)
           failcount=$((failcount + 1))
-          echo "FAIL: $name — error should contain '$contains', got: $out"
+          echo "FAIL: $name — output should contain '$contains', got: $out"
           ;;
       esac
+    fi
+  else
+    if [ "$rc" -ne 1 ]; then
+      failcount=$((failcount + 1))
+      echo "FAIL: $name — expected exit 1 (REJECTED), got exit $rc: $out"
+    elif printf '%s\n' "$out" | grep REJECTED | grep -qF -- "$contains"; then
+      pass=$((pass + 1))
+    else
+      failcount=$((failcount + 1))
+      echo "FAIL: $name — a REJECTED line should contain '$contains', got: $out"
     fi
   fi
 }
@@ -168,8 +180,15 @@ EOF
 # The mirror prefix travels to awk through the environment. awk -v decodes
 # backslash sequences, so a prefix holding a literal backslash-n would turn
 # into a newline and stop matching a FROM that spells the same two
-# characters. The value below must stay exactly as written on both sides.
-run_case "mirror value with a backslash sequence is not decoded" "my\ncorp.example.io/cg" ok "" <<'EOF'
+# characters. The value below must stay exactly as written on both sides:
+# the undecoded mirror matches the FROM's prefix, and the advisory names
+# the prefix match, while a decoded mirror would match nothing and the
+# advisory would not. The FROM itself is advisory either way. Oracle: a
+# real build of this file strips the backslash and loads metadata for
+# myncorp.example.io/cg/python:latest-dev (2026-09-17), a host the written
+# spelling does not name, so the written reference is outside the grammar
+# this check trusts and no prefix can vouch for it.
+run_case "mirror value with a backslash sequence is not decoded" "my\ncorp.example.io/cg" warn "matches the allowlist prefix" <<'EOF'
 FROM my\ncorp.example.io/cg/python:latest-dev
 RUN echo hi
 EOF
@@ -237,6 +256,79 @@ run_case "malformed digest is a reference BuildKit refuses, unverified" "" warn 
 FROM alpine@sha256:zzz
 RUN echo hi
 EOF
+
+# Oracle: a real build fails with failed to parse stage name "alpine..x":
+# invalid reference format (2026-09-17); a path component runs lowercase
+# alphanumerics joined by a single dot, a single underscore, a double
+# underscore, or one or more hyphens, so the double dot is outside the
+# grammar and no base pulls from it.
+run_case "double-dot path component is a reference BuildKit refuses, unverified" "" warn "not a reference BuildKit accepts" <<'EOF'
+FROM alpine..x
+RUN echo hi
+EOF
+
+# Oracle: a real build fails with failed to parse stage name
+# "cgr.dev/chainguard/a..b": invalid reference format (2026-09-17); the
+# allowlist prefix does not vouch for a reference outside the grammar.
+run_case "double-dot component under the allowlist prefix is unverified" "" warn "matches the allowlist prefix but is not a reference BuildKit accepts" <<'EOF'
+FROM cgr.dev/chainguard/a..b
+RUN echo hi
+EOF
+
+# Oracle: a real build fails with failed to parse stage name
+# "example.com:abc/alpine": invalid reference format (2026-09-17); a
+# registry port is numeric.
+run_case "non-numeric registry port is a reference BuildKit refuses, unverified" "" warn "not a reference BuildKit accepts" <<'EOF'
+FROM example.com:abc/alpine
+RUN echo hi
+EOF
+
+# Oracle: a real build fails with failed to parse stage name
+# "cgr.dev:abc/chainguard/x": invalid reference format (2026-09-17). The
+# written host is cgr.dev:abc, which the cgr.dev/ prefix does not match,
+# and the reference is outside the grammar, so it is reported.
+run_case "non-numeric port on the allowlist host is unverified" "" warn "not a reference BuildKit accepts" <<'EOF'
+FROM cgr.dev:abc/chainguard/x
+RUN echo hi
+EOF
+
+# Oracle: a real build fails with failed to parse stage name
+# "docker.io/library/Alpine": invalid reference format: repository name
+# (library/Alpine) must be lowercase (2026-09-17).
+run_case "uppercase path component is a reference BuildKit refuses, unverified" "" warn "not a reference BuildKit accepts" <<'EOF'
+FROM docker.io/library/Alpine
+RUN echo hi
+EOF
+
+# Oracle: a real build fails with failed to parse stage name
+# "cgr.dev/chainguard/Alpine": invalid reference format: repository name
+# (chainguard/Alpine) must be lowercase (2026-09-17); the allowlist
+# prefix, matched case-insensitively, does not vouch for it.
+run_case "uppercase path component under the allowlist prefix is unverified" "" warn "matches the allowlist prefix but is not a reference BuildKit accepts" <<'EOF'
+FROM cgr.dev/chainguard/Alpine
+RUN echo hi
+EOF
+
+# Oracle: a real build accepts localhost:5000/alpine and loads metadata
+# for localhost:5000/alpine:latest (2026-09-17; the pull then fails on
+# the connection, not on the reference). A valid host with a numeric port
+# is inside the grammar, so the off-allowlist base stays rejected.
+run_case "valid numeric registry port off the allowlist is rejected" "" err "localhost:5000/alpine" <<'EOF'
+FROM localhost:5000/alpine
+RUN echo hi
+EOF
+
+# Oracle: a real build accepts a bare 247-character name (the normalized
+# path docker.io/library/... runs exactly 255 characters) and loads its
+# metadata, while a bare 248-character name fails with repository name
+# must not be more than 255 characters (both pinned 2026-09-17), so the
+# limit binds the normalized path with the domain excluded. The fixtures
+# are built with awk because the deciding lengths would be unreadable
+# here.
+awk 'BEGIN { s = sprintf("%247s", ""); gsub(/ /, "a", s); printf "FROM %s\nRUN echo hi\n", s }' < /dev/null > "$tmp/longref.bin"
+run_case "normalized path of exactly 255 characters off the allowlist is rejected" "" err "not allowed" < "$tmp/longref.bin"
+awk 'BEGIN { s = sprintf("%248s", ""); gsub(/ /, "a", s); printf "FROM %s\nRUN echo hi\n", s }' < /dev/null > "$tmp/longref.bin"
+run_case "normalized path over 255 characters is a reference BuildKit refuses, unverified" "" warn "not a reference BuildKit accepts" < "$tmp/longref.bin"
 
 # Oracle: outline fails with dockerfile parse error on line 1: FROM requires
 # either one or three arguments (three tokens whose middle one is not AS
@@ -817,7 +909,7 @@ EOF
 
 # A multi-platform value is a usage error; the caller runs the gate once
 # per platform (exit 2, no oracle involved).
-run_case "multi-platform value is refused" "" err "one platform per run" --platform linux/amd64,linux/arm64 <<'EOF'
+run_case "multi-platform value is refused" "" usage "one platform per run" --platform linux/amd64,linux/arm64 <<'EOF'
 FROM cgr.dev/chainguard/wolfi-base
 EOF
 
@@ -946,14 +1038,14 @@ EOF
 # buildx itself refuses a context name that is not a valid reference
 # (invalid context name DEP, repository name must be lowercase), so the
 # captured invocation cannot build with it: a usage error (exit 2).
-run_case "invalid context name is refused as a usage error" "" err "not a valid image reference" --build-context DEP=docker-image://alpine:latest <<'EOF'
+run_case "invalid context name is refused as a usage error" "" usage "not a valid image reference" --build-context DEP=docker-image://alpine:latest <<'EOF'
 FROM cgr.dev/chainguard/wolfi-base
 EOF
 
 # buildx refuses this invocation too (invalid context name dep:--: invalid
 # reference format, verified 2026-09-17), because the tag does not start
 # with a letter, digit, or underscore.
-run_case "context name with an invalid tag is refused as a usage error" "" err "not a valid image reference" --build-context dep:--=docker-image://alpine:latest <<'EOF'
+run_case "context name with an invalid tag is refused as a usage error" "" usage "not a valid image reference" --build-context dep:--=docker-image://alpine:latest <<'EOF'
 FROM cgr.dev/chainguard/wolfi-base
 EOF
 
@@ -1751,6 +1843,71 @@ ARG BASE=alpine
 ARG OTHER="x y" BASE=cgr.dev/chainguard/wolfi-base
 FROM $BASE
 EOF
+
+# Oracle: a real cacheonly build of this file with --build-arg
+# BASE=cgr.dev/chainguard/wolfi- loads only
+# cgr.dev/chainguard/wolfi-base:latest (2026-09-17): BuildKit reassembles
+# the quoted line, the reassembled line declares BASE, and the override
+# beats the declared default. This check cannot tell whether the
+# unverifiable line declared BASE, and an override applies only to a
+# declared name, so the FROM is unverified, never resolved to the bare
+# "base" the empty expansion would leave and never rejected on it.
+run_case "override of a name declared only on an unverifiable line is unverified" "" warn 'FROM "${BASE}base"' BASE=cgr.dev/chainguard/wolfi- <<'EOF'
+ARG OTHER="x y" BASE=cgr.dev/chainguard/wolfi-
+FROM ${BASE}base
+EOF
+
+# Oracle: a real cacheonly build of this file with --build-arg
+# BASE=cgr.dev/chainguard/ loads only docker.io/library/alpine:latest
+# (2026-09-17): the quoted value belongs to OTHER, BASE is never declared,
+# and the override does not apply, so ${BASE} expands empty. This check
+# cannot tell whether the unverifiable line declared BASE, so the FROM is
+# unverified, never rejected on the alpine and never resolved through the
+# override.
+run_case "override of a name the unverifiable line may not declare is unverified" "" warn 'FROM "${BASE}alpine"' BASE=cgr.dev/chainguard/ <<'EOF'
+ARG OTHER="x BASE=y"
+FROM ${BASE}alpine
+EOF
+
+# The arg-mode sibling of the same rule: a later ARG default reading the
+# overridden name is uncertain too when only the unverifiable line could
+# have declared the name. Oracle: a real cacheonly build of this file with
+# --build-arg BASE=cgr.dev/chainguard/wolfi- loads only
+# cgr.dev/chainguard/wolfi-base:latest (2026-09-17).
+run_case "ARG default reading an override the taint covers is unverified" "" warn 'FROM "${NEW}"' BASE=cgr.dev/chainguard/wolfi- <<'EOF'
+ARG OTHER="x y" BASE=cgr.dev/chainguard/wolfi-
+ARG NEW=${BASE}base
+FROM ${NEW}
+EOF
+
+# Oracle: a real cacheonly build of this file with --build-arg
+# BASE=cgr.dev/chainguard/wolfi- loads only
+# cgr.dev/chainguard/wolfi-base:latest (2026-09-17): the override beats
+# whatever the unverifiable line assigns BASE. Line 1 is a trusted
+# declaration of BASE, so the override keeps BASE certain through the
+# taint and the FROM resolves the allowed base; only the unverifiable
+# line itself is reported, and nothing rejects.
+cat > "$tmp/Dockerfile" <<'EOF'
+ARG BASE=alpine
+ARG OTHER="x y" BASE=cgr.dev/chainguard/wolfi-
+FROM ${BASE}base
+EOF
+out=$(sh "$SCRIPT" --build-arg BASE=cgr.dev/chainguard/wolfi- "$tmp/Dockerfile" 2>&1); rc=$?
+nwarn=$(printf '%s\n' "$out" | grep -c '^check-from-lines: UNVERIFIED')
+if [ "$rc" -ne 3 ] || [ "$nwarn" -ne 1 ]; then
+  failcount=$((failcount + 1))
+  echo "FAIL: overridden name declared by a trusted line stays certain — expected exit 3 with exactly one UNVERIFIED diagnostic besides the summary, got exit $rc with $nwarn: $out"
+else
+  case "$out" in
+    *REJECTED*)
+      failcount=$((failcount + 1))
+      echo "FAIL: overridden name declared by a trusted line stays certain — nothing may reject here, got: $out"
+      ;;
+    *)
+      pass=$((pass + 1))
+      ;;
+  esac
+fi
 
 # Oracle: a real cacheonly build of ARG OTHER=a\ B=alpine with the same
 # FROM resolves cgr.dev/chainguard/wolfi-base:latest (2026-09-17): the
