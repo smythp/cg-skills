@@ -13,8 +13,14 @@
 #      BuildKit's precedence, so the reviewer's single-quoted TARGETVARIANT
 #      file is rejected on the alpine base the real build pulls while the
 #      benign declared default passes, and a pinned syntax directive runs
-#      under its own frontend with one warning, passing for 1.6 and failing
-#      as not-a-pass for 1.0, whose frontend cannot answer subrequests.
+#      under its own frontend with exactly one warning, passing for 1.6 and
+#      failing
+#      as not-a-pass for 1.0, whose frontend cannot answer subrequests. An
+#      automatic default declared below a line that already reads the name,
+#      and a self-referential default, are refused naming the argument and
+#      the lines, because one buildx call cannot reproduce the order the
+#      real build applies (cases 1h and 1i, pinned with real arm/v7
+#      builds).
 #   2. a multi-stage file whose runtime stage is cgr.dev/chainguard/static —
 #      every base allowed, exit 0
 #   3. a file whose only external base sits on a configured mirror prefix —
@@ -50,7 +56,10 @@
 # shim shortens the bound), pinning the exit
 # status for empty output, unrelated output, a bracketed-label load that
 # must classify as an artifact source, an off-set load in a file with no
-# artifact-capable instruction, which is an unexpanded base and fails, an
+# artifact-capable instruction, which is an unexpanded base and fails
+# (REJECTED when it is off the allowlist, refused as an unexplained load
+# when it is on it), an invalid or empty docker-image:// context reference
+# refused by name, an
 # unparsable reference line, a
 # scratch-only stage graph, an off-allowlist stage, an alias base, a JSON
 # escape in a base, targets runs that fail or lack evidence, outline runs
@@ -233,15 +242,15 @@ out=$(sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
 if [ "$rc" -ne 0 ]; then
   bad "pinned 1.6: expected pass, exit $rc: $out"
 else
-  case "$out" in
-    *"WARNING: the syntax directive pins the frontend docker/dockerfile:1.6"*)
-      case "$out" in
-        *"allowed  cgr.dev/chainguard/wolfi-base"*) ok ;;
-        *) bad "pinned 1.6: should allow wolfi-base, got: $out" ;;
-      esac
-      ;;
-    *) bad "pinned 1.6: should print the pinned-frontend warning, got: $out" ;;
-  esac
+  nwarn=$(printf '%s\n' "$out" | grep -c 'WARNING: the syntax directive pins the frontend docker/dockerfile:1.6')
+  if [ "$nwarn" -ne 1 ]; then
+    bad "pinned 1.6: exactly one pinned-frontend WARNING line expected, got $nwarn: $out"
+  else
+    case "$out" in
+      *"allowed  cgr.dev/chainguard/wolfi-base"*) ok ;;
+      *) bad "pinned 1.6: should allow wolfi-base, got: $out" ;;
+    esac
+  fi
 fi
 
 echo "--- case 1g: a pinned frontend without subrequest support is not a pass ---"
@@ -264,6 +273,62 @@ else
       esac
       ;;
     *) bad "pinned 1.0: should say the frontend lacks the outline call, got: $out" ;;
+  esac
+fi
+
+echo "--- case 1h: an automatic default declared below its first read is not a pass ---"
+# A real cacheonly build of this file on linux/arm/v7 resolves
+# cgr.dev/chainguard/wolfi-base:latest (2026-09-17; the manifest has no
+# arm/v7 entry, so the pull then fails, but the base the build resolves is
+# the Chainguard one): line 1 reads the automatic TARGETVARIANT, v7, before
+# line 2 declares its empty default. One buildx call cannot reproduce that
+# order, so the oracle must refuse naming the argument and both lines,
+# never reject the alpine a daemon-platform outline would resolve.
+cat > "$tmp/Dockerfile" <<'EOF'
+ARG BASE=${TARGETVARIANT:+cgr.dev/chainguard/wolfi-base}
+ARG TARGETVARIANT=
+FROM ${BASE:-alpine}
+EOF
+out=$(sh "$SCRIPT" --platform linux/arm/v7 "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 1 ]; then
+  bad "pre-declaration read: expected exit 1, got $rc: $out"
+else
+  case "$out" in
+    *"line 1 of"*"reads the automatic argument TARGETVARIANT and line 2 declares its default"*)
+      case "$out" in
+        *REJECTED*) bad "pre-declaration read: must refuse to answer, not reject: $out" ;;
+        *) ok ;;
+      esac
+      ;;
+    *) bad "pre-declaration read: should name TARGETVARIANT and lines 1 and 2, got: $out" ;;
+  esac
+  case "$out" in
+    *"Declaring the default above its first use lets the gate run"*) ok ;;
+    *) bad "pre-declaration read: should name the way out, got: $out" ;;
+  esac
+fi
+
+echo "--- case 1i: a self-referential automatic default is not a pass ---"
+# A real cacheonly build of this file on linux/arm/v7 also resolves
+# cgr.dev/chainguard/wolfi-base:latest (2026-09-17): the default reads the
+# automatic v7 it replaces, so the same one-call limit applies and the
+# oracle refuses naming the argument and the line.
+cat > "$tmp/Dockerfile" <<'EOF'
+ARG TARGETVARIANT=${TARGETVARIANT}
+FROM ${TARGETVARIANT:+cgr.dev/chainguard/wolfi-base}
+EOF
+out=$(sh "$SCRIPT" --platform linux/arm/v7 "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 1 ]; then
+  bad "self-referential default: expected exit 1, got $rc: $out"
+else
+  case "$out" in
+    *"line 1 of"*"reads the automatic argument TARGETVARIANT before the same line finishes declaring its default"*)
+      case "$out" in
+        *REJECTED*) bad "self-referential default: must refuse to answer, not reject: $out" ;;
+        *) ok ;;
+      esac
+      ;;
+    *) bad "self-referential default: should name TARGETVARIANT and line 1, got: $out" ;;
   esac
 fi
 
@@ -799,6 +864,28 @@ FROM cgr.dev/chainguard/wolfi-base
 EOF
 shim_case "off-set load with no artifact-capable instruction is an unexpanded base" "$tmp/out-mixed" 0 1 \
   "unexpanded base"
+# The same fallback with the off-set load on the allowlist: the load is
+# not a rejected base (the header defines REJECTED as a base known off the
+# allowlist), but the scan and the frontend still disagree about the file,
+# so the run refuses as an unexplained load, still exit 1.
+sed 's/^#2 DONE.*/#3 [internal] load metadata for cgr.dev\/chainguard\/static:latest/' \
+  "$tmp/out-good" > "$tmp/out-mixed-cgr"
+shim_case "allowed off-set load is an unexplained load, not a pass" "$tmp/out-mixed-cgr" 0 1 \
+  "not a pass: unexplained load cgr.dev/chainguard/static:latest"
+out=$(SHIM_OUT="$tmp/out-mixed-cgr" SHIM_OUT_TARGETS="$tmp/out-targets-good" \
+      PATH="$shimdir:$PATH" sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1)
+case "$out" in
+  *"REJECTED cgr.dev/chainguard/static:latest"*) bad "allowed off-set load: must not print a REJECTED line for an allowed load, got: $out" ;;
+  *) ok ;;
+esac
+# An invalid docker-image:// context reference is refused by name before
+# the FROM set is serialized (buildx accepts the flag and a real build
+# fails with invalid reference format, pinned 2026-09-17 for an empty
+# reference and for alpine:--).
+shim_case "invalid docker-image context reference is refused by name" "$tmp/out-good" 0 1 \
+  "not a valid image reference" --build-context cgr.dev/chainguard/wolfi-base=docker-image://alpine:--
+shim_case "empty docker-image context reference is refused" "$tmp/out-good" 0 1 \
+  "empty docker-image:// reference" --build-context cgr.dev/chainguard/wolfi-base=docker-image://
 shim_case "allowed reference passes" "$tmp/out-good" 0 0 \
   "allowed  cgr.dev/chainguard/wolfi-base:latest"
 shim_case "missing load-build-definition step fails" "$tmp/out-nodef" 0 1 "no evidence"
@@ -960,10 +1047,12 @@ out=$(SHIM_OUT="$tmp/out-good" SHIM_OUT_TARGETS="$tmp/out-targets-good" SHIM_ARG
 if [ "$rc" -ne 0 ]; then
   bad "pinned syntax runs: expected pass, exit $rc: $out"
 else
-  case "$out" in
-    *"WARNING: the syntax directive pins the frontend docker/dockerfile:1.6"*) ok ;;
-    *) bad "pinned syntax runs: should print the pinned-frontend warning, got: $out" ;;
-  esac
+  nwarn=$(printf '%s\n' "$out" | grep -c 'WARNING: the syntax directive pins the frontend docker/dockerfile:1.6')
+  if [ "$nwarn" -eq 1 ]; then
+    ok
+  else
+    bad "pinned syntax runs: exactly one pinned-frontend WARNING line expected, got $nwarn: $out"
+  fi
 fi
 if grep -qx -- '--call=targets,format=json' "$synlog" && grep -qx -- '--call=outline,format=json' "$synlog"; then
   ok

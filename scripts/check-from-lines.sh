@@ -163,7 +163,9 @@
 #     BuildKit reassembles such a line by rules this check does not model
 #     (verified with real builds: ARG A="x y" B=alpine assigns B, while
 #     ARG OTHER=a\ B=alpine swallows B= into OTHER's value), so every later
-#     FROM whose resolution reads any variable is UNVERIFIED too, while a
+#     FROM whose resolution reads any variable is UNVERIFIED too, a
+#     variable an earlier line assigned included (the unverifiable line
+#     could have reassigned it, so the earlier value is stale), while a
 #     FROM written as a literal reference stays verifiable. ARGs declared
 #     after a FROM are ignored for FROM resolution. A --build-arg override
 #     replaces the default of a matching ARG declared before the first
@@ -215,10 +217,15 @@
 #     and asking for --platform (or --target, for TARGETSTAGE), because
 #     BuildKit resolves a value this check does not know. A file that never
 #     reads them behaves as before.
-#   - Unresolved variables in a FROM ref are UNVERIFIED: FROM $UNSET could
-#     resolve to anything at build time (the build as captured fails on the
-#     empty expansion, and a --build-arg not on the captured invocation
-#     could send it anywhere), so the check reports it instead of deciding.
+#   - A variable in a FROM ref that no global ARG and no override gives a
+#     value expands to the empty string, exactly as BuildKit expands it
+#     (verified with real builds: FROM alpine${UNSET} resolves
+#     docker.io/library/alpine, and an override without a declaration never
+#     applies, so the captured invocation fixes the value). The expanded
+#     reference is then classified like any other. A FROM whose whole
+#     reference expands empty is UNVERIFIED naming the empty result,
+#     because BuildKit refuses an empty base (base name should not be
+#     blank, verified), so no base pulls from it as written.
 #   - Named build contexts: BuildKit matches each --build-context name
 #     against the expanded FROM reference and against stage names, after
 #     docker reference normalization on both sides (a bare name gains
@@ -234,7 +241,11 @@
 #     outline run or a real build. The check applies the same matching at
 #     each FROM and at each AS name. A matching docker-image://REF source
 #     puts REF through the allowlist in place of the FROM (or of the
-#     overridden stage's base); a matching source of any other kind (a
+#     overridden stage's base), after checking that REF is a reference
+#     docker accepts: an empty or invalid REF is UNVERIFIED naming it,
+#     because buildx accepts the flag and the build then fails on it
+#     (invalid reference format, verified with an empty reference and with
+#     alpine:--), so no base pulls from it; a matching source of any other kind (a
 #     local directory, a git repository, an oci layout, another target) is
 #     UNVERIFIED, because a base built from such a source has no registry
 #     reference to check; a name that matches nothing is ignored. A context
@@ -263,10 +274,12 @@
 # ${...} forms and Unicode spaces on heredoc-capable lines, unterminated
 # heredocs, pinned '# syntax=' frontends, unknown or duplicate parser
 # directives and invalid escape values, NUL bytes and lone CRs, FROM token
-# counts BuildKit refuses, references BuildKit refuses, unresolved
-# variables in a FROM, automatic platform arguments read without
+# counts BuildKit refuses, references BuildKit refuses (an invalid tag or
+# digest included), a FROM whose reference expands to the empty string,
+# automatic platform arguments read without
 # --platform or --target, forward stage references, and named build
-# contexts whose source is not docker-image://. None of these is emulated
+# contexts whose source is not docker-image:// or whose docker-image://
+# reference BuildKit refuses. None of these is emulated
 # or guessed at; each is named for the report, and check-from-oracle.sh
 # decides them with BuildKit's own resolution. One documented deviation
 # stays: with --platform but no --build-platform the BUILD* arguments take
@@ -530,9 +543,23 @@ function autocheck(name, lineno) {
     warn("line " lineno " reads the automatic platform argument " name ", which BuildKit sets on every build, and this run has no --platform. Pass --platform (and --build-platform when the build platform differs from the target) so the check resolves the same file the builder does")
 }
 
+# taint_args(): an unverifiable ARG line could have assigned any name that
+# appears on it (BuildKit reassembles such a line by rules this check does
+# not model), so every name loses its trusted value, the names earlier
+# lines assigned included; ARG BASE=alpine followed by an unverifiable line
+# reassigning BASE must not leave the stale alpine trusted (a real build
+# of that shape assigns the later value, so a FROM reading BASE is
+# unverified, never rejected on the stale value). Clearing CLEAN puts every
+# name under the ARG_TAINT rule in unknown_var below.
+function taint_args(   k) {
+  ARG_TAINT = 1
+  for (k in CLEAN) delete CLEAN[k]
+}
+
 # unknown_var(name): true when this check lost track of the value of name.
 # An unverifiable ARG line taints every name it could have assigned, which
-# is any name (ARG_TAINT); a name assigned after the tainted line (CLEAN)
+# is any name (ARG_TAINT), the names earlier lines assigned included; a
+# name assigned after the tainted line (CLEAN)
 # or forced by a --build-arg override, which beats any declared default, is
 # certain again, and a name whose own default could not be expanded stays
 # unknown (ARGS_UNKNOWN).
@@ -542,10 +569,12 @@ function unknown_var(name) {
   return 0
 }
 
-# Resolve one variable name. In "from" mode an unknown name is collected in
-# UNRESOLVED instead of guessed at; in "default" mode it expands to the empty
-# string, matching the builder. A name whose value this check lost track of
-# marks the expansion uncertain instead of answering.
+# Resolve one variable name. An unknown name expands to the empty string,
+# exactly as BuildKit expands a variable no global ARG and no override
+# gives a value (verified with real builds); in "from" mode the name is
+# also collected in UNRESOLVED so a reference that expands wholly empty
+# can be reported naming what emptied it. A name whose value this check
+# lost track of marks the expansion uncertain instead of answering.
 function lookup(name, mode, lineno) {
   autocheck(name, lineno)
   if (unknown_var(name)) { UNCERTAIN = 1; return "" }
@@ -636,10 +665,15 @@ function expand_str(s, mode, lineno,   out, j, k, name, c, mod, word, isset) {
 # DOCKER.io context does not match a docker.io FROM, also pinned);
 # index.docker.io maps to docker.io only in that exact lowercase
 # spelling; a docker.io path without a slash gains library/; a reference
-# with neither tag nor digest gains :latest; a digest part is kept
-# verbatim. Returns the empty string for a value docker refuses (an
+# with neither tag nor digest gains :latest; a digest part is validated
+# against the docker digest grammar (letter-led algorithm segments, then a
+# colon and at least 32 hex digits) and kept verbatim. Returns the empty
+# string for a value docker refuses (an
 # uppercase repository, whitespace, empty parts, a colon inside the
-# path). BuildKit fails any build whose FROM needs such a value and
+# path, a tag that does not start with a letter, digit, or underscore, a
+# digest outside the grammar; alpine:-- and alpine@sha256:zzz are both
+# refused with invalid reference format, verified against real builds).
+# BuildKit fails any build whose FROM needs such a value and
 # buildx refuses such a context name, so an empty result never silently
 # matches.
 function norm_ref(r,   host, rest, dig, tag, slash, last, colon, dpos) {
@@ -651,6 +685,8 @@ function norm_ref(r,   host, rest, dig, tag, slash, last, colon, dpos) {
     dig = substr(r, dpos)
     r = substr(r, 1, dpos - 1)
     if (r == "" || length(dig) < 2) return ""
+    if (dig !~ /^@[A-Za-z][A-Za-z0-9]*([-_+.][A-Za-z][A-Za-z0-9]*)*:[0-9A-Fa-f]+$/) return ""
+    if (length(dig) - index(dig, ":") < 32) return ""
   }
   slash = index(r, "/")
   if (slash == 0) { host = "docker.io"; rest = r }
@@ -668,7 +704,7 @@ function norm_ref(r,   host, rest, dig, tag, slash, last, colon, dpos) {
   if (colon > 0) {
     tag = substr(last, colon + 1)
     rest = substr(rest, 1, length(rest) - length(last) + colon - 1)
-    if (tag == "" || tag ~ /[^A-Za-z0-9_.-]/ || length(tag) > 128) return ""
+    if (tag == "" || tag !~ /^[A-Za-z0-9_]/ || tag ~ /[^A-Za-z0-9_.-]/ || length(tag) > 128) return ""
   }
   if (host == "docker.io" && index(rest, "/") == 0) rest = "library/" rest
   if (rest ~ /[^a-z0-9._\/-]/) return ""
@@ -1094,7 +1130,7 @@ function process(logical, lineno,   n, f, instr, sub2, p, q, ref, resolved, alia
       t = f[ai]
       if (index(t, ESC) > 0) {
         warn("ARG at line " lineno " contains the escape character in \"" t "\"; BuildKit joins escaped whitespace by rules this check does not model, so what this line assigns cannot be verified and later variable reads are unverified too")
-        ARG_TAINT = 1
+        taint_args()
         return
       }
       p = index(t, "=")
@@ -1104,7 +1140,7 @@ function process(logical, lineno,   n, f, instr, sub2, p, q, ref, resolved, alia
       }
       if (p == 1) {
         warn("ARG at line " lineno " declares an assignment with an empty name (\"" t "\"); this check cannot tell what the line assigns, so later variable reads are unverified too (BuildKit rejects the file)")
-        ARG_TAINT = 1
+        taint_args()
         return
       }
       name = substr(t, 1, p - 1)
@@ -1115,7 +1151,7 @@ function process(logical, lineno,   n, f, instr, sub2, p, q, ref, resolved, alia
         inner = substr(val, 2, length(val) - 2)
         if ((q != "\"" && q != SQ) || length(val) < 2 || substr(val, length(val), 1) != q || index(inner, q) > 0) {
           warn("ARG at line " lineno " has a quoted value this check cannot take apart (\"" t "\"): a quoted value spanning whitespace or a stray quote is reassembled by rules this check does not model, so what this line assigns cannot be verified and later variable reads are unverified too")
-          ARG_TAINT = 1
+          taint_args()
           return
         }
         val = inner
@@ -1193,6 +1229,15 @@ function process(logical, lineno,   n, f, instr, sub2, p, q, ref, resolved, alia
         return
       }
       checked = substr(csrc, 16)
+      # The substituted reference must be one docker accepts before it can
+      # be allowed or rejected: buildx accepts the flag and the build then
+      # fails on an empty or invalid docker-image:// reference (invalid
+      # reference format, verified), so no base pulls from it as written.
+      if (norm_ref(checked) == "") {
+        warn("the stage \"" alias "\" at line " lineno " is overridden by a --build-context whose docker-image:// reference \"" checked "\" is not a valid image reference; BuildKit fails the build on it (invalid reference format), so no base pulls from it as written, and check-from-oracle.sh decides what the build does with this invocation")
+        ALIASES[alias] = 1
+        return
+      }
       lc2 = tolower(checked)
       ok = 0
       if (substr(lc2, 1, 8) == "cgr.dev/") ok = 1
@@ -1212,12 +1257,21 @@ function process(logical, lineno,   n, f, instr, sub2, p, q, ref, resolved, alia
     if (alias != "") ALIASES[alias] = 1
     return
   }
-  if (UNRESOLVED != "") {
-    warn("FROM \"" ref "\" at line " lineno " has unresolved ARG variable(s):" UNRESOLVED ", so the build as captured resolves no base from it. Declare a default before the first FROM, pass the --build-arg the real build passes, or remove the interpolation")
+  # An undeclared or unset variable expands to the empty string, as
+  # BuildKit expands it, and the reference that remains is classified
+  # below like any other (a real build of FROM alpine${UNSET} resolves
+  # docker.io/library/alpine). Only a reference that expands wholly empty
+  # is reported: BuildKit refuses an empty base (base name should not be
+  # blank, verified with a real build), so no base pulls from it as
+  # written.
+  if (resolved == "") {
+    if (UNRESOLVED != "")
+      warn("FROM \"" ref "\" at line " lineno " expands to an empty base: the variable(s)" UNRESOLVED " have no value on the captured invocation and expand to the empty string, as BuildKit expands them, and BuildKit refuses an empty base (base name should not be blank), so no base pulls from it as written. check-from-oracle.sh decides what the build does with this file")
+    else
+      warn("FROM \"" ref "\" at line " lineno " expands to an empty base, which BuildKit refuses (base name should not be blank), so no base pulls from it as written. check-from-oracle.sh decides what the build does with this file")
     if (alias != "") ALIASES[alias] = 1
     return
   }
-  if (resolved == "") resolved = ref
 
   lc = tolower(resolved)
   ok = 0
@@ -1239,6 +1293,15 @@ function process(logical, lineno,   n, f, instr, sub2, p, q, ref, resolved, alia
           return
         }
         checked = substr(csrc, 16)
+        # Same validity check as the stage-name site above: an empty or
+        # invalid docker-image:// reference pulls nothing (the build fails
+        # on it with invalid reference format, verified), so it is reported,
+        # never allowed and never rejected.
+        if (norm_ref(checked) == "") {
+          warn("FROM \"" resolved "\" at line " lineno " is overridden by a --build-context whose docker-image:// reference \"" checked "\" is not a valid image reference; BuildKit fails the build on it (invalid reference format), so no base pulls from it as written, and check-from-oracle.sh decides what the build does with this invocation")
+          if (alias != "") ALIASES[alias] = 1
+          return
+        }
         lc2 = tolower(checked)
         if (substr(lc2, 1, 8) == "cgr.dev/") ok = 1
         else if (mirror != "" && substr(lc2, 1, length(mirror) + 1) == mirror "/") ok = 1
@@ -1248,8 +1311,20 @@ function process(logical, lineno,   n, f, instr, sub2, p, q, ref, resolved, alia
     }
     if (!ok) {
       if (lc in ALIASES) ok = 1
-      else if (substr(lc, 1, 8) == "cgr.dev/") ok = 1
-      else if (mirror != "" && substr(lc, 1, length(mirror) + 1) == mirror "/") ok = 1
+      else if (substr(lc, 1, 8) == "cgr.dev/" ||
+               (mirror != "" && substr(lc, 1, length(mirror) + 1) == mirror "/")) {
+        # An allowed prefix is not enough on its own: a reference BuildKit
+        # refuses (cgr.dev/chainguard/:latest-dev, left by an empty
+        # expansion, fails a real build with invalid reference format)
+        # pulls nothing, so the check reports it instead of vouching for a
+        # base that never enters the build.
+        if (norm_ref(resolved) != "") ok = 1
+        else {
+          warn("FROM \"" resolved "\" at line " lineno " matches the allowlist prefix but is not a reference BuildKit accepts, so no base pulls from it as written; check-from-oracle.sh decides what the build does with this file")
+          if (alias != "") ALIASES[alias] = 1
+          return
+        }
+      }
     }
   }
 

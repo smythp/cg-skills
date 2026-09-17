@@ -219,6 +219,25 @@ FROM SCRATCH
 COPY hello /
 EOF
 
+# Oracle: outline fails with failed to parse stage name "alpine:--":
+# invalid reference format (2026-09-17); a tag must start with a letter,
+# digit, or underscore. No base pulls from a reference BuildKit refuses,
+# so the check reports it instead of rejecting a base that never enters
+# the build.
+run_case "invalid tag is a reference BuildKit refuses, unverified" "" warn "not a reference BuildKit accepts" <<'EOF'
+FROM alpine:--
+RUN echo hi
+EOF
+
+# Oracle: outline fails with failed to parse stage name
+# "alpine@sha256:zzz": invalid reference format (2026-09-17); a digest
+# needs letter-led algorithm segments, a colon, and at least 32 hex
+# digits, so this base pulls nothing and is reported, not rejected.
+run_case "malformed digest is a reference BuildKit refuses, unverified" "" warn "not a reference BuildKit accepts" <<'EOF'
+FROM alpine@sha256:zzz
+RUN echo hi
+EOF
+
 # Oracle: outline fails with dockerfile parse error on line 1: FROM requires
 # either one or three arguments (three tokens whose middle one is not AS
 # draw the same message). No base pulls from such a line, so the check
@@ -327,12 +346,32 @@ FROM my-corp.example.io/chainguard-remote-extra/python:latest-dev
 RUN echo hi
 EOF
 
-# The build as captured resolves no base from an unresolved variable (an
-# empty expansion fails the build), and a --build-arg not on the captured
-# invocation could send it anywhere, so the check reports it.
-run_case "unresolved ARG base is unverified" "" warn '${BASE}' <<'EOF'
+# A declared ARG with no value expands to the empty string, as BuildKit
+# expands it, and here the whole reference empties: a real build of
+# FROM ${UNSET} fails with base name (${UNSET}) should not be blank
+# (2026-09-17), so no base pulls from it and the check reports the empty
+# result.
+run_case "FROM that expands to an empty base is unverified" "" warn "expands to an empty base" <<'EOF'
 ARG BASE
 FROM ${BASE}
+RUN echo hi
+EOF
+
+# The same empty expansion with no declaration at all: an undeclared
+# variable expands to the empty string too (a --build-arg without a
+# declaration never applies), and the empty base is refused the same way.
+run_case "FROM of an undeclared variable is an empty base, unverified" "" warn "expands to an empty base" <<'EOF'
+FROM ${UNSET}
+RUN echo hi
+EOF
+
+# Oracle: a real cacheonly build of this file resolves
+# docker.io/library/alpine:latest (2026-09-17): the undeclared variable
+# expands to the empty string and the literal that remains is the base.
+# The check expands the same way, so the alpine the build really pulls is
+# rejected rather than reported as unresolvable.
+run_case "undeclared variable suffix leaves alpine and is rejected" "" err "alpine" <<'EOF'
+FROM alpine${UNSET}
 RUN echo hi
 EOF
 
@@ -344,7 +383,9 @@ FROM ${BASE}
 RUN echo hi
 EOF
 
-run_case "stage ARG alone cannot satisfy FROM variable" "" warn '${BASE}' <<'EOF'
+# A stage ARG never reaches FROM resolution, so the global value is empty
+# and the reference expands to an empty base, which BuildKit refuses.
+run_case "stage ARG alone cannot satisfy FROM variable" "" warn "expands to an empty base" <<'EOF'
 FROM cgr.dev/chainguard/wolfi-base
 ARG BASE=cgr.dev/chainguard/python:latest-dev
 FROM ${BASE}
@@ -360,7 +401,7 @@ EOF
 
 # BuildKit expands the empty default and fails the build (base name should
 # not be blank), so no base pulls from it and the check reports it.
-run_case "empty ARG base is unverified" "" warn '${BASE}' <<'EOF'
+run_case "empty ARG base is unverified" "" warn "expands to an empty base" <<'EOF'
 ARG BASE=
 FROM ${BASE}
 RUN echo hi
@@ -403,13 +444,21 @@ FROM images.acme.io/team/go:1.21
 RUN echo hi
 EOF
 
-run_case "unresolved ARG inside cgr.dev path is unverified" "" warn "unresolved ARG variable" <<'EOF'
+# Oracle: a real build fails with failed to parse stage name
+# "cgr.dev/chainguard/:latest-dev": invalid reference format (2026-09-17).
+# The empty expansion leaves a reference BuildKit refuses, and the
+# allowlist prefix alone must not vouch for it, because no base pulls
+# from a reference the builder refuses.
+run_case "empty expansion inside a cgr.dev path is unverified" "" warn "matches the allowlist prefix but is not a reference BuildKit accepts" <<'EOF'
 ARG IMG
 FROM cgr.dev/chainguard/$IMG:latest-dev
 RUN echo hi
 EOF
 
-run_case "unresolved ARG inside external mirror path is unverified" "" warn "unresolved ARG variable" <<'EOF'
+# Oracle: a real build fails with failed to parse stage name
+# "/python:latest-dev": invalid reference format (2026-09-17); the empty
+# expansion leaves a reference BuildKit refuses.
+run_case "empty expansion at the start of a FROM is unverified" "" warn "not a reference BuildKit accepts" <<'EOF'
 ARG REG
 FROM $REG/python:latest-dev
 RUN echo hi
@@ -899,6 +948,34 @@ EOF
 # captured invocation cannot build with it: a usage error (exit 2).
 run_case "invalid context name is refused as a usage error" "" err "not a valid image reference" --build-context DEP=docker-image://alpine:latest <<'EOF'
 FROM cgr.dev/chainguard/wolfi-base
+EOF
+
+# buildx refuses this invocation too (invalid context name dep:--: invalid
+# reference format, verified 2026-09-17), because the tag does not start
+# with a letter, digit, or underscore.
+run_case "context name with an invalid tag is refused as a usage error" "" err "not a valid image reference" --build-context dep:--=docker-image://alpine:latest <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+EOF
+
+# Oracle: buildx accepts the flag and the real build then fails with
+# invalid reference format (verified 2026-09-17 for docker-image:// with
+# an empty reference and with alpine:--), so no base pulls from the
+# override and the check reports it, never allowing or rejecting a
+# reference the builder refuses.
+run_case "empty docker-image context source is unverified" "" warn "not a valid image reference" --build-context cgr.dev/chainguard/wolfi-base=docker-image:// <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+EOF
+
+run_case "invalid docker-image context source is unverified" "" warn "not a valid image reference" --build-context cgr.dev/chainguard/wolfi-base=docker-image://alpine:-- <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+EOF
+
+# The same validity rule at a stage definition: the context matches the AS
+# name and replaces the base, and its invalid docker-image:// reference is
+# reported, not checked against the allowlist.
+run_case "invalid docker-image source for a stage name is unverified" "" warn "not a valid image reference" --build-context builder=docker-image://alpine:-- <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base AS builder
+RUN echo hi
 EOF
 
 # Oracle: with --build-context builder=docker-image://alpine:latest the
@@ -1662,6 +1739,19 @@ ARG B=cgr.dev/chainguard/wolfi-base
 FROM ${B}
 EOF
 
+# Oracle: a real cacheonly build of this file resolves only
+# cgr.dev/chainguard/wolfi-base:latest (2026-09-17): BuildKit reassembles
+# the quoted second line and assigns BASE the Chainguard base over the
+# alpine from line 1. The value a line before the tainted one gave a name
+# is stale after it, so the FROM is unverified on the uncertain line,
+# never rejected on the stale alpine; the exit 3 is the discriminator,
+# because a scan that kept trusting line 1 exits 1 here.
+run_case "tainted ARG line does not leave an earlier value trusted" "" warn "ARG at line 2 has a quoted value" <<'EOF'
+ARG BASE=alpine
+ARG OTHER="x y" BASE=cgr.dev/chainguard/wolfi-base
+FROM $BASE
+EOF
+
 # Oracle: a real cacheonly build of ARG OTHER=a\ B=alpine with the same
 # FROM resolves cgr.dev/chainguard/wolfi-base:latest (2026-09-17): the
 # escaped whitespace swallows B= into the value of OTHER, the reverse of
@@ -1762,8 +1852,10 @@ FROM artifact-capable
 EOF
 
 # The scan continues past an advisory construct so every one is listed:
-# two unsupported modifiers on two ARG lines must both appear as
-# UNVERIFIED lines in one run.
+# the two unsupported modifiers must both appear as UNVERIFIED diagnostics
+# naming their own lines, and the count excludes the summary line (which
+# also spells UNVERIFIED), so a scan that stopped after the first
+# construct cannot pass on the summary's token.
 cat > "$tmp/Dockerfile" <<'EOF'
 ARG A=alpine-x
 ARG B=${A%x}
@@ -1771,12 +1863,26 @@ ARG C=${A#a}
 FROM cgr.dev/chainguard/wolfi-base
 EOF
 out=$(sh "$SCRIPT" "$tmp/Dockerfile" 2>&1); rc=$?
-nwarn=$(printf '%s\n' "$out" | grep -c 'UNVERIFIED')
-if [ "$rc" -eq 3 ] && [ "$nwarn" -ge 2 ]; then
-  pass=$((pass + 1))
-else
+nwarn=$(printf '%s\n' "$out" | grep -c '^check-from-lines: UNVERIFIED')
+if [ "$rc" -ne 3 ] || [ "$nwarn" -ne 2 ]; then
   failcount=$((failcount + 1))
-  echo "FAIL: advisory scan continues — expected exit 3 with two UNVERIFIED lines, got exit $rc with $nwarn: $out"
+  echo "FAIL: advisory scan continues — expected exit 3 with exactly two UNVERIFIED diagnostics besides the summary, got exit $rc with $nwarn: $out"
+else
+  case "$out" in
+    *'in "${A%...}" at line 2'*)
+      case "$out" in
+        *'in "${A#...}" at line 3'*) pass=$((pass + 1)) ;;
+        *)
+          failcount=$((failcount + 1))
+          echo "FAIL: advisory scan continues — the line 3 modifier diagnostic is missing, got: $out"
+          ;;
+      esac
+      ;;
+    *)
+      failcount=$((failcount + 1))
+      echo "FAIL: advisory scan continues — the line 2 modifier diagnostic is missing, got: $out"
+      ;;
+  esac
 fi
 
 # A Dockerfile whose bare name contains '=' must still be read: a POSIX awk

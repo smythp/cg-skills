@@ -11,18 +11,25 @@
 # check-from-lines.sh reads the file textually and advises, with
 # UNVERIFIED lines for the constructs it cannot verify, and this script
 # asks BuildKit itself what the file resolves. It exits 1 in two cases
-# only. REJECTED means a base is known to resolve outside the allowlist,
-# from the stage graph BuildKit reports or through a named build context.
+# only. REJECTED means a base is known to resolve outside the allowlist:
+# from the stage graph BuildKit reports, through a named build context, or
+# from the unexpanded-base fallback below the outline run, when a load off
+# the allowlist sits outside the FROM set with no artifact-capable
+# instruction to explain it, because the build really resolves that load
+# whatever this script's scan misread.
 # Everything else that exits 1 is the script refusing to answer on its own
 # account, printed as not a pass: BuildKit gave no answer (a failed call, a
 # pinned frontend without subrequest support), the answer lacks its
 # positive evidence, a load-metadata line does not parse, a source policy
 # in the environment can rewrite references behind the log, a base cannot
 # be expanded or serialized with certainty (a NUL byte or lone CR in the
-# file breaks the line-based expansion scan the same way), or a resolved
-# load sits outside the FROM set in a file with no artifact-capable
-# instruction, the unexpanded-base fallback that catches any divergence
-# between the scan and the frontend.
+# file breaks the line-based expansion scan the same way), an automatic
+# argument's declared default sits below a line that already reads the
+# name (an order one buildx call cannot reproduce), a docker-image://
+# context reference is empty or invalid, or a resolved
+# load on the allowlist sits outside the FROM set in a file with no
+# artifact-capable instruction, an unexplained load; the fallback catches
+# any divergence between the scan and the frontend either way.
 #
 # The FROM set comes from docker buildx build --call=targets,format=json,
 # which returns every stage with its base exactly as written, from
@@ -125,7 +132,11 @@
 # BuildKit applies the declared default exactly as the real build does; the
 # expansion scan applies the same precedence when it seeds its own table. A
 # bare redeclaration such as ARG TARGETARCH is not a default and changes
-# nothing. So the scan can trust its own line
+# nothing. One order no single call reproduces is a read of the name above
+# the line that declares its default, a self-referential default included:
+# the pre-scan refuses it naming the argument and both lines, and
+# declaring the default above its first use lets the gate run.
+# So the scan can trust its own line
 # splitting, a NUL byte anywhere in the file and a CR that is not part of
 # a CRLF ending are rejected first, as line-based scans require.
 # The scan reads the parser directives the way check-from-lines.sh does,
@@ -164,16 +175,22 @@
 #   0 — both calls succeeded with their evidence, every base in the FROM
 #       set is on the allowlist, and every other resolved reference was
 #       printed as an external artifact source WARNING
-#   1 — a base is off the allowlist (REJECTED), or the script refuses to
+#   1 — a base is off the allowlist (REJECTED; an off-allowlist load
+#       outside the FROM set with no artifact-capable instruction
+#       included), or the script refuses to
 #       answer on its own account: a base could not be expanded or
 #       classified with certainty, a base is overridden by a context
-#       that is not a docker-image:// reference, either call failed
+#       that is not a docker-image:// reference or whose docker-image://
+#       reference is empty or invalid, an automatic argument's declared
+#       default sits below a line that already reads the name, either
+#       call failed
 #       (a pinned frontend without subrequest support included), lacked
 #       its evidence, or printed a load-metadata line this script
 #       cannot parse, a source policy is configured in the environment,
 #       the file contains a NUL byte or a bare CR, or a resolved load
+#       on the allowlist
 #       sits outside the FROM set in a file with no artifact-capable
-#       instruction; none of these is a pass
+#       instruction, an unexplained load; none of these is a pass
 #   2 — usage error
 #
 # Dependencies: sh, awk, od, grep, sed, sort, tr, docker with buildx
@@ -462,38 +479,102 @@ bounded() {
 # reverse what the real build resolves. For those names no override is
 # passed and BuildKit applies the declared default itself, exactly as the
 # real build does; the expansion scan below applies the same precedence to
-# its own table. The reader mirrors the main scan's global walk: a BOM, the
+# its own table.
+#
+# The same walk detects the one order a single buildx call cannot
+# reproduce: a read of an automatic name, in a global ARG default or a
+# FROM, above the line that declares that name's default, and a default
+# that reads its own name. The real build reads the automatic value until
+# the declaring line (a real cacheonly build on linux/arm/v7 of
+# ARG BASE=${TARGETVARIANT:+cgr.dev/chainguard/wolfi-base} then
+# ARG TARGETVARIANT= then FROM ${BASE:-alpine} resolves the Chainguard
+# base, 2026-09-17), while the single call either carries the synthetic
+# override, which beats the declared default everywhere, or omits it,
+# which leaves the reads above the declaration on the daemon's own
+# platform. Neither matches the real build, so the run refuses to answer,
+# naming the argument and both lines, instead of failing the file on a
+# resolution the real build never performs. The refusal applies only to
+# names whose override would travel: the TARGET* platform names with
+# --platform, the BUILD* names with --build-platform. TARGETSTAGE travels
+# as --target itself, which the call keeps, and a name the user overrides
+# with --build-arg reads the override everywhere in the real build too, so
+# neither can diverge.
+#
+# The reader mirrors the main scan's global walk: a BOM, the
 # directive block (the escape directive changes the continuation
 # character), comments and blank lines dropped inside continuations,
 # assignments split on whitespace with the name read up to the first =,
-# stopping at the first FROM. Only names are read here; a token the main
+# stopping at the first FROM after noting the FROM's own reads. A
+# single-quoted default stays literal and reads nothing. Only names and
+# read order are taken here; a token the main
 # scan cannot take apart fails the run there, before the outline call.
-DECLARED_AUTO=$(LC_ALL=C awk '
-function scan_line(logical,   n, f, instr, ai, t, p, name) {
+PRE_SCAN=$(CHECK_FROM_BUILD_ARGS="$USER_ARGS" LC_ALL=C awk \
+  -v pset="${PLATFORM:+1}" -v bset="${BUILD_PLATFORM:+1}" '
+# note_reads(s, lineno): record the first line reading each automatic name
+# while the name has no declared default yet. $NAME and ${NAME...} forms
+# both count, nested words included, which can only over-detect on lines
+# the main scan refuses before any buildx call runs.
+function note_reads(s, lineno,   j, name) {
+  while (length(s) > 0) {
+    j = index(s, "$")
+    if (j == 0) return
+    s = substr(s, j + 1)
+    if (substr(s, 1, 1) == "{") s = substr(s, 2)
+    if (match(s, /^[A-Za-z_][A-Za-z0-9_]*/)) {
+      name = substr(s, RSTART, RLENGTH)
+      s = substr(s, RLENGTH + 1)
+      if ((name in AUTO) && !(name in DECL) && !(name in READ)) READ[name] = lineno
+    }
+  }
+}
+# conflict_applies(name): the order can only diverge when the synthetic
+# override for the name would travel (see the comment above the scan).
+function conflict_applies(name) {
+  if (name == "TARGETSTAGE") return 0
+  if (name ~ /^BUILD/) return bset == "1"
+  return pset == "1"
+}
+function scan_line(logical, lineno,   n, f, instr, ai, t, p, name, val, q) {
   sub("^" WS, "", logical)
   n = split(logical, f, WS)
   if (n == 0) return 0
   instr = toupper(f[1])
-  if (instr == "FROM") return 1
+  if (instr == "FROM") { note_reads(logical, lineno); return 1 }
   if (instr != "ARG") return 0
   for (ai = 2; ai <= n; ai++) {
     t = f[ai]
     p = index(t, "=")
     if (p <= 1) continue
     name = substr(t, 1, p - 1)
-    if ((name in AUTO) && !(name in SEEN)) { SEEN[name] = 1; print name }
+    val = substr(t, p + 1)
+    q = substr(val, 1, 1)
+    if (!(q == SQ && length(val) >= 2 && substr(val, length(val), 1) == SQ))
+      note_reads(val, lineno)
+    if ((name in AUTO) && !(name in DECL)) {
+      DECL[name] = lineno
+      print "DECL " name
+      if ((name in READ) && conflict_applies(name) && !(name in OVERRIDE))
+        print "CONFLICT " name " " READ[name] " " lineno
+    }
   }
   return 0
 }
 BEGIN {
+  SQ  = sprintf("%c", 39)
   BOM = sprintf("%c%c%c", 239, 187, 191)
   WS  = sprintf("[ \t\r%c%c]+", 11, 12)
   CTRL_WS = sprintf("[%c%c\r]", 11, 12)
   ESC = "\\"
   directive_mode = 1
-  buf = ""
+  buf = ""; bufline = 0
   n_auto = split("TARGETPLATFORM TARGETOS TARGETARCH TARGETVARIANT TARGETOSVERSION TARGETSTAGE BUILDPLATFORM BUILDOS BUILDARCH BUILDVARIANT BUILDOSVERSION", auto_names, " ")
   for (b = 1; b <= n_auto; b++) AUTO[auto_names[b]] = 1
+  n_ba = split(ENVIRON["CHECK_FROM_BUILD_ARGS"], ba_lines, "\n")
+  for (b = 1; b <= n_ba; b++) {
+    if (ba_lines[b] == "") continue
+    p = index(ba_lines[b], "=")
+    if (p > 1) OVERRIDE[substr(ba_lines[b], 1, p - 1)] = 1
+  }
 }
 {
   raw = $0
@@ -524,6 +605,7 @@ BEGIN {
   }
   if (trimmed ~ /^#/) next
   if (trimmed == "") next
+  if (buf == "") bufline = NR
   llen = length(line)
   if (substr(line, llen, 1) == ESC && (llen == 1 || substr(line, llen - 1, 1) != ESC)) {
     buf = buf substr(line, 1, llen - 1)
@@ -531,14 +613,27 @@ BEGIN {
   }
   buf = buf line
   logical = buf; buf = ""
-  if (scan_line(logical)) exit 0
+  if (scan_line(logical, bufline)) exit 0
 }
-END { if (buf != "") scan_line(buf) }
+END { if (buf != "") scan_line(buf, bufline) }
 ' < "$DOCKERFILE")
-DECLARED_AUTO=" $(printf '%s' "$DECLARED_AUTO" | tr '\n' ' ') "
+DECLARED_AUTO=" $(printf '%s\n' "$PRE_SCAN" | sed -n 's/^DECL //p' | tr '\n' ' ') "
 declared_auto() {
   case "$DECLARED_AUTO" in *" $1 "*) return 0 ;; *) return 1 ;; esac
 }
+
+AUTO_CONFLICT=$(printf '%s\n' "$PRE_SCAN" | sed -n 's/^CONFLICT //p' | sed -n '1p')
+if [ -n "$AUTO_CONFLICT" ]; then
+  conflict_name=${AUTO_CONFLICT%% *}
+  conflict_rest=${AUTO_CONFLICT#* }
+  conflict_read=${conflict_rest%% *}
+  conflict_decl=${conflict_rest#* }
+  if [ "$conflict_read" -eq "$conflict_decl" ]; then
+    not_a_pass "line $conflict_decl of $DOCKERFILE reads the automatic argument $conflict_name before the same line finishes declaring its default, so the declaration needs the automatic value it replaces, and one buildx call cannot reproduce that order (a synthetic override would beat the declared default everywhere, and omitting it leaves the read on the daemon's own platform). Declaring the default above its first use, from a value that does not read the name, lets the gate run"
+  else
+    not_a_pass "line $conflict_read of $DOCKERFILE reads the automatic argument $conflict_name and line $conflict_decl declares its default. The real build reads the automatic value until the declaring line, and one buildx call cannot reproduce that order (a synthetic override would beat the declared default everywhere, and omitting it leaves the reads above line $conflict_decl on the daemon's own platform). Declaring the default above its first use lets the gate run"
+  fi
+fi
 
 # Build the argument list: the platform packs first, then the user's
 # --build-arg values so they override them, then the target. Each TARGET*
@@ -758,7 +853,11 @@ function expand_str(s, mode, where,   out, j, k, name, c, mod, word, isset) {
 # registry host when it contains a dot or a colon, is exactly localhost,
 # or is not all-lowercase (splitDockerDomain); the host keeps its case and
 # compares byte-exact, and index.docker.io maps to docker.io only in that
-# exact lowercase spelling.
+# exact lowercase spelling. A tag must start with a letter, digit, or
+# underscore and a digest must be letter-led algorithm segments, a colon,
+# and at least 32 hex digits; a build on a value outside those rules fails
+# with invalid reference format (alpine:-- and alpine@sha256:zzz both
+# verified), so the empty return never vouches for one.
 function norm_ref(r,   host, rest, dig, tag, slash, last, colon, dpos) {
   if (r == "") return ""
   if (r ~ /[ \t\r]/ || index(r, VT) > 0 || index(r, FF) > 0) return ""
@@ -768,6 +867,8 @@ function norm_ref(r,   host, rest, dig, tag, slash, last, colon, dpos) {
     dig = substr(r, dpos)
     r = substr(r, 1, dpos - 1)
     if (r == "" || length(dig) < 2) return ""
+    if (dig !~ /^@[A-Za-z][A-Za-z0-9]*([-_+.][A-Za-z][A-Za-z0-9]*)*:[0-9A-Fa-f]+$/) return ""
+    if (length(dig) - index(dig, ":") < 32) return ""
   }
   slash = index(r, "/")
   if (slash == 0) { host = "docker.io"; rest = r }
@@ -785,7 +886,7 @@ function norm_ref(r,   host, rest, dig, tag, slash, last, colon, dpos) {
   if (colon > 0) {
     tag = substr(last, colon + 1)
     rest = substr(rest, 1, length(rest) - length(last) + colon - 1)
-    if (tag == "" || tag ~ /[^A-Za-z0-9_.-]/ || length(tag) > 128) return ""
+    if (tag == "" || tag !~ /^[A-Za-z0-9_]/ || tag ~ /[^A-Za-z0-9_.-]/ || length(tag) > 128) return ""
   }
   if (host == "docker.io" && index(rest, "/") == 0) rest = "library/" rest
   if (rest ~ /[^a-z0-9._\/-]/) return ""
@@ -1094,7 +1195,9 @@ END {
           fail("the stage " SN[i] " is overridden by a --build-context whose source (" csrc ") is not a docker-image:// reference; BuildKit builds the stage from that source in place of its base, and a base taken from a local directory, a git repository, an oci layout, or another build target cannot be checked against the allowlist, so a named context of that kind is unsupported for a stage name")
         resolved = substr(csrc, 16)
         if (resolved == "")
-          fail("the stage " SN[i] " is overridden by a --build-context with an empty docker-image:// reference")
+          fail("the stage " SN[i] " is overridden by a --build-context with an empty docker-image:// reference; the build fails on it (invalid reference format, verified), so there is no base to check")
+        if (norm_ref(resolved) == "")
+          fail("the stage " SN[i] " is overridden by a --build-context whose docker-image:// reference \"" resolved "\" is not a valid image reference; the build fails on it (invalid reference format, verified), so there is no base to check")
         outbuf = outbuf member_line(resolved, where)
         continue
       }
@@ -1113,7 +1216,9 @@ END {
           fail(where " resolves to \"" resolved "\", which a --build-context overrides with a source (" csrc ") that is not a docker-image:// reference; a base taken from a local directory, a git repository, an oci layout, or another build target cannot be checked against the allowlist, so a named context of that kind is unsupported for a base")
         resolved = substr(csrc, 16)
         if (resolved == "")
-          fail(where " is overridden by a --build-context with an empty docker-image:// reference")
+          fail(where " is overridden by a --build-context with an empty docker-image:// reference; the build fails on it (invalid reference format, verified), so there is no base to check")
+        if (norm_ref(resolved) == "")
+          fail(where " is overridden by a --build-context whose docker-image:// reference \"" resolved "\" is not a valid image reference; the build fails on it (invalid reference format, verified), so there is no base to check")
         handled = 1
       }
     }
@@ -1256,12 +1361,32 @@ fi
 # this script's scan expanded differently than the frontend did, so the
 # run fails naming it. This is the fallback for any divergence between the
 # scan and the frontend: whatever the scan misreads, the extra load
-# surfaces here instead of passing as an artifact source.
+# surfaces here instead of passing as an artifact source. The exit is 1
+# either way, split by the allowlist so the header's REJECTED definition
+# holds: an off-allowlist load is a base the build really resolves off the
+# list, whatever the scan misread, so it is REJECTED; a load on the
+# allowlist is not a rejected base, only a disagreement this script cannot
+# explain, so it refuses to answer as an unexplained load.
 for ref in $refs; do
   case "$fromset_match" in
     *"$NL$ref$NL"*) : ;;
     *)
       if [ "$ART_CAPABLE" -eq 0 ]; then
+        lcref=$(printf '%s' "$ref" | tr '[:upper:]' '[:lower:]')
+        allowedref=0
+        case "$lcref" in
+          cgr.dev/*) allowedref=1 ;;
+        esac
+        if [ "$allowedref" -eq 0 ] && [ -n "$mirror" ]; then
+          case "$lcref" in
+            "$mirror"/*) allowedref=1 ;;
+          esac
+        fi
+        if [ "$allowedref" -eq 1 ]; then
+          echo "check-from-oracle: not a pass: unexplained load $ref. The build resolves it, it is not in the FROM set, and the file has no COPY --from= and no RUN --mount= with a from= source that could pull an artifact, so this script's scan and the frontend disagree about the file; the load is on the allowlist, so it is not a rejected base, and a disagreement the gate cannot explain is not a pass either"
+          echo "check-from-oracle: this is not a pass; the FROM gate fails."
+          exit 1
+        fi
         echo "check-from-oracle: REJECTED $ref — the build resolves it, it is not in the FROM set, and the file has no COPY --from= and no RUN --mount= with a from= source that could pull an artifact, so it is an unexpanded base: this script's scan and the frontend disagree about the file"
         echo "check-from-oracle: this is not a pass; the FROM gate fails."
         exit 1

@@ -30,8 +30,12 @@ FROM set is a base already checked, and every other load is printed as a
 WARNING naming it an external artifact source with the linkage reason and
 allowed (see the artifact sources section),
 unless the file has no instruction that can pull an image other than FROM,
-in which case such a load is an unexpanded base and fails the run, the
-fallback for any divergence between the oracle's scan and the frontend.
+in which case such a load fails the run, the
+fallback for any divergence between the oracle's scan and the frontend:
+REJECTED when the load is off the allowlist, because the build really
+resolves it there whatever the scan misread, and a refusal naming an
+unexplained load when it is on the allowlist, since an allowed load is
+not a rejected base but the disagreement is not a pass either.
 The scan reads parser directives as the textual gate does (VT and FF
 normalized to spaces); a syntax directive pinning a frontend runs under
 that frontend with one WARNING that the expansion assumes the rolling
@@ -41,8 +45,9 @@ Both calls must show positive evidence they ran (the load-build-definition
 step plus their JSON result), and the script refuses to answer when a
 BuildKit source policy
 is configured in the environment. The oracle
-covers every stage the file declares, like the textual check. A migration
-passes only when both pass.
+covers every stage the file declares, like the textual check. The oracle's
+OK plus no textual REJECTED lets the run proceed; the textual check's
+UNVERIFIED lines are carried into the report's Warnings.
 
 Sourcing the options for both scripts in step 9: pass `--platform` from
 the captured invocation, or the daemon's default from
@@ -167,7 +172,7 @@ because its own expansion scan is line-based too.
 | several assignments on one ARG line | all processed | same | second assignment on an ARG line is processed (existing) |
 | `--build-arg` override of a declared ARG | beats the default | same | build-arg override to a forbidden registry is rejected (existing) |
 | `--build-arg` with no declaration | ignored (automatic arguments excepted) | same | build-arg with no matching ARG declaration is ignored (existing) |
-| quoted value spanning whitespace, escape characters in ARG tokens | reassembled by the parser (real builds pin both directions: ARG A="x y" B=alpine assigns B, ARG OTHER=a\ B=alpine swallows B= into the value of OTHER) | advisory naming the token; every later variable read is unverified until the name is assigned again, so a FROM reading a variable after such a line is unverified while a literal FROM stays verifiable | quoted ARG value spanning whitespace is unverified; variable FROM after an unverifiable ARG line is unverified; assignment after an unverifiable ARG line is certain again; escape character in an ARG value is unverified; variable FROM after an escaped ARG line is unverified |
+| quoted value spanning whitespace, escape characters in ARG tokens | reassembled by the parser (real builds pin both directions: ARG A="x y" B=alpine assigns B, ARG OTHER=a\ B=alpine swallows B= into the value of OTHER, and the reassembled line reassigns names earlier lines declared: ARG BASE=alpine then ARG OTHER="x y" BASE=cgr.dev/chainguard/wolfi-base resolves the Chainguard base, pinned) | advisory naming the token; every later variable read is unverified until the name is assigned again, the value an earlier line gave a name included, so a FROM reading a variable after such a line is unverified while a literal FROM stays verifiable | quoted ARG value spanning whitespace is unverified; variable FROM after an unverifiable ARG line is unverified; assignment after an unverifiable ARG line is certain again; tainted ARG line does not leave an earlier value trusted; escape character in an ARG value is unverified; variable FROM after an escaped ARG line is unverified |
 
 ## Automatic platform arguments
 
@@ -186,6 +191,9 @@ textual gate lets the declared default replace its seeded value, and the
 oracle omits the synthetic override for a name the file gives a declared
 default, so BuildKit applies the default exactly as the real build does.
 A bare redeclaration is not a default and keeps the automatic value.
+The omission is faithful only while no read of the name sits above its
+declaring line; the oracle refuses that order, and a self-referential
+default, instead of answering (the row below).
 
 | Construct | BuildKit | Gate | Fixture |
 |---|---|---|---|
@@ -195,6 +203,7 @@ A bare redeclaration is not a default and keeps the automatic value.
 | platform normalization | containerd platforms.Normalize: x86_64 and x86-64 to amd64, aarch64 to arm64, i386 to 386 dropping any variant, armhf to arm/v7 and armel to arm/v6 replacing any variant, amd64 drops a v1 variant, arm64 drops an 8 or v8 variant, bare arm gains v7, the numeric arm variants 5, 6, 7, 8 gain the v prefix, every other variant passes through | same rules | amd64/v1 normalizes to an empty TARGETVARIANT; amd64/v2 keeps its TARGETVARIANT; arm64/v8 and arm64/8 normalize to an empty TARGETVARIANT; bare arm gains the v7 variant; arm/5 through arm/8 normalize to the v5 through v8 variants; arm/v8 keeps its TARGETVARIANT; x86_64 and x86-64 normalize to amd64; aarch64 normalizes to arm64; armhf normalizes to arm/v7 (with or without a variant); armel normalizes to arm/v6; i386 normalizes to 386 and drops any variant; arm/v7 keeps its TARGETVARIANT |
 | bare global `ARG TARGETARCH` | keeps the automatic value | same | bare global ARG redeclaration keeps the automatic value |
 | global `ARG TARGETARCH=value` | the default replaces the automatic value; a --build-arg replaces the default (pinned with real builds) | applied with the same precedence in both scripts; the oracle omits the synthetic override for the name, so the frontend applies the declared default; hard only when the resolved base is off the allowlist | declared default for an automatic argument resolves the FROM; benign declared default on an automatic argument passes; benign declared default read by the FROM passes; declared automatic default with a single-quoted literal resolves alpine (amd64, arm64); oracle cases 1d and 1d2; oracle shim case: a declared automatic default omits its synthetic override |
+| declared default below a line that already reads the name, or a default that reads its own name | the read takes the automatic value and the declaration replaces it from its line onward (a real arm/v7 build of `ARG BASE=${TARGETVARIANT:+cgr.dev/chainguard/wolfi-base}`, `ARG TARGETVARIANT=`, `FROM ${BASE:-alpine}` resolves the Chainguard base, pinned, the self-referential shape likewise) | the textual gate applies the same per-line precedence; the oracle cannot reproduce that order in one buildx call, so it exits 1 naming the argument and both lines, and declaring the default above its first use lets the gate run | oracle cases 1h and 1i |
 | `--build-arg TARGETARCH=...` undeclared | overrides the automatic value | same | build-arg overrides an automatic argument undeclared |
 | BUILD* on a cross-platform build | the builder's own platform | target platform unless --build-platform is passed; a documented deviation | BUILDARCH follows --build-platform on a cross build; BUILDARCH defaults to the target platform without --build-platform |
 | TARGETSTAGE | the --target stage name, else the final stage's; a declared default beats it | seeded from --target; advisory asking for --target when read without it (the oracle exits 1 asking the same) | TARGETSTAGE carries the --target stage name; TARGETSTAGE without --target is unverified |
@@ -210,7 +219,7 @@ A bare redeclaration is not a default and keeps the automatic value.
 | `${NAME:+alt}` | alt when set and non-empty | same | colon-plus substitutes when set (existing) |
 | `${NAME-d}`, `${NAME+a}` colon-less | unset test only, empty counts as set | advisory naming the modifier, and the value is unknown from then on | colon-less minus modifier is unverified, not emulated |
 | `${NAME%pat}`, `${NAME#pat}`, `${NAME/p/r}`, `${NAME:?}` and the rest | expanded per shell rules | advisory naming the modifier, never expanded to an empty string; a FROM reading the value is unverified too (the oracle exits 1 on the modifier) | unsupported modifier in FROM is unverified, not emptied |
-| unresolved variable in a FROM ref | expands to the empty string, which fails the build (base name should not be blank) | advisory naming the variable (the oracle exits 1, unable to expand the FROM set) | unresolved ARG base is unverified |
+| variable in a FROM ref that no global ARG and no override gives a value | expands to the empty string (FROM alpine${UNSET} resolves docker.io/library/alpine, pinned with a real build), and a wholly empty base fails the build (base name should not be blank, pinned) | the same expansion; the reference that remains is classified like any other, hard when it is off the allowlist, and a reference that expands wholly empty is advisory naming the empty result (the oracle exits 1, unable to expand the FROM set) | undeclared variable suffix leaves alpine and is rejected; FROM that expands to an empty base is unverified; FROM of an undeclared variable is an empty base, unverified; empty expansion inside a cgr.dev path is unverified; empty expansion at the start of a FROM is unverified |
 
 ## FROM syntax
 
@@ -220,6 +229,7 @@ A bare redeclaration is not a default and keeps the automatic value.
 | FROM flags (`--platform=...`) | consumed before the reference | skipped the same way | platform flag with cgr image is allowed (existing) |
 | reference with tag | resolved as written | prefix-checked as written | public cgr.dev/chainguard is allowed (existing) |
 | reference with tag and digest | resolved as written | prefix-checked as written | digest-pinned cgr.dev reference is allowed |
+| reference with an invalid tag or digest (`alpine:--`, `alpine@sha256:zzz`) | fails to parse the stage name with invalid reference format (both pinned with real builds) | advisory naming the reference, never hard, because no base pulls from a reference BuildKit refuses; an allowed prefix is not vouched for either when the reference is invalid | invalid tag is a reference BuildKit refuses, unverified; malformed digest is a reference BuildKit refuses, unverified; empty expansion inside a cgr.dev path is unverified |
 | one pair of quotes around the reference | quotes stripped | advisory, a quoted spelling is not a reference this check verifies (the oracle refuses the JSON escape the quotes become in the targets output) | quoted FROM reference is unverified |
 | backslashes and quotes elsewhere in a reference | processed by the shell lexer | passed through textually; removal of quote or escape characters cannot change the host a prefix check sees, so no allowed prefix can be forged | covered by the prefix rule (no fixture) |
 | FROM token count after flags | one image reference, or reference AS name; every other count fails with "FROM requires either one or three arguments" (three tokens whose middle one is not AS draw the same message) | advisory quoting the line, because no base pulls from a line BuildKit fails | FROM with two extra tokens is unverified; FROM followed by a bare AS is unverified; FROM with a reference and an AS name stays allowed |
@@ -248,7 +258,7 @@ build, on Docker 29.8.0 with buildx v0.37.0.
 
 | Construct | BuildKit | Gate | Fixture |
 |---|---|---|---|
-| context name matching a FROM reference | the docker-image:// source replaces the base; other source kinds (local directory, git, oci-layout, target) build the base from that source | docker-image://REF puts REF through the allowlist in place of the FROM, hard when REF is off the list; any other source kind for a FROM name is advisory in the textual check, because the base has no registry reference to verify, and the oracle exits 1 on it | build context overriding a Chainguard FROM to alpine is rejected; build context overriding a FROM to another Chainguard image is allowed; local-directory context for a FROM name is unverified; oracle test case 6 |
+| context name matching a FROM reference | the docker-image:// source replaces the base; other source kinds (local directory, git, oci-layout, target) build the base from that source; an empty or invalid docker-image:// reference fails the build with invalid reference format (pinned for an empty reference and for alpine:--) | docker-image://REF puts REF through the allowlist in place of the FROM after checking REF parses, hard when a valid REF is off the list; an empty or invalid REF is advisory naming it in the textual check (the oracle refuses it by name), and any other source kind for a FROM name is advisory in the textual check, because the base has no registry reference to verify, and the oracle exits 1 on it | build context overriding a Chainguard FROM to alpine is rejected; build context overriding a FROM to another Chainguard image is allowed; local-directory context for a FROM name is unverified; empty docker-image context source is unverified; invalid docker-image context source is unverified; invalid docker-image source for a stage name is unverified; oracle test case 6; oracle shim cases: invalid and empty docker-image context references are refused by name |
 | matching normalization | reference normalization on both sides: a bare name gains docker.io/library/ and :latest, index.docker.io maps to docker.io only in that exact lowercase spelling, the host keeps its case from splitDockerDomain and compares byte-exact, and a dotless first component that is not all-lowercase is a domain (Foo/bar is domain Foo, path bar) | same rules in norm_ref, shared by both scripts | context name with a tag matches an untagged FROM; fully qualified context name matches a short FROM; index.docker.io context name matches a short FROM; context name with a different tag does not match; uppercase-host context name does not match a lowercase FROM; lowercase-host context name matches the FROM the uppercase one missed; uppercase index.docker.io context name does not map or match; dotless uppercase first component is a domain and matches its context; lowercased context does not match an uppercase-domain FROM; oracle test case 10 |
 | matching against the expanded reference | the context match sees the FROM after ARG expansion | same | context matching happens after ARG expansion |
 | context name matching a stage name | applied at the stage's definition: the stage's base is replaced even when no FROM references the name, with reference normalization on the name, and the stage-name match beats a context matching the base reference; at a FROM, the context beats the stage wherever it is referenced | same, checked at each AS name and at each FROM; a non-docker-image source for a stage name is advisory in the textual check and exits 1 in the oracle, like the FROM-name row | stage-name context overriding a Chainguard stage to alpine is rejected; stage-name context overriding a stage to a Chainguard image is allowed; normalized stage-name context still overrides the stage; local-directory context for a stage name is unverified; context overriding a stage alias to alpine is rejected; context overriding a stage alias to a Chainguard image is allowed; oracle test case 9 |
@@ -256,7 +266,7 @@ build, on Docker 29.8.0 with buildx v0.37.0.
 | digest-pinned FROM | matches a context only on the exact digest string; the bare name does not match | same | context with the exact digest string overrides the FROM; bare context name does not match a digest-pinned FROM |
 | repeated context name | the last value wins | same | repeated context name applies the last value (allowed, rejected) |
 | context name matching no FROM and no stage name | ignored for bases (a COPY --from source may still use it, including from a local directory) | same | context whose name matches nothing is ignored; local-directory context for a copy source is ignored by the FROM gate |
-| context name that is not a valid reference | buildx refuses the invocation (invalid context name, lowercase repository rule) | usage error (exit 2) naming the context in the textual check; the oracle exits 1 | invalid context name is refused as a usage error |
+| context name that is not a valid reference | buildx refuses the invocation (invalid context name: the lowercase repository rule, an invalid tag such as dep:--, both verified) | usage error (exit 2) naming the context in the textual check; the oracle exits 1 | invalid context name is refused as a usage error; context name with an invalid tag is refused as a usage error |
 
 ## Artifact sources
 
@@ -270,12 +280,13 @@ as a WARNING naming it an external artifact source with the linkage
 reason (a binary copied from another distribution's image links against
 that distribution's libraries), but only when the file contains
 at least one instruction that can pull an image other than FROM. With
-none present, an off-set load is an unexpanded base and fails the run.
+none present, an off-set load fails the run: REJECTED when it is off the
+allowlist, an unexplained-load refusal when it is on it.
 
 | Construct | BuildKit | Gate | Fixture |
 |---|---|---|---|
 | `COPY --from=IMAGE`, `RUN --mount=from=IMAGE`, ADD from an image | a metadata load, indistinguishable from a base load by its step label (verified; both print as [internal]) | the load is matched against the FROM set from the targets call; a non-base load is printed as an external artifact source WARNING with the linkage reason and allowed | oracle test case 7; external COPY --from artifact source is not a base; external RUN mount source is not a base; bracketed-label shim case |
 | a reference that is both a FROM base and a copy source | one load serves both | it is in the FROM set, so it is checked as a base; the artifact allowance cannot launder it | a base doubling as a copy source is still a base; oracle test case 7 |
-| a load outside the FROM set in a file with no COPY --from= and no RUN --mount= carrying a from= source that could pull an image | only a FROM can have pulled it, so it is a base the scan expanded differently than the frontend | exit 1 naming the load; the fallback for any divergence between the oracle's scan and the frontend | oracle shim case: off-set load with no artifact-capable instruction is an unexpanded base; the bracketed-label shim case is the artifact-report pair |
+| a load outside the FROM set in a file with no COPY --from= and no RUN --mount= carrying a from= source that could pull an image | only a FROM can have pulled it, so it is a base the scan expanded differently than the frontend | exit 1 naming the load, the fallback for any divergence between the oracle's scan and the frontend: REJECTED when the load is off the allowlist, a refusal naming an unexplained load when it is on it, so the REJECTED line always means a base known off the allowlist | oracle shim cases: off-set load with no artifact-capable instruction is an unexpanded base, allowed off-set load is an unexplained load; the bracketed-label shim case is the artifact-report pair |
 | `COPY --from=STAGE`, `RUN --mount=from=STAGE` naming a declared stage | resolves the stage, pulls nothing | not artifact-capable for the fallback count; the source is matched by AS alias case-insensitively and by numeric stage index, after the global ARG expansion the FROM set uses, and mount keys match case-insensitively as BuildKit lowercases them (`FROM=`, `Type=`, and `From=` all build, verified with real cacheonly builds) | oracle shim cases: a copy or mount source naming a stage is not artifact-capable, the image copy source pair, and the uppercase-mount-key live case |
 | an artifact source that fails to resolve | the build fails | the outline run fails, which is not a pass | covered by the unresolvable-base oracle case (same failure path) |
