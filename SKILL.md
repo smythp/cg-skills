@@ -212,8 +212,8 @@ platform, target, build args, build contexts, and mirror, for example:
 `timeout -k 30 1260 scripts/check-from-oracle.sh --platform <p> --target <stage> --build-arg NAME=value --build-context NAME=SOURCE --mirror <prefix> Dockerfile.chainguard <context>`
 (two internal buildx calls, each bounded at 600 seconds). It checks every
 base image BuildKit itself resolves against the allowlist; its OK line is
-the gate, and a REJECTED from it stops the run — fix the base, do not
-argue with the gate. Then run `scripts/check-from-lines.sh` with the same
+the gate. A REJECTED from it stops the run; fix the base rather than
+working around the check. Then run `scripts/check-from-lines.sh` with the same
 options minus the context path; it reads every FROM textually, reachable
 or not, its UNVERIFIED lines go into the report's Warnings, and a
 REJECTED from it stops the run too. How to source the options (the daemon
