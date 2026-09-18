@@ -697,10 +697,15 @@ function expand_str(s, mode, lineno,   out, j, k, name, c, mod, word, isset) {
 # more hex digits and colons) with the optional port after the closing
 # bracket (real builds accept [::1]:5000/alpine and [::1]/alpine and fail
 # the pull on the connection, not the reference, while [::1:5000/alpine
-# fails with invalid reference format, all pinned). A bracket form with no
-# colon or dot in it ([dead]/alpine) is not recognized as a domain at all;
-# it falls to the docker.io path, whose grammar refuses the brackets, and a
-# real build refuses it the same way (pinned); each path component is
+# fails with invalid reference format, all pinned). A bracket form reaches
+# that grammar only through the same four recognition triggers as any
+# other first component, a dot, a colon, localhost, or an uppercase
+# letter. [dead]/alpine has none of them, so it falls to the docker.io
+# path, whose grammar refuses the brackets, and a real build refuses it
+# the same way; [DEAD]/alpine and [dead:beef]/alpine each carry one
+# trigger, so both are recognized as hosts and a real build loads
+# metadata for each and fails on the host address, not on the reference
+# (all pinned); each path component is
 # lowercase alphanumerics joined by a single
 # dot, a single underscore, a double underscore, or one or more hyphens; a
 # tag starts with a letter, digit, or underscore and runs at most 128

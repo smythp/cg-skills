@@ -354,11 +354,22 @@ RUN echo hi
 EOF
 
 # Oracle: a real build fails with failed to parse stage name
-# "[dead]/alpine": invalid reference format (2026-09-18). A bracket form
-# with no colon or dot in it is not recognized as a registry host; the
+# "[dead]/alpine": invalid reference format (2026-09-18). [dead] carries
+# none of the four recognition triggers (a dot, a colon, localhost, an
+# uppercase letter), so it is not recognized as a registry host; the
 # name falls to the docker.io path, whose grammar refuses the brackets.
 run_case "bracket form without a colon is a reference BuildKit refuses, unverified" "" warn "not a reference BuildKit accepts" <<'EOF'
 FROM [dead]/alpine
+RUN echo hi
+EOF
+
+# Oracle: a real build of FROM [DEAD]/alpine loads metadata for
+# [DEAD]/alpine:latest and fails on the host address (unable to parse IP),
+# not on the reference (2026-09-18). The uppercase letter is a recognition
+# trigger, so the bracket form is a host and the base is a reference the
+# build pulls, off the allowlist.
+run_case "bracket form with an uppercase letter off the allowlist is rejected" "" err "[DEAD]/alpine" <<'EOF'
+FROM [DEAD]/alpine
 RUN echo hi
 EOF
 
@@ -368,6 +379,24 @@ EOF
 # hex digits and colons in brackets, not a parsed IPv6 address.
 run_case "bracketed hex literal with a colon off the allowlist is rejected" "" err "[dead:beef]/alpine" <<'EOF'
 FROM [dead:beef]/alpine
+RUN echo hi
+EOF
+
+# Oracle: a real build of FROM [::1]:5000/alpine with --build-context
+# [::1]:5000/alpine=docker-image://cgr.dev/chainguard/wolfi-base prints
+# "#2 [context [::1]:5000/alpine] load metadata for
+# cgr.dev/chainguard/wolfi-base" and exits 0 (2026-09-18), so a bracketed
+# host works as a context name and the override decides the base.
+run_case "bracketed context name with an allowed override is allowed" "" ok "" --build-context '[::1]:5000/alpine=docker-image://cgr.dev/chainguard/wolfi-base' <<'EOF'
+FROM [::1]:5000/alpine
+RUN echo hi
+EOF
+
+# Oracle: the same context pointed at alpine:latest loads metadata for
+# alpine:latest under the [context [::1]:5000/alpine] label (2026-09-18),
+# so the override substitutes the off-allowlist base.
+run_case "bracketed context name overriding to alpine is rejected" "" err "overridden by --build-context" --build-context '[::1]:5000/alpine=docker-image://alpine:latest' <<'EOF'
+FROM [::1]:5000/alpine
 RUN echo hi
 EOF
 

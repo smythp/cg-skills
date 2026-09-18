@@ -879,8 +879,12 @@ function expand_str(s, mode, where,   out, j, k, name, c, mod, word, isset) {
 # port after the closing bracket (real builds accept [::1]:5000/alpine and
 # [::1]/alpine and fail the pull on the connection, not the reference,
 # while [::1:5000/alpine fails with invalid reference format; a bracket
-# form with no colon or dot in it, [dead]/alpine, is not recognized as a
-# domain and the path grammar refuses it, as a real build does, all
+# form is recognized as a domain only through the four triggers above, a
+# dot, a colon, localhost, or an uppercase letter, so [dead]/alpine with
+# none of them falls to the path grammar, which refuses it as a real
+# build does, while [DEAD]/alpine and [dead:beef]/alpine each carry one
+# trigger and a real build loads metadata for each and fails on the host
+# address, not on the reference, all
 # pinned); each path component
 # is lowercase alphanumerics joined by a single dot, a single underscore,
 # a double underscore, or one or more hyphens; a tag starts with a letter,
@@ -1393,23 +1397,33 @@ fi
 
 # Every line containing "load metadata for" is a reference, whatever its
 # bracketed step label; a line whose shape this script cannot parse fails
-# the run naming the line. A load matching the FROM set (as written or in
-# canonical form) is a base the check above already vouched for; every
-# other load is an external artifact source (COPY --from, a RUN mount,
-# ADD from an image), which references/from-and-registry-rules.md permits
-# and asks the report to name, so it is printed and allowed. A reference
-# that is both a base and an artifact source is in the FROM set and was
-# checked as a base.
+# the run naming the line. The label of an overridden base carries the
+# context name verbatim, and a bracketed registry host puts brackets
+# inside the label (a real build of FROM [::1]:5000/alpine with the
+# override prints "#2 [context [::1]:5000/alpine] load metadata for
+# cgr.dev/chainguard/wolfi-base" and exits 0, pinned 2026-09-18), so the
+# label is separated from the reference on the literal text
+# "] load metadata for ", not on the brackets. A context name never
+# contains a space and neither does a reference, so that text cannot
+# occur inside the label and the split is unambiguous; the greedy match
+# in the validator and in the extractor takes the last occurrence either
+# way, so both read the same reference. A load matching the FROM set (as
+# written or in canonical form) is a base the check above already vouched
+# for; every other load is an external artifact source (COPY --from, a
+# RUN mount, ADD from an image), which
+# references/from-and-registry-rules.md permits and asks the report to
+# name, so it is printed and allowed. A reference that is both a base and
+# an artifact source is in the FROM set and was checked as a base.
 meta=$(printf '%s\n' "$out" | grep -F 'load metadata for')
 refs=""
 if [ -n "$meta" ]; then
-  bad=$(printf '%s\n' "$meta" | grep -vE '^#[0-9]+ \[[^][]+\] load metadata for [^ ]+$')
+  bad=$(printf '%s\n' "$meta" | grep -vE '^#[0-9]+ \[.+\] load metadata for [^ ]+$')
   if [ -n "$bad" ]; then
     printf '%s\n' "$bad" | sed 's/^/  | /'
     not_a_pass "these load-metadata lines do not have the shape this script can parse, so the references cannot be checked"
   fi
   refs=$(printf '%s\n' "$meta" \
-    | sed 's/^#[0-9]* \[[^][]*\] load metadata for //' \
+    | sed 's/^#[0-9]* \[.*\] load metadata for //' \
     | sort -u)
 fi
 

@@ -53,6 +53,10 @@
 #      from the frontend
 #  12. a forward stage reference is a stage reference, not a pull; the
 #      FROM set holds only the later stage's base
+#  13. a context name that is a bracketed registry host carries its
+#      brackets into the [context NAME] progress label, so the label
+#      parsing splits on the literal text "] load metadata for "; the
+#      allowed override passes and the alpine override stays rejected
 #
 # The shim cases need no container engine: a docker shim on PATH prints
 # canned output per call (targets and outline separately, and a timeout
@@ -1563,6 +1567,40 @@ else
   case "$out" in
     *"allowed  cgr.dev/chainguard/wolfi-base:latest"*) ok ;;
     *) bad "forward stage reference: should allow only the wolfi-base base, got: $out" ;;
+  esac
+fi
+
+echo "--- case 13: a bracketed context name carries through the progress label ---"
+# A real build of this file with the wolfi-base override prints
+# "#2 [context [::1]:5000/alpine] load metadata for
+# cgr.dev/chainguard/wolfi-base" and exits 0 (pinned 2026-09-18), so the
+# [context NAME] label can hold brackets inside NAME and the label
+# parsing splits on the literal text "] load metadata for ", not on the
+# brackets. The override substitutes wolfi-base into the FROM set, the
+# outline's labeled load matches it, and the run passes.
+printf 'FROM [::1]:5000/alpine\n' > "$tmp/Dockerfile"
+out=$(sh "$SCRIPT" --build-context '[::1]:5000/alpine=docker-image://cgr.dev/chainguard/wolfi-base' \
+      "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  bad "bracketed context name: expected pass, exit $rc: $out"
+else
+  case "$out" in
+    *"allowed  cgr.dev/chainguard/wolfi-base:latest"*) ok ;;
+    *) bad "bracketed context name: should allow the substituted wolfi-base base, got: $out" ;;
+  esac
+fi
+# The same name pointed at alpine:latest substitutes alpine into the FROM
+# set, which is rejected in canonical form before the outline runs (a real
+# build with that override loads metadata for alpine:latest under the
+# [context [::1]:5000/alpine] label, pinned 2026-09-18).
+out=$(sh "$SCRIPT" --build-context '[::1]:5000/alpine=docker-image://alpine:latest' \
+      "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 1 ]; then
+  bad "bracketed context name to alpine: expected exit 1, got $rc: $out"
+else
+  case "$out" in
+    *"REJECTED docker.io/library/alpine:latest"*) ok ;;
+    *) bad "bracketed context name to alpine: should reject alpine in canonical form, got: $out" ;;
   esac
 fi
 
