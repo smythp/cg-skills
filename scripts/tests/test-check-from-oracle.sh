@@ -1443,6 +1443,66 @@ cat > "$tmp/Dockerfile" <<'EOF'
 FROM cgr.dev/chainguard/wolfi-base
 EOF
 
+echo "--- shim cases: bracketed IPv6 hosts follow the reference grammar ---"
+# A real build accepts [::1]:5000/alpine and loads metadata for
+# [::1]:5000/alpine:latest (2026-09-18; the pull then fails with connection
+# refused at [::1]:5000, on the connection, not on the reference), so the
+# member is a base the build pulls and REJECTED keeps its meaning.
+printf 'FROM [::1]:5000/alpine\n' > "$tmp/Dockerfile"
+sed 's|"base": "cgr.dev/chainguard/wolfi-base"|"base": "[::1]:5000/alpine"|' \
+  "$tmp/out-targets-good" > "$tmp/out-targets-brkt"
+out=$(SHIM_OUT="$tmp/out-good" SHIM_OUT_TARGETS="$tmp/out-targets-brkt" \
+      PATH="$shimdir:$PATH" sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 1 ]; then
+  bad "bracketed IPv6 member: expected exit 1, got $rc: $out"
+else
+  case "$out" in
+    *"REJECTED [::1]:5000/alpine:latest"*) ok ;;
+    *) bad "bracketed IPv6 member: should reject the base by name, got: $out" ;;
+  esac
+fi
+# The same host under --mirror [::1]:5000/cg is an allowed prefix; the
+# canned outline load names the canonical member, as a real run would.
+printf 'FROM [::1]:5000/cg/base\n' > "$tmp/Dockerfile"
+sed 's|"base": "cgr.dev/chainguard/wolfi-base"|"base": "[::1]:5000/cg/base"|' \
+  "$tmp/out-targets-good" > "$tmp/out-targets-brkt-ok"
+sed 's|load metadata for cgr.dev/chainguard/wolfi-base:latest|load metadata for [::1]:5000/cg/base:latest|' \
+  "$tmp/out-good" > "$tmp/out-brkt-ok"
+out=$(SHIM_OUT="$tmp/out-brkt-ok" SHIM_OUT_TARGETS="$tmp/out-targets-brkt-ok" \
+      PATH="$shimdir:$PATH" sh "$SCRIPT" --mirror '[::1]:5000/cg' "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  bad "bracketed IPv6 mirror member: expected pass, got exit $rc: $out"
+else
+  case "$out" in
+    *"allowed  [::1]:5000/cg/base:latest"*) ok ;;
+    *) bad "bracketed IPv6 mirror member: should allow the base through the mirror, got: $out" ;;
+  esac
+fi
+# The unclosed bracket fails a real build with failed to parse stage name
+# "[::1:5000/alpine": invalid reference format (pinned 2026-09-18), so the
+# member is refused by name and no REJECTED line prints.
+printf 'FROM [::1:5000/alpine\n' > "$tmp/Dockerfile"
+sed 's|"base": "cgr.dev/chainguard/wolfi-base"|"base": "[::1:5000/alpine"|' \
+  "$tmp/out-targets-good" > "$tmp/out-targets-brkt-bad"
+out=$(SHIM_OUT="$tmp/out-good" SHIM_OUT_TARGETS="$tmp/out-targets-brkt-bad" \
+      PATH="$shimdir:$PATH" sh "$SCRIPT" "$tmp/Dockerfile" "$tmp" 2>&1); rc=$?
+if [ "$rc" -ne 1 ]; then
+  bad "unclosed IPv6 bracket member: expected exit 1, got $rc: $out"
+else
+  case "$out" in
+    *'"[::1:5000/alpine"'*"is not a reference BuildKit accepts"*)
+      case "$out" in
+        *REJECTED*) bad "unclosed IPv6 bracket member: must refuse to answer, not reject: $out" ;;
+        *) ok ;;
+      esac
+      ;;
+    *) bad "unclosed IPv6 bracket member: should name the reference as one BuildKit does not accept, got: $out" ;;
+  esac
+fi
+cat > "$tmp/Dockerfile" <<'EOF'
+FROM cgr.dev/chainguard/wolfi-base
+EOF
+
 echo "--- case 8: a base identical to its own stage name is a pull, not a stage reference ---"
 cat > "$tmp/Dockerfile" <<'EOF'
 FROM alpine AS alpine

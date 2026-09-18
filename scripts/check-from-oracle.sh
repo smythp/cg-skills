@@ -874,13 +874,21 @@ function expand_str(s, mode, where,   out, j, k, name, c, mod, word, isset) {
 # excluded (pinned at the 255 and 256 boundary with real builds); a
 # recognized
 # domain is dot-separated components, each alphanumeric with interior
-# hyphens, then an optional colon and a numeric port; each path component
+# hyphens, then an optional colon and a numeric port, or an IPv6 literal
+# in square brackets (one or more hex digits and colons) with the optional
+# port after the closing bracket (real builds accept [::1]:5000/alpine and
+# [::1]/alpine and fail the pull on the connection, not the reference,
+# while [::1:5000/alpine fails with invalid reference format; a bracket
+# form with no colon or dot in it, [dead]/alpine, is not recognized as a
+# domain and the path grammar refuses it, as a real build does, all
+# pinned); each path component
 # is lowercase alphanumerics joined by a single dot, a single underscore,
 # a double underscore, or one or more hyphens; a tag starts with a letter,
 # digit, or underscore and runs at most 128 characters; a digest is
 # letter-led algorithm segments, a colon, and at least 32 hex digits. A
 # build on a value outside the grammar fails with invalid reference format
-# (alpine:--, alpine@sha256:zzz, alpine..x, example.com:abc/alpine, and an
+# (alpine:--, alpine@sha256:zzz, alpine..x, example.com:abc/alpine,
+# [::1:5000/alpine, and an
 # uppercase path component each verified), so the empty return never
 # vouches for one.
 function norm_ref(r,   host, rest, dig, tag, slash, last, colon, dpos, hn, port, np, ci, comps) {
@@ -902,13 +910,17 @@ function norm_ref(r,   host, rest, dig, tag, slash, last, colon, dpos, hn, port,
     if (host ~ /[.:]/ || host == "localhost" || host != tolower(host)) {
       rest = substr(r, slash + 1)
       hn = host
-      colon = index(hn, ":")
-      if (colon > 0) {
-        port = substr(hn, colon + 1)
-        hn = substr(hn, 1, colon - 1)
-        if (port !~ /^[0-9]+$/) return ""
+      if (substr(hn, 1, 1) == "[") {
+        if (hn !~ /^\[[0-9A-Fa-f:]+\](:[0-9]+)?$/) return ""
+      } else {
+        colon = index(hn, ":")
+        if (colon > 0) {
+          port = substr(hn, colon + 1)
+          hn = substr(hn, 1, colon - 1)
+          if (port !~ /^[0-9]+$/) return ""
+        }
+        if (hn !~ /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$/) return ""
       }
-      if (hn !~ /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$/) return ""
     }
     else { host = "docker.io"; rest = r }
   }

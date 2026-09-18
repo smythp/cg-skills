@@ -318,6 +318,59 @@ FROM localhost:5000/alpine
 RUN echo hi
 EOF
 
+# Oracle: a real build accepts [::1]:5000/alpine and loads metadata for
+# [::1]:5000/alpine:latest (2026-09-18; the pull then fails with connection
+# refused at [::1]:5000, on the connection, not on the reference). An IPv6
+# literal in square brackets is a valid registry host, so the off-allowlist
+# base stays rejected.
+run_case "bracketed IPv6 host with a port off the allowlist is rejected" "" err "[::1]:5000/alpine" <<'EOF'
+FROM [::1]:5000/alpine
+RUN echo hi
+EOF
+
+# Oracle: a real build accepts [::1]/alpine and loads metadata for
+# [::1]/alpine:latest (2026-09-18; the pull then fails with connection
+# refused at [::1]:443), so the port after the closing bracket is optional.
+run_case "bracketed IPv6 host without a port off the allowlist is rejected" "" err "[::1]/alpine" <<'EOF'
+FROM [::1]/alpine
+RUN echo hi
+EOF
+
+# Oracle: a real build accepts [::1]:5000/cg/base and loads metadata for
+# [::1]:5000/cg/base:latest (2026-09-18; the pull then fails with
+# connection refused at [::1]:5000), so a bracketed host works as a mirror
+# prefix like any other.
+run_case "bracketed IPv6 mirror prefix is allowed" "[::1]:5000/cg" ok "" <<'EOF'
+FROM [::1]:5000/cg/base
+RUN echo hi
+EOF
+
+# Oracle: a real build fails with failed to parse stage name
+# "[::1:5000/alpine": invalid reference format (2026-09-18); the bracket
+# never closes, so the host is outside the grammar and no base pulls.
+run_case "unclosed IPv6 bracket is a reference BuildKit refuses, unverified" "" warn "not a reference BuildKit accepts" <<'EOF'
+FROM [::1:5000/alpine
+RUN echo hi
+EOF
+
+# Oracle: a real build fails with failed to parse stage name
+# "[dead]/alpine": invalid reference format (2026-09-18). A bracket form
+# with no colon or dot in it is not recognized as a registry host; the
+# name falls to the docker.io path, whose grammar refuses the brackets.
+run_case "bracket form without a colon is a reference BuildKit refuses, unverified" "" warn "not a reference BuildKit accepts" <<'EOF'
+FROM [dead]/alpine
+RUN echo hi
+EOF
+
+# Oracle: a real build accepts [dead:beef]/alpine and attempts the pull,
+# loading metadata for [dead:beef]/alpine:latest before the resolver fails
+# on the address, not the reference (2026-09-18): the grammar's literal is
+# hex digits and colons in brackets, not a parsed IPv6 address.
+run_case "bracketed hex literal with a colon off the allowlist is rejected" "" err "[dead:beef]/alpine" <<'EOF'
+FROM [dead:beef]/alpine
+RUN echo hi
+EOF
+
 # Oracle: a real build accepts a bare 247-character name (the normalized
 # path docker.io/library/... runs exactly 255 characters) and loads its
 # metadata, while a bare 248-character name fails with repository name
@@ -655,9 +708,14 @@ FROM ${BASE}
 RUN echo hi
 EOF
 
-run_case "build-arg with no matching ARG declaration is ignored" "" warn '${BASE}' OTHER=cgr.dev/chainguard/python:latest-dev <<'EOF'
-ARG BASE
-FROM ${BASE}
+# Oracle: a real cacheonly build of this file with --build-arg
+# OTHER=cgr.dev/chainguard/ loads only docker.io/library/alpine:latest
+# (2026-09-18): no ARG declares OTHER, so the override never applies and
+# ${OTHER} expands to the empty string. A scan that applied the override
+# anyway would resolve the allowed cgr.dev base and pass.
+run_case "build-arg with no matching ARG declaration is ignored" "" err "alpine" OTHER=cgr.dev/chainguard/ <<'EOF'
+ARG BASE=cgr.dev/chainguard/wolfi-base
+FROM ${OTHER}alpine
 RUN echo hi
 EOF
 
@@ -1824,10 +1882,39 @@ EOF
 
 # A name assigned again after the unverifiable line is certain again, as
 # in BuildKit (a later assignment beats whatever the tainted line set), so
-# only the tainted line itself is reported.
-run_case "assignment after an unverifiable ARG line is certain again" "" warn "cannot take apart" <<'EOF'
+# only the tainted line itself is reported. Oracle: a real cacheonly build
+# of this file loads only cgr.dev/chainguard/wolfi-base:latest
+# (2026-09-18). The count pins the certainty: exactly one UNVERIFIED
+# diagnostic besides the summary, and none of them for the FROM line, so a
+# scan that left B tainted through the reassignment cannot pass.
+cat > "$tmp/Dockerfile" <<'EOF'
 ARG A="x y" B=alpine
 ARG B=cgr.dev/chainguard/wolfi-base
+FROM ${B}
+EOF
+out=$(sh "$SCRIPT" "$tmp/Dockerfile" 2>&1); rc=$?
+nwarn=$(printf '%s\n' "$out" | grep -c '^check-from-lines: UNVERIFIED')
+nfrom=$(printf '%s\n' "$out" | grep -c '^check-from-lines: UNVERIFIED FROM')
+if [ "$rc" -ne 3 ] || [ "$nwarn" -ne 1 ] || [ "$nfrom" -ne 0 ]; then
+  failcount=$((failcount + 1))
+  echo "FAIL: assignment after an unverifiable ARG line is certain again — expected exit 3 with exactly one UNVERIFIED diagnostic besides the summary and no UNVERIFIED FROM line, got exit $rc with $nwarn diagnostic(s) and $nfrom FROM line(s): $out"
+else
+  case "$out" in
+    *"cannot take apart"*) pass=$((pass + 1)) ;;
+    *)
+      failcount=$((failcount + 1))
+      echo "FAIL: assignment after an unverifiable ARG line is certain again — the ARG diagnostic is missing, got: $out"
+      ;;
+  esac
+fi
+
+# The certainty cuts both ways: when the trusted reassignment holds a
+# forbidden base, the FROM resolves it and rejects. Oracle: a real
+# cacheonly build of this file loads only docker.io/library/alpine:latest
+# (2026-09-18).
+run_case "assignment after an unverifiable ARG line resolves a forbidden base" "" err "alpine" <<'EOF'
+ARG A="x y" B=cgr.dev/chainguard/wolfi-base
+ARG B=alpine
 FROM ${B}
 EOF
 
@@ -2048,17 +2135,14 @@ fi
 # is never read and the gate prints OK.
 printf 'FROM docker.io/library/python:3.12\n' > "$tmp/from=allowed"
 out=$( (cd "$tmp" && sh "$SCRIPT" "from=allowed") 2>&1); rc=$?
-if [ "$rc" -ne 0 ]; then
-  case "$out" in
-    *"docker.io/library/python:3.12"*) pass=$((pass + 1)) ;;
-    *)
-      failcount=$((failcount + 1))
-      echo "FAIL: filename containing '=' — error should name the forbidden FROM, got: $out"
-      ;;
-  esac
+if [ "$rc" -ne 1 ]; then
+  failcount=$((failcount + 1))
+  echo "FAIL: filename containing '=' — expected exit 1 (REJECTED), got exit $rc: $out"
+elif printf '%s\n' "$out" | grep REJECTED | grep -qF -- "docker.io/library/python:3.12"; then
+  pass=$((pass + 1))
 else
   failcount=$((failcount + 1))
-  echo "FAIL: filename containing '=' — forbidden FROM passed; the file was not read"
+  echo "FAIL: filename containing '=' — a REJECTED line should name the forbidden FROM, got: $out"
 fi
 
 echo ""
