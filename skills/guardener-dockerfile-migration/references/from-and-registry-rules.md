@@ -352,6 +352,14 @@ image reference could launder a forbidden registry through the check.
 
 `COPY --from=<image>` lines that name an external image (for example
 `COPY --from=ghcr.io/some/tool:v1 /tool /usr/local/bin/tool`) are artifact
-copies, not base images, and the FROM gate does not cover them. Leave them
-as they are unless the user asks to migrate them too, and name them in the
-report so the user knows an upstream artifact source remains.
+copies, not base images, and the FROM allowlist does not cover them; the
+same applies to `RUN --mount=from=<image>` and to ADD pulling an image.
+Look up the Chainguard image of the same name first
+(`chainctl images tags list --public --repo <name>`, or the organization
+catalog) and migrate the source when one exists, reporting it as a
+mapping. When none exists, keep the line, and the report names it with
+the linkage warning: a binary copied from another distribution's image
+links against that distribution's libraries, so prefer the Chainguard
+image of the same name or build the artifact in a Chainguard stage.
+`scripts/check-from-oracle.sh` prints each remaining artifact source as a
+WARNING with that reason, which is the list the report names.

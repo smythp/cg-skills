@@ -174,7 +174,13 @@ For each instruction, using `references/from-and-registry-rules.md`,
   root-needing RUNs in `USER root` … `USER <image user>` in the same block.
   If a package is dropped, apply the internal-consistency rule.
 - **COPY/ADD**: keep; fix ownership for the non-root user; remap
-  postgres-family init-script paths.
+  postgres-family init-script paths. For a `COPY --from`, `RUN --mount`
+  with a `from=` source, or ADD that names an external image, look up the
+  Chainguard image of the same name first (`chainctl images tags list
+  --public --repo NAME`, or the organization catalog) and migrate the
+  source when one exists, reporting it as a mapping; when none exists,
+  keep the line, and the report names it with the linkage warning from
+  the artifact-copy rule in `references/from-and-registry-rules.md`.
 - **Metadata**: pass through; do not add base-image defaults the original
   overrides; check CMD against a purpose-built image's ENTRYPOINT.
 
@@ -201,41 +207,21 @@ the user — it is never solved by switching to another registry.
 
 ### 9. Gate the FROMs
 
-The gate is two checks, and both must pass.
-`references/from-allowlist-constructs.md` lists the constructs that decide
-what a FROM resolves to and how each check handles them.
-
-Run `scripts/check-from-lines.sh` on the complete migrated file, with
-`--mirror <prefix>` if one is configured and a repeated `--build-arg
-NAME=value` for every build arg in the captured invocation — the build honors
-those overrides over the Dockerfile's ARG defaults, so a gate run without
-them checks a different file than the one being built. Pass `--platform`
-from the captured invocation, or the daemon's default from
-`docker version --format '{{.Server.Os}}/{{.Server.Arch}}'` when the
-invocation names none, because BuildKit sets the automatic platform
-arguments on every build and a FROM can read them. When the invocation lists
-several platforms, run the gate once per platform. When the invocation has
-`--target`, pass it too, and when the build platform differs from the target
-platform, add `--build-platform` with the daemon's platform. This check
-reads every FROM line textually, reachable or not. For example:
-`scripts/check-from-lines.sh --platform <p> --build-arg NAME=value Dockerfile.chainguard`.
-
-Run `scripts/check-from-oracle.sh` on the same file with the same options
-plus the build context path. The two scripts share the option set:
-`--mirror <prefix>`, `--platform <os/arch[/variant]>`,
-`--build-platform <os/arch[/variant]>`, `--target <stage>`, and repeated
-`--build-arg NAME=value`. For example:
-`timeout -k 30 660 scripts/check-from-oracle.sh --platform <p> --build-arg NAME=value Dockerfile.chainguard <context>`
-(its internal outline call is itself bounded at 600 seconds). It evaluates
-the file with BuildKit's own frontend, which loads image metadata and
-executes nothing, and checks every reference the builder actually resolves
-for the given target and platform.
-
-Any reference outside the allowlist
-fails the run — fix it, do not argue with the gate. Then confirm every stage
-that used `USER root` ends with the image's user. This is the
-machine-checkable intermediate output: paste both OK lines into your reply
-before proceeding.
+Run `scripts/check-from-oracle.sh` on the migrated file with the captured
+platform, target, build args, build contexts, and mirror, for example:
+`timeout -k 30 1260 scripts/check-from-oracle.sh --platform <p> --target <stage> --build-arg NAME=value --build-context NAME=SOURCE --mirror <prefix> Dockerfile.chainguard <context>`
+(two internal buildx calls, each bounded at 600 seconds). It checks every
+base image BuildKit itself resolves against the allowlist; its OK line is
+the gate. A REJECTED from it stops the run; fix the base rather than
+working around the check. Then run `scripts/check-from-lines.sh` with the same
+options minus the context path; it reads every FROM textually, reachable
+or not, its UNVERIFIED lines go into the report's Warnings, and a
+REJECTED from it stops the run too. How to source the options (the daemon
+platform, one run per platform, `--build-platform` when cross-building)
+is in the introduction of `references/from-allowlist-constructs.md`,
+which also lists the constructs and how each check handles them. Then
+confirm every stage that used `USER root` ends with the image's user, and
+paste both result lines into your reply before proceeding.
 
 ### 10. Validate — a hard gate
 
@@ -267,8 +253,11 @@ reference file carries the detail; the one-line forms:
 
 1. **FROM allowlist**: every FROM stays on `cgr.dev/*`, the configured
    mirror, `scratch`, or a declared stage alias — a FROM that drifts
-   produces an image nobody maintains, and `scripts/check-from-lines.sh`
-   rejects it.
+   produces an image nobody maintains, and the step-9 gate rejects it:
+   `scripts/check-from-oracle.sh` decides with BuildKit's own resolution,
+   and `scripts/check-from-lines.sh` advises, reporting what it cannot
+   verify. The gate exists to catch mistakes in a migration; it is not a
+   guarantee that a Dockerfile written to defeat it cannot pass.
 2. **Never swap registries to make a pull work**: report the underlying
    error instead; a swapped registry is a migration that silently stopped
    being one.
